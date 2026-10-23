@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>WingTrack — animal flight tracker</title>
+  <link data-trunk rel="rust" data-wasm-opt="z" data-bin="wingtrack" />
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; width: 100%; overflow: hidden; background: #1b1b1b; }
+    canvas { display: block; position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+    #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #ccc; font-family: sans-serif; }
+  </style>
+</head>
+<body>
+  <canvas id="wingtrack_canvas"></canvas>
+  <div id="loading">Loading WingTrack…</div>
+  <script>
+    // Hide the loading text once the app has had a moment to start.
+    window.addEventListener("load", () => setTimeout(() => {
+      const l = document.getElementById("loading"); if (l) l.remove();
+    }, 1500));
+  </script>
+</body>
+</html>

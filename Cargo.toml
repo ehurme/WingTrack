@@ -1,0 +1,62 @@
+[package]
+name = "wingtrack"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Interactive animal flight tracker for Sigfox (TinyFox/NanoFox/uWasp), GPS and CTT tags, with satellite imagery and ERA5 wind/weather annotation"
+license = "MIT"
+authors = ["Edward Hurme"]
+repository = "https://github.com/ehurme/wingtrack"
+
+[lib]
+name = "wingtrack"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wingtrack"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.37"
+egui_plot = "0.38"
+walkers = "0.63"
+ehttp = "0.7"
+csv = "1.4"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+serde_json = "1.0"
+log = "0.4"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rfd = "0.17"
+env_logger = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["wasmbind"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+rfd = { version = "0.17", default-features = false }
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "HtmlAnchorElement",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.dev.package."*"]
+opt-level = 2
