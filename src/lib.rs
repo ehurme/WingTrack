@@ -14,6 +14,7 @@ pub mod export;
 pub mod firmware;
 pub mod geo;
 pub mod model;
+pub mod share;
 pub mod table;
 pub mod tiles;
 pub mod video;

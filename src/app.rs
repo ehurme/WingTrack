@@ -3,6 +3,7 @@
 use crate::firmware;
 use crate::geo;
 use crate::model::{Fix, LocationSource, SensorKind, Track};
+use crate::share::{self, ShareMap};
 use crate::table::{Table, fmt_date, fmt_time};
 use crate::tiles::{Basemap, Gibs, SatLayer};
 use crate::video;
@@ -32,6 +33,18 @@ enum Msg {
         result: Result<String, String>,
     },
     Status(String),
+    /// A CSV downloaded from a URL (Open URL… or a shared link).
+    RemoteFile {
+        url: String,
+        bytes: Vec<u8>,
+        force: Option<String>,
+        from_share: bool,
+    },
+    FetchFailed {
+        url: String,
+        err: String,
+        from_share: bool,
+    },
     /// An ERA5 wind-cube file picked by the user.
     Cube {
         name: String,
@@ -72,7 +85,18 @@ struct LoadedFile {
     name: String,
     bytes: Vec<u8>,
     firmware: String,
+    /// Firmware chosen by the user (None = auto-detected).
+    forced: Option<String>,
+    origin: FileOrigin,
     ranking: Vec<(&'static str, f32)>,
+}
+
+/// Where a file came from — decides how a share link carries it.
+#[derive(Clone, Debug, PartialEq)]
+enum FileOrigin {
+    Local,
+    Demo,
+    Url(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -372,6 +396,22 @@ pub struct WingApp {
     curtain_metric: CurtainMetric,
     curtain_cache: Option<(CurtainKey, Option<Curtain>)>,
 
+    // share links
+    share_dialog: bool,
+    share_embed: bool,
+    url_dialog: bool,
+    url_input: String,
+    /// A share link being restored: (state, files still downloading).
+    pending_share: Option<(ShareMap, usize)>,
+    /// Centre of the 2D map (lat, lon) as last drawn.
+    map_center: Option<(f64, f64)>,
+    /// Packed data files for links: (files key, base64url).
+    packed_cache: Option<(u64, String)>,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    last_hash: String,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    hash_synced_at: f64,
+
     // video export
     video: video::Settings,
     video_dialog: bool,
@@ -406,6 +446,18 @@ type SliceKey = (i64, u64, Vec<usize>, (i32, i32, i32, i32));
 impl WingApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut app = Self::blank();
+        if let Some(link) = startup_link() {
+            app.start_from_share(&ShareMap::decode(&link));
+        } else if std::env::var("WINGTRACK_DEMO").is_ok() {
+            app.load_demo();
+        }
+        app.apply_test_env();
+        app
+    }
+
+    /// App with default state and no data (also used by tests).
+    fn blank() -> Self {
         let (tx, rx) = channel();
         let mut app = WingApp {
             tracks: Vec::new(),
@@ -449,6 +501,15 @@ impl WingApp {
             req_done: 0,
             req_failed: 0,
             since_annotate: 0,
+            share_dialog: false,
+            share_embed: true,
+            url_dialog: false,
+            url_input: String::new(),
+            pending_share: None,
+            map_center: None,
+            packed_cache: None,
+            last_hash: String::new(),
+            hash_synced_at: 0.0,
             video: video::Settings::default(),
             video_dialog: false,
             ffmpeg: None,
@@ -480,9 +541,12 @@ impl WingApp {
         };
         let _ = app.memory.set_zoom(5.0);
         app.memory.center_at(lon_lat(9.17, 47.67));
-        if std::env::var("WINGTRACK_DEMO").is_ok() {
-            app.load_demo();
-        }
+        app
+    }
+
+    /// Offline testing aids (synthetic winds, 3D tab) from environment variables.
+    fn apply_test_env(&mut self) {
+        let app = self;
         if std::env::var("WINGTRACK_SYNTHETIC_WIND").is_ok() {
             weather::synthetic_field(&mut app.store, &app.tracks);
             let n = weather::annotate(&mut app.tracks, &app.store, &app.opts);
@@ -509,7 +573,6 @@ impl WingApp {
                 }
             }
         }
-        app
     }
 
     fn status(&mut self, s: impl Into<String>) {
@@ -525,11 +588,35 @@ impl WingApp {
 
     fn load_demo(&mut self) {
         for (name, csv) in crate::demo::all() {
-            self.add_file(name.to_string(), csv.into_bytes(), None);
+            self.add_file_from(
+                name.to_string(),
+                csv.into_bytes(),
+                None,
+                Some(FileOrigin::Demo),
+            );
         }
     }
 
     fn add_file(&mut self, name: String, bytes: Vec<u8>, force: Option<&str>) {
+        self.add_file_from(name, bytes, force, None);
+    }
+
+    /// Load a file; `origin` None keeps the origin of a same-named file (re-parse) or Local.
+    fn add_file_from(
+        &mut self,
+        name: String,
+        bytes: Vec<u8>,
+        force: Option<&str>,
+        origin: Option<FileOrigin>,
+    ) {
+        let origin = origin
+            .or_else(|| {
+                self.files
+                    .iter()
+                    .find(|f| f.name == name)
+                    .map(|f| f.origin.clone())
+            })
+            .unwrap_or(FileOrigin::Local);
         let table = match Table::from_bytes(&name, &bytes) {
             Ok(t) => t,
             Err(e) => return self.status(format!("! {e}")),
@@ -557,8 +644,11 @@ impl WingApp {
                     name,
                     bytes,
                     firmware: fw.to_string(),
+                    forced: force.map(|f| f.to_string()),
+                    origin,
                     ranking,
                 });
+                self.packed_cache = None;
                 self.recompute_time_range();
                 if !self.store.is_empty() {
                     weather::annotate(&mut self.tracks, &self.store, &self.opts);
@@ -573,6 +663,717 @@ impl WingApp {
             }
             Err(e) => self.status(format!("! {e}")),
         }
+    }
+
+    // ------------------------------------------------------------------ share links
+
+    /// Changes whenever the set of loaded files changes (for the packed-data cache).
+    fn files_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for f in &self.files {
+            (
+                &f.name,
+                f.bytes.len(),
+                &f.forced,
+                f.origin == FileOrigin::Local,
+            )
+                .hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Local files packed for embedding in a link (cached).
+    fn packed_data(&mut self) -> String {
+        let key = self.files_key();
+        if let Some((k, s)) = &self.packed_cache
+            && *k == key
+        {
+            return s.clone();
+        }
+        let files: Vec<share::EmbeddedFile> = self
+            .files
+            .iter()
+            .filter(|f| f.origin == FileOrigin::Local)
+            .map(|f| share::EmbeddedFile {
+                name: f.name.clone(),
+                firmware: f.forced.clone().unwrap_or_default(),
+                bytes: f.bytes.clone(),
+            })
+            .collect();
+        let s = if files.is_empty() {
+            String::new()
+        } else {
+            share::pack_files(&files)
+        };
+        self.packed_cache = Some((key, s.clone()));
+        s
+    }
+
+    /// The whole dashboard as link parameters. `embed`: include local data files.
+    fn share_map(&mut self, embed: bool) -> ShareMap {
+        use share::{name, r};
+        let mut m = ShareMap::default();
+        m.set("v", share::VERSION);
+        // ---- data
+        if self.files.iter().any(|f| f.origin == FileOrigin::Demo) {
+            m.set("demo", "1");
+        }
+        let mut forced: Vec<String> = Vec::new();
+        for f in &self.files {
+            if let FileOrigin::Url(u) = &f.origin {
+                m.set("data", u);
+            }
+            if f.origin != FileOrigin::Local
+                && let Some(fw) = &f.forced
+            {
+                forced.push(format!("{}:{fw}", f.name));
+            }
+        }
+        for fw in forced {
+            m.set("fw", fw);
+        }
+        if embed {
+            let packed = self.packed_data();
+            m.set_if(!packed.is_empty(), "emb", packed);
+        }
+        // ---- view
+        m.set(
+            "tab",
+            if self.view_tab == ViewTab::ThreeD {
+                "3d"
+            } else {
+                "map"
+            },
+        );
+        m.set("t", self.t_now.round() as i64);
+        m.set("spd", self.speed_idx);
+        if let Some((la, lo)) = self.map_center {
+            m.set(
+                "map",
+                format!("{},{},{}", r(la, 4), r(lo, 4), r(self.memory.zoom(), 2)),
+            );
+        }
+        m.set("base", name(&self.basemap));
+        m.set_if(
+            self.sat_on,
+            "sat",
+            format!(
+                "{},{}",
+                name(&self.sat_layer),
+                r(self.sat_opacity as f64, 2)
+            ),
+        );
+        if !self.wind_palettes.is_empty() {
+            let mut p: Vec<String> = self
+                .wind_palettes
+                .iter()
+                .map(|(b, w)| format!("{}:{}", name(b), name(w)))
+                .collect();
+            p.sort();
+            m.set("pal", p.join(";"));
+        }
+        m.set("cb", name(&self.color_by));
+        let flags = [
+            (self.show_error, 'e'),
+            (self.show_wind_arrows, 'a'),
+            (self.show_wind_field, 'w'),
+            (self.wind_field_night_only, 'n'),
+            (self.skip_daytime, 'd'),
+            (self.hide_insignificant, 'i'),
+            (self.trail_to_cursor, 'c'),
+            (self.follow, 'f'),
+            (self.view3d.follow, 'F'),
+        ];
+        m.set(
+            "disp",
+            flags
+                .iter()
+                .filter(|x| x.0)
+                .map(|x| x.1)
+                .collect::<String>(),
+        );
+        m.set("err", r(self.max_error_km as f64, 2));
+        m.set("chart", name(&self.chart_var));
+        m.set("cm", name(&self.curtain_metric));
+        m.set("co", self.chart_open as u8);
+        // ---- weather
+        let o = &self.opts;
+        m.set(
+            "wx",
+            format!(
+                "{},{},{},{},{},{},{}",
+                name(&o.model),
+                name(&o.level),
+                o.segments as u8,
+                o.night_only as u8,
+                r(o.max_segment_h as f64, 1),
+                r(o.field_margin_deg as f64, 2),
+                o.field_stride
+            ),
+        );
+        m.set_if(self.surface_field_on || !self.store.is_empty(), "era5", "1");
+        // ---- 3D
+        if let wind3d::Source::OpenMeteo(om) = self.profiles.source {
+            m.set("w3d", name(&om));
+            let annotated = self
+                .tracks
+                .iter()
+                .any(|t| t.fixes.iter().any(|f| f.weather.flight.is_some()));
+            m.set_if(annotated, "ann3d", "1");
+        }
+        m.set(
+            "f3d",
+            format!(
+                "{},{},{}",
+                self.field_auto as u8,
+                self.field_step_cells,
+                r(self.field_radius_deg as f64, 2)
+            ),
+        );
+        if !self.display_levels.is_empty() {
+            let lv: Vec<String> = self
+                .display_levels
+                .iter()
+                .filter_map(|&i| self.profiles.levels.get(i))
+                .map(|p| r(*p as f64, 0))
+                .collect();
+            m.set("lv", lv.join(","));
+        }
+        let v = &self.view3d;
+        m.set("rl", v.raster_level);
+        let c = &v.cam;
+        m.set(
+            "cam",
+            format!(
+                "{},{},{},{},{},{},{},{}{}",
+                r(c.yaw as f64, 1),
+                r(c.pitch as f64, 1),
+                r(c.dist as f64, 1),
+                r(c.target[0] as f64, 1),
+                r(c.target[1] as f64, 1),
+                r(c.target[2] as f64, 1),
+                r(v.exag as f64, 1),
+                v.auto_exag as u8,
+                v.origin()
+                    .map(|(la, lo)| format!(",{},{}", r(la, 5), r(lo, 5)))
+                    .unwrap_or_default()
+            ),
+        );
+        m.set(
+            "v3",
+            format!(
+                "{},{},{},{},{},{},{},{},{},{}",
+                v.particles_on as u8,
+                v.particles_per_level,
+                r(v.flow_hours_per_s as f64, 2),
+                v.show_planes as u8,
+                v.show_raster as u8,
+                v.show_drop_lines as u8,
+                v.show_shadows as u8,
+                r(v.ground_dim as f64, 2),
+                r(v.default_alt_m as f64, 0),
+                r(v.gap_factor as f64, 2)
+            ),
+        );
+        // ---- tracks
+        let hidden: Vec<String> = (0..self.tracks.len())
+            .filter(|&i| !self.tracks[i].visible)
+            .map(|i| self.track_key(i))
+            .collect();
+        m.set_if(!hidden.is_empty(), "hide", hidden.join(","));
+        let cols: Vec<String> = (0..self.tracks.len())
+            .map(|i| {
+                let c = self.tracks[i].color;
+                format!("{}:{:02x}{:02x}{:02x}", self.track_key(i), c[0], c[1], c[2])
+            })
+            .collect();
+        m.set_if(!cols.is_empty(), "col", cols.join(";"));
+        if let Some(i) = self.selected_track.filter(|&i| i < self.tracks.len()) {
+            m.set("iso", self.track_key(i));
+        }
+        if let Some((ti, fi)) = self.selected
+            && let Some(f) = self.tracks.get(ti).and_then(|t| t.fixes.get(fi))
+        {
+            m.set("sel", format!("{}:{}", self.track_key(ti), f.t));
+        }
+        m
+    }
+
+    /// Stable key of a track in links: its id, or `id@file` when the id occurs in several files.
+    fn track_key(&self, i: usize) -> String {
+        let t = &self.tracks[i];
+        if self.tracks.iter().filter(|o| o.id == t.id).count() > 1 {
+            format!("{}@{}", t.id, t.file)
+        } else {
+            t.id.clone()
+        }
+    }
+
+    fn track_by_key(&self, key: &str) -> Option<usize> {
+        (0..self.tracks.len()).find(|&i| self.track_key(i) == key)
+    }
+
+    /// Full link for the current view.
+    fn share_url(&mut self, embed: bool) -> String {
+        format!("{}#{}", page_base_url(), self.share_map(embed).encode())
+    }
+
+    /// Settings that don't depend on the data.
+    fn apply_share_settings(&mut self, m: &ShareMap) {
+        use share::from_name;
+        if let Some(t) = m.get("tab") {
+            self.view_tab = if t == "3d" {
+                ViewTab::ThreeD
+            } else {
+                ViewTab::Map
+            };
+        }
+        if let Some(v) = m.f64("spd") {
+            self.speed_idx = (v as usize).min(SPEEDS.len() - 1);
+        }
+        if let Some(b) = m.get("base").and_then(|b| from_name(&Basemap::ALL, b)) {
+            self.basemap = b;
+        }
+        self.sat_on = false;
+        if let Some(s) = m.get("sat") {
+            let mut it = s.split(',');
+            if let Some(l) = it.next().and_then(|l| from_name(&SatLayer::ALL, l)) {
+                self.sat_on = true;
+                self.sat_layer = l;
+            }
+            if let Some(o) = it.next().and_then(|o| o.parse::<f32>().ok()) {
+                self.sat_opacity = o.clamp(0.1, 1.0);
+            }
+        }
+        if let Some(p) = m.get("pal") {
+            for kv in p.split(';') {
+                if let Some((b, w)) = kv.split_once(':')
+                    && let (Some(b), Some(w)) =
+                        (from_name(&Basemap::ALL, b), from_name(&WindPalette::ALL, w))
+                {
+                    self.wind_palettes.insert(b, w);
+                }
+            }
+        }
+        if let Some(c) = m.get("cb").and_then(|c| from_name(&ColorBy::ALL, c)) {
+            self.color_by = c;
+        }
+        if let Some(d) = m.get("disp") {
+            let has = |c: char| d.contains(c);
+            self.show_error = has('e');
+            self.show_wind_arrows = has('a');
+            self.show_wind_field = has('w');
+            self.wind_field_night_only = has('n');
+            self.skip_daytime = has('d');
+            self.hide_insignificant = has('i');
+            self.trail_to_cursor = has('c');
+            self.follow = has('f');
+            self.view3d.follow = has('F');
+        }
+        if let Some(e) = m.f64("err") {
+            self.max_error_km = e as f32;
+        }
+        if let Some(c) = m.get("chart").and_then(|c| from_name(&ChartVar::ALL, c)) {
+            self.chart_var = c;
+        }
+        if let Some(c) = m.get("cm").and_then(|c| from_name(&CurtainMetric::ALL, c)) {
+            self.curtain_metric = c;
+        }
+        if let Some(c) = m.flag("co") {
+            self.chart_open = c;
+        }
+        if let Some(w) = m.get("wx") {
+            let p: Vec<&str> = w.split(',').collect();
+            let num = |i: usize| p.get(i).and_then(|v| v.parse::<f32>().ok());
+            if let Some(v) = p
+                .first()
+                .and_then(|v| from_name(&[Model::Era5, Model::BestMatch], v))
+            {
+                self.opts.model = v;
+            }
+            if let Some(v) = p
+                .get(1)
+                .and_then(|v| from_name(&[WindLevel::Auto, WindLevel::M10, WindLevel::M100], v))
+            {
+                self.opts.level = v;
+            }
+            if let Some(v) = num(2) {
+                self.opts.segments = v != 0.0;
+            }
+            if let Some(v) = num(3) {
+                self.opts.night_only = v != 0.0;
+            }
+            if let Some(v) = num(4) {
+                self.opts.max_segment_h = v;
+            }
+            if let Some(v) = num(5) {
+                self.opts.field_margin_deg = v;
+            }
+            if let Some(v) = num(6) {
+                self.opts.field_stride = (v as i32).max(1);
+            }
+        }
+        let f3 = m.nums("f3d");
+        if let Some(&a) = f3.first() {
+            self.field_auto = a != 0.0;
+        }
+        if let Some(&st) = f3.get(1).filter(|v| v.is_finite()) {
+            self.field_step_cells = (st as i32).clamp(1, 8);
+            self.profiles.node_step = self.field_step_cells;
+        }
+        if let Some(&rad) = f3.get(2).filter(|v| v.is_finite()) {
+            self.field_radius_deg = rad as f32;
+        }
+        if let Some(om) = m.get("w3d").and_then(|o| from_name(&OmModel::ALL, o)) {
+            self.om_model = om;
+        }
+        let v3 = m.nums("v3");
+        let g = |i: usize| v3.get(i).copied().filter(|v| v.is_finite());
+        let v = &mut self.view3d;
+        if let Some(x) = g(0) {
+            v.particles_on = x != 0.0;
+        }
+        if let Some(x) = g(1) {
+            v.particles_per_level = (x as usize).clamp(100, 2500);
+        }
+        if let Some(x) = g(2) {
+            v.flow_hours_per_s = x as f32;
+        }
+        if let Some(x) = g(3) {
+            v.show_planes = x != 0.0;
+        }
+        if let Some(x) = g(4) {
+            v.show_raster = x != 0.0;
+        }
+        if let Some(x) = g(5) {
+            v.show_drop_lines = x != 0.0;
+        }
+        if let Some(x) = g(6) {
+            v.show_shadows = x != 0.0;
+        }
+        if let Some(x) = g(7) {
+            v.ground_dim = x as f32;
+        }
+        if let Some(x) = g(8) {
+            v.default_alt_m = x as f32;
+        }
+        if let Some(x) = g(9) {
+            v.gap_factor = x as f32;
+        }
+        if let Some(x) = m.f64("rl") {
+            v.raster_level = x as usize;
+        }
+    }
+
+    /// Track-dependent state, applied once the link's data has loaded.
+    fn apply_share_view(&mut self, m: &ShareMap) {
+        if let Some(h) = m.get("hide") {
+            let hidden: Vec<&str> = h.split(',').collect();
+            for i in 0..self.tracks.len() {
+                let key = self.track_key(i);
+                self.tracks[i].visible = !hidden.contains(&key.as_str());
+            }
+        }
+        if let Some(c) = m.get("col") {
+            for kv in c.split(';') {
+                if let Some((key, hex)) = kv.rsplit_once(':')
+                    && hex.len() == 6
+                    && let Ok(v) = u32::from_str_radix(hex, 16)
+                    && let Some(i) = self.track_by_key(key)
+                {
+                    self.tracks[i].color = [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+                }
+            }
+        }
+        self.selected_track = m.get("iso").and_then(|k| self.track_by_key(k));
+        self.selected = m.get("sel").and_then(|s| {
+            let (key, t) = s.rsplit_once(':')?;
+            let t: i64 = t.parse().ok()?;
+            let ti = self.track_by_key(key)?;
+            let fi = self.tracks[ti].fixes.iter().position(|f| f.t == t)?;
+            Some((ti, fi))
+        });
+        if let Some(t) = m.f64("t") {
+            self.t_now = t.clamp(self.t_min, self.t_max);
+        }
+        let mp = m.nums("map");
+        if mp.len() == 3 && mp.iter().all(|v| v.is_finite()) {
+            let _ = self.memory.set_zoom(mp[2]);
+            self.memory.center_at(lon_lat(mp[1], mp[0]));
+            self.fit_pending = false;
+        }
+        let c = m.nums("cam");
+        if c.len() >= 6 && c[..6].iter().all(|v| v.is_finite()) {
+            let cam = crate::view3d::Camera {
+                yaw: c[0] as f32,
+                pitch: c[1] as f32,
+                dist: c[2] as f32,
+                target: [c[3] as f32, c[4] as f32, c[5] as f32],
+                ..Default::default()
+            };
+            let exag = c
+                .get(6)
+                .copied()
+                .filter(|v| v.is_finite())
+                .map(|v| v as f32);
+            let auto = c.get(7).map(|v| *v != 0.0);
+            let origin = match (c.get(8), c.get(9)) {
+                (Some(la), Some(lo)) if la.is_finite() && lo.is_finite() => Some((*la, *lo)),
+                _ => None,
+            };
+            self.view3d.set_camera_after_fit(cam, exag, auto, origin);
+        }
+        // Weather: re-download what the sender had.
+        if m.flag("era5") == Some(true) {
+            self.start_weather();
+        }
+        if m.get("w3d").is_some() {
+            self.ensure_open_meteo();
+            if let Some(lv) = m.get("lv") {
+                let want: Vec<f32> = lv.split(',').filter_map(|x| x.parse().ok()).collect();
+                let idx: Vec<usize> = (0..self.profiles.levels.len())
+                    .filter(|&i| {
+                        want.iter()
+                            .any(|w| (w - self.profiles.levels[i]).abs() < 0.5)
+                    })
+                    .collect();
+                if !idx.is_empty() {
+                    self.display_levels = idx;
+                    self.slice_cache = None;
+                }
+            }
+            if m.flag("ann3d") == Some(true) {
+                self.start_profiles();
+            }
+        }
+        if let Some(x) = m.f64("rl") {
+            self.view3d.raster_level = x as usize;
+        }
+        self.status("Opened a shared view");
+    }
+
+    /// Restore a shared link: settings now, data (demo / embedded / URLs), then the view.
+    fn start_from_share(&mut self, m: &ShareMap) {
+        self.apply_share_settings(m);
+        let forced: HashMap<String, String> = m
+            .get_all("fw")
+            .filter_map(|s| s.rsplit_once(':'))
+            .map(|(n, f)| (n.to_string(), f.to_string()))
+            .collect();
+        if m.flag("demo") == Some(true) {
+            for (name, csv) in crate::demo::all() {
+                let fw = forced.get(name).map(|s| s.as_str());
+                self.add_file_from(
+                    name.to_string(),
+                    csv.into_bytes(),
+                    fw,
+                    Some(FileOrigin::Demo),
+                );
+            }
+        }
+        if let Some(e) = m.get("emb") {
+            match share::unpack_files(e) {
+                Ok(files) => {
+                    for f in files {
+                        let fw = (!f.firmware.is_empty()).then_some(f.firmware.as_str());
+                        self.add_file_from(
+                            f.name.clone(),
+                            f.bytes.clone(),
+                            fw,
+                            Some(FileOrigin::Local),
+                        );
+                    }
+                }
+                Err(err) => self.status(format!("! shared link: {err}")),
+            }
+        }
+        let urls: Vec<String> = m.get_all("data").map(|s| s.to_string()).collect();
+        for u in &urls {
+            let fw = forced.get(&share::file_name_from_url(u)).cloned();
+            self.fetch_url(u.clone(), fw, true);
+        }
+        if urls.is_empty() {
+            self.apply_share_view(m);
+        } else {
+            self.status(format!(
+                "Shared link: downloading {} data file(s)…",
+                urls.len()
+            ));
+            self.pending_share = Some((m.clone(), urls.len()));
+        }
+    }
+
+    fn share_file_arrived(&mut self) {
+        if let Some((_, n)) = &mut self.pending_share {
+            *n = n.saturating_sub(1);
+            if *n == 0
+                && let Some((m, _)) = self.pending_share.take()
+            {
+                self.apply_share_view(&m);
+            }
+        }
+    }
+
+    /// Download a CSV from a URL into the app.
+    fn fetch_url(&self, url: String, force: Option<String>, from_share: bool) {
+        let tx = self.tx.clone();
+        ehttp::fetch(ehttp::Request::get(&url), move |res| {
+            let msg = match res {
+                Ok(r) if r.ok => Msg::RemoteFile {
+                    url,
+                    bytes: r.bytes,
+                    force,
+                    from_share,
+                },
+                Ok(r) => Msg::FetchFailed {
+                    url,
+                    err: format!("HTTP {} {}", r.status, r.status_text),
+                    from_share,
+                },
+                Err(e) => Msg::FetchFailed {
+                    url,
+                    err: format!(
+                        "{e} (the server may not allow downloads from other sites - CORS)"
+                    ),
+                    from_share,
+                },
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// Keep the browser's address bar in sync with the view (like a map app), at most once a second.
+    fn sync_url_hash(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.pending_share.is_some()
+                || self.tracks.is_empty()
+                || self.now - self.hash_synced_at < 1.0
+            {
+                return;
+            }
+            self.hash_synced_at = self.now;
+            // Embed data in the live address only while it stays short enough for every browser.
+            let embed = self.packed_data().len() <= 60_000;
+            let frag = self.share_map(embed).encode();
+            if frag != self.last_hash {
+                if let Some(h) = web_sys::window().and_then(|w| w.history().ok()) {
+                    let _ = h.replace_state_with_url(
+                        &wasm_bindgen::JsValue::NULL,
+                        "",
+                        Some(&format!("#{frag}")),
+                    );
+                }
+                self.last_hash = frag;
+            }
+        }
+    }
+
+    fn share_window(&mut self, ctx: &egui::Context) {
+        if !self.share_dialog {
+            return;
+        }
+        let has_local = self.files.iter().any(|f| f.origin == FileOrigin::Local);
+        let has_url = self
+            .files
+            .iter()
+            .any(|f| matches!(f.origin, FileOrigin::Url(_)));
+        let packed_len = if has_local {
+            self.packed_data().len()
+        } else {
+            0
+        };
+        let embed = self.share_embed && has_local;
+        let url = self.share_url(embed);
+        let cube = matches!(
+            self.profiles.source,
+            wind3d::Source::File(_) | wind3d::Source::Synthetic
+        );
+        let mut open = true;
+        let mut copied = false;
+        egui::Window::new("Share this view")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Anyone opening this link sees the same data, time, map or 3D view and settings. \
+                     Weather is downloaded again on their side.",
+                );
+                if has_local {
+                    ui.checkbox(
+                        &mut self.share_embed,
+                        format!("Include my data files in the link ({:.0} KB)", packed_len as f32 / 1024.0),
+                    );
+                    if !self.share_embed {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 180, 80),
+                            "Without the data the link only restores the view for people who open the same files.",
+                        );
+                    } else if packed_len > 60_000 {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 180, 80),
+                            "Long link: fine in browsers and email, but some chat apps cut long links. \
+                             Put the CSV online (e.g. GitHub) and use File → Open URL… for a short link.",
+                        );
+                    }
+                }
+                if has_url {
+                    ui.weak("Files opened from a web address are referenced, not copied into the link.");
+                }
+                if cube {
+                    ui.weak("The imported ERA5 cube / test field is not included; the link uses Open-Meteo winds.");
+                }
+                let mut text = url.as_str();
+                ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Copy link").clicked() {
+                        ui.ctx().copy_text(url.clone());
+                        copied = true;
+                    }
+                    ui.weak(format!("{} characters", url.len()));
+                });
+            });
+        if copied {
+            self.status("Share link copied to the clipboard");
+        }
+        self.share_dialog = open;
+    }
+
+    fn url_window(&mut self, ctx: &egui::Context) {
+        if !self.url_dialog {
+            return;
+        }
+        let mut open = true;
+        let mut go = false;
+        egui::Window::new("Open CSV from a web address")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label("Direct link to a CSV file, e.g. https://raw.githubusercontent.com/<user>/<repo>/main/bats.csv");
+                let r = ui.add(egui::TextEdit::singleline(&mut self.url_input).desired_width(f32::INFINITY));
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    go = true;
+                }
+                ui.weak("The server must allow downloads from other sites (CORS); GitHub raw links and most data portals do.");
+                if ui.button("Load").clicked() {
+                    go = true;
+                }
+            });
+        let url = self.url_input.trim().to_string();
+        if go && url.starts_with("http") {
+            self.status(format!("Downloading {url}…"));
+            self.fetch_url(url, None, false);
+            open = false;
+        }
+        self.url_dialog = open;
     }
 
     fn recompute_time_range(&mut self) {
@@ -1356,6 +2157,28 @@ impl WingApp {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::File { name, bytes } => self.add_file(name, bytes, None),
+                Msg::RemoteFile {
+                    url,
+                    bytes,
+                    force,
+                    from_share,
+                } => {
+                    let name = share::file_name_from_url(&url);
+                    self.add_file_from(name, bytes, force.as_deref(), Some(FileOrigin::Url(url)));
+                    if from_share {
+                        self.share_file_arrived();
+                    }
+                }
+                Msg::FetchFailed {
+                    url,
+                    err,
+                    from_share,
+                } => {
+                    self.status(format!("! could not download {url}: {err}"));
+                    if from_share {
+                        self.share_file_arrived();
+                    }
+                }
                 Msg::Status(s) => self.status(s),
                 Msg::Cube { name, bytes } => match self.profiles.import_cube(&name, &bytes) {
                     Ok(msg) => {
@@ -1600,6 +2423,15 @@ impl WingApp {
             ui.selectable_value(&mut self.view_tab, ViewTab::Map, "2D map");
             ui.selectable_value(&mut self.view_tab, ViewTab::ThreeD, "3D winds");
             ui.separator();
+            if ui
+                .add_enabled(!self.tracks.is_empty(), egui::Button::new("Share"))
+                .on_hover_text(
+                    "Link that opens exactly this view - data, time, map, 3D camera and settings",
+                )
+                .clicked()
+            {
+                self.share_dialog = true;
+            }
             if narrow {
                 ui.menu_button("File", |ui| self.file_actions(ui));
                 ui.menu_button("Layers", |ui| self.layer_actions(ui));
@@ -1661,6 +2493,14 @@ impl WingApp {
             self.files.clear();
             self.selected = None;
             self.selected_track = None;
+            self.packed_cache = None;
+        }
+        if ui
+            .button("Open URL…")
+            .on_hover_text("Load a CSV from a web address (e.g. a GitHub raw link) - shared links then reference it instead of embedding it")
+            .clicked()
+        {
+            self.url_dialog = true;
         }
     }
 
@@ -2176,7 +3016,8 @@ impl WingApp {
             .map(|s| s.0)
             .or(self.selected_track)
             .and_then(|ti| self.tracks.get(ti).and_then(|t| t.position_at(t_now)));
-        map.with_plugin(layer).show(ui, |ui, _resp, _proj, _mem| {
+        let shown = map.with_plugin(layer).show(ui, |ui, _resp, proj, _mem| {
+            let centre = proj.unproject(ui.max_rect().center().to_vec2());
             let r = ui.max_rect();
             let p = ui.painter();
             // attribution
@@ -2232,7 +3073,9 @@ impl WingApp {
                 Color32::WHITE,
             );
             legend(p, r, color_by, wind_legend);
+            (centre.y(), centre.x())
         });
+        self.map_center = Some(shown.inner);
 
         if let Some(sel) = interaction.clicked {
             self.selected = Some(sel);
@@ -3000,6 +3843,7 @@ fn fix_details(ui: &mut Ui, tr: &Track, f: &Fix) {
 impl eframe::App for WingApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.now = ctx.input(|i| i.time);
+        self.sync_url_hash();
         self.process_messages();
         match self.view_tab {
             ViewTab::ThreeD => self.maybe_request_field(),
@@ -3081,6 +3925,35 @@ impl eframe::App for WingApp {
             .response
             .rect;
         self.video_window(&ctx);
+        self.share_window(&ctx);
+        self.url_window(&ctx);
+    }
+}
+
+/// Address of this page without the fragment (web), or the published web app (desktop).
+fn page_base_url() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(loc) = web_sys::window().map(|w| w.location())
+            && let (Ok(o), Ok(p)) = (loc.origin(), loc.pathname())
+        {
+            return format!("{o}{p}");
+        }
+    }
+    share::WEB_APP_URL.to_string()
+}
+
+/// The share link the app was opened with: the page's `#…` on the web, or a link passed
+/// as the first command-line argument on the desktop.
+fn startup_link() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let h = web_sys::window()?.location().hash().ok()?;
+        (h.len() > 2).then_some(h)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::args().nth(1).filter(|a| a.contains('#'))
     }
 }
 
@@ -3482,4 +4355,113 @@ fn web_download(name: &str, bytes: &[u8], mime: &str) -> Result<(), String> {
     a.click();
     let _ = web_sys::Url::revoke_object_url(&url);
     Ok(())
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::*;
+
+    fn without(m: &ShareMap, keys: &[&str]) -> Vec<(String, String)> {
+        m.pairs
+            .iter()
+            .filter(|p| !keys.contains(&p.0.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn share_link_restores_the_view() {
+        let mut a = WingApp::blank();
+        a.load_demo();
+        a.add_file_from(
+            "my_local.csv".into(),
+            crate::demo::ctt_gps_csv().into_bytes(),
+            Some("ctt-gps"),
+            Some(FileOrigin::Local),
+        );
+        assert_eq!(a.tracks.len(), 5);
+        a.view_tab = ViewTab::ThreeD;
+        a.t_now = a.t_min + 0.37 * (a.t_max - a.t_min);
+        a.speed_idx = 1;
+        a.basemap = Basemap::CartoDark;
+        a.sat_on = true;
+        a.sat_layer = SatLayer::ViirsSnpp;
+        a.sat_opacity = 0.5;
+        a.wind_palettes
+            .insert(Basemap::OpenStreetMap, WindPalette::Turbo);
+        a.color_by = ColorBy::Altitude;
+        a.show_error = false;
+        a.follow = true;
+        a.view3d.follow = true;
+        a.max_error_km = 10.0;
+        a.chart_var = ChartVar::Sensor(SensorKind::Pressure);
+        a.curtain_metric = CurtainMetric::Crosswind;
+        a.chart_open = false;
+        a.opts.field_margin_deg = 2.0;
+        a.opts.night_only = false;
+        a.field_radius_deg = 5.0;
+        a.field_step_cells = 2;
+        a.view3d.particles_per_level = 900;
+        a.view3d.ground_dim = 0.2;
+        a.view3d.cam.yaw = 33.0;
+        a.view3d.cam.pitch = 25.0;
+        a.view3d.cam.dist = 1234.0;
+        a.view3d.auto_exag = false;
+        a.view3d.exag = 400.0;
+        a.tracks[1].visible = false;
+        a.tracks[0].color = [1, 2, 3];
+        a.selected_track = Some(2);
+        a.selected = Some((0, 5));
+        a.map_center = Some((45.5, 7.25));
+        let _ = a.memory.set_zoom(6.5);
+
+        let url = a.share_url(true);
+        assert!(url.starts_with(share::WEB_APP_URL) && url.contains("#v=1&demo=1"));
+
+        let mut b = WingApp::blank();
+        b.start_from_share(&ShareMap::decode(&url));
+        assert_eq!(b.tracks.len(), 5);
+        assert_eq!(
+            b.files
+                .iter()
+                .filter(|f| f.origin == FileOrigin::Local)
+                .count(),
+            1
+        );
+        assert_eq!(
+            b.files
+                .iter()
+                .find(|f| f.name == "my_local.csv")
+                .unwrap()
+                .firmware,
+            "ctt-gps"
+        );
+        assert!(!b.tracks[1].visible && b.tracks[0].color == [1, 2, 3]);
+        assert_eq!(b.selected, Some((0, 5)));
+        assert_eq!(b.selected_track, Some(2));
+        assert_eq!(b.t_now, a.t_now.round());
+        assert_eq!(b.memory.zoom(), 6.5);
+        let c = b.memory.detached().expect("map centred from the link");
+        assert!((c.y() - 45.5).abs() < 1e-9 && (c.x() - 7.25).abs() < 1e-9);
+        // Everything else encodes identically (map / cam are applied on the first frame).
+        b.map_center = a.map_center;
+        b.view3d.cam = a.view3d.cam.clone();
+        b.view3d.exag = a.view3d.exag;
+        b.view3d.auto_exag = a.view3d.auto_exag;
+        assert_eq!(
+            without(&a.share_map(true), &[]),
+            without(&b.share_map(true), &[])
+        );
+    }
+
+    #[test]
+    fn link_without_data_or_with_bad_data_is_harmless() {
+        let mut b = WingApp::blank();
+        b.start_from_share(&ShareMap::decode(
+            "#v=1&tab=3d&emb=%%%garbage&cb=Nope&t=abc",
+        ));
+        assert!(b.tracks.is_empty());
+        assert_eq!(b.view_tab, ViewTab::ThreeD);
+        assert_eq!(b.color_by, ColorBy::Individual);
+    }
 }

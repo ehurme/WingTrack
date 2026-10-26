@@ -48,6 +48,7 @@ This file is written for AI coding agents. Assume the reader knows nothing about
 │   ├── video.rs            # Frame capture/cropping, MP4 (ffmpeg) and GIF encoding
 │   ├── wind3d.rs           # Pressure-level profiles: Open-Meteo + ERA5-cube sources, flight-level annotation, curtains
 │   ├── view3d.rs           # CPU-projected 3D view: ground tiles, wind raster, level planes, particles, tracks at altitude
+│   ├── share.rs            # Share links: URL-fragment encoding, data embedding (gzip + base64url)
 │   ├── export.rs           # Annotated CSV export (Movebank-like column names)
 │   └── demo.rs             # Simulated demo datasets in raw export formats
 └── tools/era5_wind_cube.py # Python: export an ERA5 pressure-level wind cube from download_era5.py folders
@@ -131,6 +132,10 @@ MP4 export needs `ffmpeg` on PATH. GIF export works everywhere. On Windows the a
   `weather::window_points()` (cells within a radius of each animal's position, a week at a time from the cursor day).
   `app.rs::pump_weather()` throttles requests by their estimated Open-Meteo call weight (`weather::call_weight`:
   locations × max(1, vars/10) × max(1, days/14)) to 450/min and 4200/h, and re-queues jobs after HTTP 429.
+- Share links (`src/share.rs` + `WingApp::share_map` / `apply_share_settings` / `apply_share_view` in `app.rs`):
+  the dashboard state as `key=value` pairs in the URL fragment. **When adding a user-visible setting, add it to
+  `share_map` and the matching apply function** (enums are encoded by their `Debug` name; unknown/missing keys are
+  ignored, so links stay backward compatible). `app::share_tests` round-trips a full state.
 - `table::Table`: tolerant column lookup by aliases (`t.col(&[...])`) and prefix (`t.col_prefix(...)`).
 
 ## Development conventions
