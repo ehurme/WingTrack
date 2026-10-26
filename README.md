@@ -40,11 +40,18 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
   - **wind support, crosswind, airspeed** relative to the step heading
   - **along-step wind support**: hourly samples along the great-circle path between fixes, optionally **night hours only** (sun < −6°)
   - **barometric altitude re-computed with the local ERA5 MSLP** instead of the 1013.25 hPa standard atmosphere
-  - ERA5 wind field (arrows) for the hour under the cursor; requests batched by month, 25 grid cells per call, and cached
+  - ERA5 wind field (arrows) for the hour under the cursor, with a speed legend; by default it extends 1° around the
+    tracks on a 0.5° grid (*wind-field margin / spacing*), optionally night cells only. The arrow palette has a
+    default per basemap (bright on satellite imagery, viridis on street/topo maps) and can be changed per basemap.
+    Requests are batched by month, 25 grid cells per call, and cached
 - **Timeline & charts** — play/pause at 10 min/s … 1 week/s, step fix-by-fix (← →, Space),
   linked chart of altitude, speeds, wind components, ERA5 variables, location error or raw sensor
   streams (VeDBA, tag temperature, pressure, activity). Click the chart to jump in time; click a fix on the map to inspect it,
   with a day/twilight/night indicator for the selected animal.
+- **Video export** — *Export video…* records the animated map (basemap, satellite layer, ERA5 wind field,
+  legend, clock) plus, optionally, the timeline and sensor chart. Frames are captured at a fixed amount of tracking
+  time per frame, so the result does not depend on render speed. MP4 (H.264) needs `ffmpeg` on PATH (desktop only);
+  animated GIF works everywhere, including the web build. Honours *skip daytime during playback*.
 - **Export** — one CSV with every derived column (`wind_support_ms`, `segment_wind_support_ms`, `altitude_era5_msl_corrected_m`, …)
   and Movebank-style names, ready for R:
 
@@ -56,26 +63,121 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
                    na.fail = FALSE)
   ```
 
-## Running
+## Installation and running
+
+You need Rust (1.95 or newer) and Git. Everything else is downloaded automatically the first time you build.
+
+### 1. Install Rust
+
+**Windows**
+
+1. Download and run `rustup-init.exe` from <https://rustup.rs>.
+2. If it says the *Visual Studio C++ Build Tools* are missing, let it install them (or install
+   [Build Tools for Visual Studio](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the
+   *Desktop development with C++* workload), then run `rustup-init.exe` again.
+3. Accept the default installation.
+4. **Close and reopen** your terminal (Command Prompt, PowerShell or the VS Code terminal) so it finds `cargo`.
+
+**macOS / Linux**
 
 ```bash
-# cd to wingtrack folder
-cargo run --release
-WINGTRACK_DEMO=1 cargo run --release          # start with the simulated demo files loaded
-
-# Tests (parsers, weather batching/annotation, geodesy, export round-trip)
-cargo test --lib
-
-# Web (needs: rustup target add wasm32-unknown-unknown; cargo install trunk)
-trunk serve --release                          # http://127.0.0.1:8080
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"        # or open a new terminal
 ```
+
+On macOS, if prompted, install the Xcode command-line tools (`xcode-select --install`).
+On Debian/Ubuntu, also install the libraries the window system needs:
+
+```bash
+sudo apt install build-essential pkg-config libxcb-render0-dev libxcb-shape0-dev \
+  libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+```
+
+Check the install (open a new terminal first):
+
+```bash
+rustc --version      # should print 1.95 or newer; if older, run: rustup update
+cargo --version
+```
+
+### 2. Get the code
+
+```bash
+git clone https://github.com/ehurme/WingTrack.git
+cd WingTrack
+```
+
+(No Git? Click **Code → Download ZIP** on GitHub, unzip it, and `cd` into the unzipped folder.)
+To update later, run `git pull` inside the folder.
+
+### 3. Run the desktop app
+
+From inside the repository folder:
+
+```bash
+cargo run --release
+```
+
+The first build downloads and compiles all dependencies and takes a few minutes. Later runs start in seconds.
+The app window opens when the build finishes.
+
+To start with the simulated demo files already loaded:
+
+| Shell                  | Command                                              |
+| ---------------------- | ---------------------------------------------------- |
+| macOS / Linux / Git Bash | `WINGTRACK_DEMO=1 cargo run --release`             |
+| PowerShell             | `$env:WINGTRACK_DEMO=1; cargo run --release`         |
+| Command Prompt (cmd)   | `set WINGTRACK_DEMO=1 && cargo run --release`        |
+
+The compiled program is saved as `target/release/wingtrack` (`wingtrack.exe` on Windows); you can run that
+file directly next time without `cargo`. Ready-made builds for Windows, macOS and Linux can also be downloaded
+from the latest run on the repository's **Actions** tab (artifacts `wingtrack-<os>`).
+
+### 4. Using it
+
+- Load data with **Open…** or by dragging CSV files onto the window. The firmware profile is detected
+  automatically; change it per file under *Files & firmware* if needed.
+- **Load demo** loads three simulated files (a NanoFox 30Days Wildcloud export with two Leisler's bats,
+  a TinyFox export, a CTT GPS export) — simulated tracks, not real data.
+- **Annotate with ERA5** in the side panel downloads wind and weather (internet connection needed).
+- Space plays/pauses, ← / → step between fixes.
+
+### Optional: video export as MP4
+
+GIF export works out of the box. For MP4, install [ffmpeg](https://ffmpeg.org/download.html) and make sure
+`ffmpeg -version` works in a new terminal (Windows: `winget install ffmpeg`; macOS: `brew install ffmpeg`;
+Ubuntu: `sudo apt install ffmpeg`). Restart WingTrack afterwards.
+
+### Optional: run in the browser
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install --locked trunk          # one-time, takes a few minutes
+trunk serve --release                 # then open http://127.0.0.1:8080
+```
+
+### Tests
+
+```bash
+cargo test --lib      # parsers, weather batching/annotation, geodesy, export round-trip, video encoding
+```
+
+### Troubleshooting
+
+| Problem | Fix |
+| ------- | --- |
+| `'cargo' is not recognized` / `cargo: command not found` | Rust is not on your PATH yet — open a new terminal. On Windows, re-run `rustup-init.exe` if it still fails. |
+| `'trunk' is not recognized` | Install it: `cargo install --locked trunk` (only needed for the browser version). |
+| `linker 'link.exe' not found` (Windows) | Install the Visual Studio C++ Build Tools (step 1). |
+| `package requires rustc 1.95` | `rustup update` |
+| `could not find Cargo.toml` | You are not in the repository folder — `cd` into `WingTrack` first. |
+| MP4 greyed out in *Export video* | ffmpeg was not found on PATH; install it and restart the app, or use GIF. |
+
+### Continuous integration
 
 Pushing to `main` on GitHub runs `.github/workflows/ci.yml`: tests + clippy, desktop builds for
 Linux/macOS/Windows (downloadable artifacts), and a web build deployed to GitHub Pages
 (enable *Settings → Pages → Source: GitHub Actions*).
-
-Load data with **Open…** or by dragging CSV files onto the window; **Load demo** loads three simulated
-files (a NanoFox 30Days Wildcloud export with two Leisler's bats, a TinyFox export, a CTT GPS export) — simulated tracks, not real data.
 
 ## Adding a tag type / firmware
 
@@ -116,6 +218,7 @@ and sensor samples go into `Track::sensors` so they appear in the chart automati
 | `src/geo.rs`     | great-circle maths, solar elevation, barometric altitude, wind vectors              |
 | `src/tiles.rs`   | basemaps and NASA GIBS date-specific tile sources                                   |
 | `src/app.rs`     | egui UI: map plugin, timeline, charts, export                                       |
+| `src/video.rs`   | video export: frame capture/cropping, MP4 (ffmpeg) and GIF encoders                 |
 | `src/demo.rs`    | simulated demo files in raw export formats                                          |
 
 MIT licence. Map data © OpenStreetMap contributors, Esri, CARTO; imagery NASA EOSDIS GIBS; weather ERA5 (Copernicus) via Open-Meteo.

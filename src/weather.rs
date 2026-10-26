@@ -89,6 +89,11 @@ pub struct AnnotateOptions {
     pub night_only: bool,
     /// Ignore steps longer than this when sampling segments.
     pub max_segment_h: f32,
+    /// Also download a regular grid of cells this far (degrees) around the tracks, so the
+    /// wind-field display extends beyond the fixes. 0 = only cells the fixes need.
+    pub field_margin_deg: f32,
+    /// Spacing of that grid, in 0.25° ERA5 cells.
+    pub field_stride: i32,
 }
 
 impl Default for AnnotateOptions {
@@ -99,6 +104,8 @@ impl Default for AnnotateOptions {
             segments: true,
             night_only: true,
             max_segment_h: 72.0,
+            field_margin_deg: 1.0,
+            field_stride: 2,
         }
     }
 }
@@ -335,6 +342,59 @@ pub fn sample_points(tracks: &[Track], opts: &AnnotateOptions) -> Vec<(f64, f64,
                     pts.push((lat, lon, t));
                 }
             }
+        }
+    }
+    pts
+}
+
+/// Cells of the wind-field grid: every `field_stride`-th ERA5 cell in the tracks' bounding
+/// box padded by `field_margin_deg`.
+pub fn field_cells(tracks: &[Track], opts: &AnnotateOptions) -> Vec<CellKey> {
+    if opts.field_margin_deg <= 0.0 {
+        return Vec::new();
+    }
+    let mut it = tracks.iter().flat_map(|t| t.fixes.iter());
+    let Some(f0) = it.next() else {
+        return Vec::new();
+    };
+    let (mut s, mut n, mut w, mut e) = (f0.lat, f0.lat, f0.lon, f0.lon);
+    for f in it {
+        s = s.min(f.lat);
+        n = n.max(f.lat);
+        w = w.min(f.lon);
+        e = e.max(f.lon);
+    }
+    let m = opts.field_margin_deg as f64;
+    let st = opts.field_stride.max(1);
+    let lo = cell_of((s - m).max(-90.0), w - m);
+    let hi = cell_of((n + m).min(90.0), e + m);
+    let snap = |a: i32| a.div_euclid(st) * st;
+    let mut out = Vec::new();
+    let mut i = snap(lo.0);
+    while i <= hi.0 {
+        let mut j = snap(lo.1);
+        while j <= hi.1 {
+            out.push((i, j));
+            j += st;
+        }
+        i += st;
+    }
+    out
+}
+
+/// One sample per day of the tracking period for every [`field_cells`] cell, for
+/// [`WeatherStore::plan`].
+pub fn field_points(tracks: &[Track], opts: &AnnotateOptions) -> Vec<(f64, f64, i64)> {
+    let cells = field_cells(tracks, opts);
+    let ts = tracks.iter().flat_map(|t| t.fixes.iter().map(|f| f.t));
+    let (Some(t0), Some(t1)) = (ts.clone().min(), ts.max()) else {
+        return Vec::new();
+    };
+    let mut pts = Vec::new();
+    for d in day_of(t0)..=day_of(t1) {
+        for &k in &cells {
+            let (la, lo) = cell_center(k);
+            pts.push((la, lo, d * 86400 + 43_200));
         }
     }
     pts
@@ -654,5 +714,36 @@ mod tests {
                 || (interp_angle(350.0, 10.0, 0.5) - 360.0).abs() < 1e-4
         );
         assert_eq!(parse_day("1970-01-02"), Some(1));
+    }
+
+    #[test]
+    fn wind_field_grid_extends_beyond_tracks() {
+        let mut tr = Track::new("a", String::from("NanoFox"), "");
+        tr.fixes
+            .push(Fix::new(0, 45.9, 13.3, LocationSource::SigfoxAtlas));
+        tr.fixes.push(Fix::new(
+            86_400 * 2,
+            45.6,
+            12.9,
+            LocationSource::SigfoxAtlas,
+        ));
+        let tracks = vec![tr];
+        let opts = AnnotateOptions::default(); // 1° margin, every 2nd cell (0.5°)
+        let cells = field_cells(&tracks, &opts);
+        assert!(cells.iter().all(|k| k.0 % 2 == 0 && k.1 % 2 == 0));
+        let lats = cells.iter().map(|&k| cell_center(k).0);
+        assert!(lats.clone().fold(f64::MAX, f64::min) <= 44.6 + 1e-9);
+        assert!(lats.fold(f64::MIN, f64::max) >= 46.9 - 1e-9);
+        // 3 days × every cell, and planning picks them all up.
+        let pts = field_points(&tracks, &opts);
+        assert_eq!(pts.len(), cells.len() * 3);
+        let reqs = WeatherStore::default().plan(&pts, Model::Era5, 1000);
+        let planned: usize = reqs.iter().map(|r| r.cells.len()).sum();
+        assert_eq!(planned, cells.len());
+        let off = AnnotateOptions {
+            field_margin_deg: 0.0,
+            ..Default::default()
+        };
+        assert!(field_points(&tracks, &off).is_empty());
     }
 }

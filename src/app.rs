@@ -5,10 +5,12 @@ use crate::geo;
 use crate::model::{Fix, LocationSource, SensorKind, Track};
 use crate::table::{Table, fmt_date, fmt_time};
 use crate::tiles::{Basemap, Gibs, SatLayer};
+use crate::video;
 use crate::weather::{self, AnnotateOptions, Model, Request, WeatherStore, WindLevel};
-use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Ui, pos2, vec2};
+use egui::{Align2, Color32, ColorImage, FontId, Pos2, Rect, Stroke, Ui, pos2, vec2};
 use egui_plot::{GridMark, HoverPosition, Legend, Line, Plot, PlotPoints, Points, VLine};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use walkers::{HttpTiles, MapMemory, Plugin, Position, Projector, Tiles, lon_lat};
 
@@ -62,6 +64,85 @@ impl ColorBy {
             ColorBy::Altitude => "Altitude",
             ColorBy::GroundSpeed => "Ground speed",
             ColorBy::Time => "Time",
+        }
+    }
+}
+
+/// Colour scale for the ERA5 wind-field arrows (wind speed 0–20 m/s).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WindPalette {
+    Viridis,
+    Warm,
+    Cool,
+    Turbo,
+    White,
+    Black,
+}
+
+impl WindPalette {
+    const ALL: [WindPalette; 6] = [
+        WindPalette::Viridis,
+        WindPalette::Warm,
+        WindPalette::Cool,
+        WindPalette::Turbo,
+        WindPalette::White,
+        WindPalette::Black,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            WindPalette::Viridis => "Viridis (light maps)",
+            WindPalette::Warm => "Warm: white → yellow → magenta",
+            WindPalette::Cool => "Cool: cyan → magenta",
+            WindPalette::Turbo => "Turbo (rainbow)",
+            WindPalette::White => "White",
+            WindPalette::Black => "Black",
+        }
+    }
+    /// Satellite imagery is dark and busy, so it gets bright colours; street/topo maps are light.
+    fn default_for(b: Basemap) -> Self {
+        match b {
+            Basemap::EsriImagery => WindPalette::Warm,
+            Basemap::CartoDark => WindPalette::Cool,
+            Basemap::OpenStreetMap | Basemap::EsriTopo => WindPalette::Viridis,
+        }
+    }
+    /// `x` = wind speed / 20 m/s.
+    fn color(self, x: f32) -> Color32 {
+        match self {
+            WindPalette::Viridis => viridis(x),
+            WindPalette::Warm => lerp_stops(
+                &[
+                    [255.0, 255.0, 255.0],
+                    [255.0, 240.0, 80.0],
+                    [255.0, 170.0, 0.0],
+                    [255.0, 80.0, 40.0],
+                    [255.0, 0.0, 150.0],
+                ],
+                x,
+            ),
+            WindPalette::Cool => lerp_stops(&[[0.0, 255.0, 255.0], [255.0, 0.0, 255.0]], x),
+            WindPalette::Turbo => lerp_stops(
+                &[
+                    [48.0, 18.0, 59.0],
+                    [70.0, 130.0, 248.0],
+                    [27.0, 229.0, 181.0],
+                    [164.0, 252.0, 59.0],
+                    [251.0, 185.0, 56.0],
+                    [226.0, 66.0, 9.0],
+                    [122.0, 4.0, 3.0],
+                ],
+                x,
+            ),
+            WindPalette::White => Color32::WHITE,
+            WindPalette::Black => Color32::BLACK,
+        }
+    }
+    /// Contrasting outline drawn under each arrow.
+    fn halo(self) -> Option<Color32> {
+        match self {
+            WindPalette::Viridis => None,
+            WindPalette::Black => Some(Color32::from_white_alpha(170)),
+            _ => Some(Color32::from_black_alpha(170)),
         }
     }
 }
@@ -184,6 +265,8 @@ pub struct WingApp {
     show_wind_arrows: bool,
     show_wind_field: bool,
     wind_field_night_only: bool,
+    /// User's wind palette per basemap; missing → [`WindPalette::default_for`].
+    wind_palettes: HashMap<Basemap, WindPalette>,
     skip_daytime: bool,
     max_error_km: f32,
     hide_insignificant: bool,
@@ -201,6 +284,33 @@ pub struct WingApp {
     req_done: usize,
     req_failed: usize,
     since_annotate: usize,
+
+    // video export
+    video: video::Settings,
+    video_dialog: bool,
+    ffmpeg: Option<bool>,
+    rec: Option<Recording>,
+    map_rect: Rect,
+    timeline_rect: Rect,
+}
+
+/// An in-progress video export (see [`crate::video`]).
+struct Recording {
+    sink: video::Sink,
+    shot_tx: Sender<Arc<ColorImage>>,
+    shot_rx: Receiver<Arc<ColorImage>>,
+    /// Capture area in points, fixed when recording starts.
+    rect: Rect,
+    downscale: usize,
+    t: f64,
+    t_end: f64,
+    dt: f64,
+    waiting: bool,
+    /// Frames to render before the first capture so map tiles can load.
+    warmup: u32,
+    frames: usize,
+    total: usize,
+    name: String,
 }
 
 impl WingApp {
@@ -233,6 +343,7 @@ impl WingApp {
             show_wind_arrows: false,
             show_wind_field: true,
             wind_field_night_only: false,
+            wind_palettes: HashMap::new(),
             skip_daytime: false,
             max_error_km: 25.0,
             hide_insignificant: false,
@@ -248,6 +359,12 @@ impl WingApp {
             req_done: 0,
             req_failed: 0,
             since_annotate: 0,
+            video: video::Settings::default(),
+            video_dialog: false,
+            ffmpeg: None,
+            rec: None,
+            map_rect: Rect::NOTHING,
+            timeline_rect: Rect::NOTHING,
         };
         let _ = app.memory.set_zoom(5.0);
         app.memory.center_at(lon_lat(9.17, 47.67));
@@ -437,7 +554,7 @@ impl WingApp {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let msg = match web_download(name, &csv) {
+            let msg = match web_download(name, csv.as_bytes(), "text/csv") {
                 Ok(()) => format!("Downloaded {name}"),
                 Err(e) => format!("! download failed: {e}"),
             };
@@ -445,10 +562,274 @@ impl WingApp {
         }
     }
 
+    // ------------------------------------------------------------------ video
+
+    fn capture_rect(&self) -> Rect {
+        if self.video.include_timeline && self.timeline_rect.is_positive() {
+            self.map_rect.union(self.timeline_rect)
+        } else {
+            self.map_rect
+        }
+    }
+
+    /// (start, end, tracking seconds per frame, frame count)
+    fn video_plan(&self) -> (f64, f64, f64, usize) {
+        let dt = SPEEDS[self.video.speed_idx].0 / self.video.effective_fps() as f64;
+        let t0 = if self.video.from_cursor {
+            self.t_now
+        } else {
+            self.t_min
+        };
+        let total = ((self.t_max - t0).max(0.0) / dt).floor() as usize + 1;
+        (t0, self.t_max, dt, total)
+    }
+
+    fn start_recording(&mut self, ctx: &egui::Context) {
+        let rect = self.capture_rect();
+        if !rect.is_positive() {
+            self.status("! video: nothing to capture");
+            return;
+        }
+        let (t0, t_end, dt, total) = self.video_plan();
+        let (fmt, fps) = (self.video.format, self.video.effective_fps());
+        #[cfg(not(target_arch = "wasm32"))]
+        let (sink, name) = {
+            let Some(path) = rfd::FileDialog::new()
+                .set_file_name(format!("wingtrack.{}", fmt.ext()))
+                .add_filter(fmt.label(), &[fmt.ext()])
+                .save_file()
+            else {
+                return;
+            };
+            let name = path.display().to_string();
+            (video::Sink::new(fmt, fps, path), name)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let (sink, name) = (
+            video::Sink::new(fmt, fps),
+            format!("wingtrack.{}", fmt.ext()),
+        );
+        let (shot_tx, shot_rx) = channel();
+        self.playing = false;
+        self.video_dialog = false;
+        self.t_now = t0;
+        self.status(format!("Recording {total} frames to {name}…"));
+        self.rec = Some(Recording {
+            sink,
+            shot_tx,
+            shot_rx,
+            rect,
+            downscale: self.video.downscale,
+            t: t0,
+            t_end,
+            dt,
+            waiting: false,
+            warmup: 60,
+            frames: 0,
+            total,
+            name,
+        });
+        ctx.request_repaint();
+    }
+
+    /// One step of the capture loop: collect a finished screenshot, advance the clock, and
+    /// request the next one. Runs before the UI so the requested frame shows the new time.
+    fn record_tick(&mut self, ctx: &egui::Context) {
+        let Some(mut rec) = self.rec.take() else {
+            return;
+        };
+        self.playing = false;
+        let ppp = ctx.pixels_per_point();
+        let px = [
+            (rec.rect.min.x * ppp).round() as usize,
+            (rec.rect.min.y * ppp).round() as usize,
+            (rec.rect.width() * ppp).round() as usize,
+            (rec.rect.height() * ppp).round() as usize,
+        ];
+        let mut done: Option<Result<(), String>> = None;
+        while let Ok(img) = rec.shot_rx.try_recv() {
+            match video::prepare(&img, px, rec.downscale).and_then(|f| rec.sink.push(f)) {
+                Ok(()) => {
+                    rec.frames += 1;
+                    rec.waiting = false;
+                    rec.t += rec.dt;
+                }
+                Err(e) => {
+                    done = Some(Err(e));
+                    break;
+                }
+            }
+        }
+        if done.is_none() && !rec.waiting {
+            if rec.warmup > 0 {
+                rec.warmup -= 1;
+                self.t_now = rec.t;
+                ctx.request_repaint();
+            } else {
+                self.t_now = rec.t;
+                if self.skip_daytime {
+                    self.skip_to_night();
+                    rec.t = self.t_now;
+                }
+                if rec.t > rec.t_end {
+                    done = Some(Ok(()));
+                } else {
+                    let tx = rec.shot_tx.clone();
+                    let c = ctx.clone();
+                    ctx.request_screenshot(move |img| {
+                        let _ = tx.send(img);
+                        c.request_repaint();
+                    });
+                    rec.waiting = true;
+                }
+            }
+        }
+        match done {
+            None => self.rec = Some(rec),
+            Some(r) => self.finish_recording(rec, r, ctx),
+        }
+    }
+
+    fn finish_recording(&mut self, rec: Recording, r: Result<(), String>, ctx: &egui::Context) {
+        let Recording {
+            sink, name, frames, ..
+        } = rec;
+        if let Err(e) = r {
+            self.status(format!("! video export failed: {e}"));
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::spawn(move || drop(sink.finish()));
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.status(format!("Finishing video ({frames} frames)…"));
+            let tx = self.tx.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let msg = match sink.finish() {
+                    Ok(()) => format!("Saved video {name} ({frames} frames)"),
+                    Err(e) => format!("! video export failed: {e}"),
+                };
+                let _ = tx.send(Msg::Status(msg));
+                ctx.request_repaint();
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = ctx;
+            let msg = match sink
+                .finish()
+                .and_then(|b| web_download(&name, &b, "image/gif"))
+            {
+                Ok(()) => format!("Downloaded {name} ({frames} frames)"),
+                Err(e) => format!("! video export failed: {e}"),
+            };
+            self.status(msg);
+        }
+    }
+
+    fn open_video_dialog(&mut self) {
+        self.video_dialog = true;
+        self.video.speed_idx = self.speed_idx;
+        if self.ffmpeg.is_none() {
+            let ok = video::ffmpeg_available();
+            self.ffmpeg = Some(ok);
+            if ok {
+                self.video.format = video::Format::Mp4;
+            }
+        }
+    }
+
+    fn video_window(&mut self, ctx: &egui::Context) {
+        if !self.video_dialog {
+            return;
+        }
+        let mut open = true;
+        let mut start = false;
+        egui::Window::new("Export video")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let ffmpeg = self.ffmpeg.unwrap_or(false);
+                egui::ComboBox::from_label("format")
+                    .selected_text(self.video.format.label())
+                    .show_ui(ui, |ui| {
+                        ui.add_enabled_ui(ffmpeg, |ui| {
+                            ui.selectable_value(&mut self.video.format, video::Format::Mp4, video::Format::Mp4.label())
+                        })
+                        .response
+                        .on_disabled_hover_text(if cfg!(target_arch = "wasm32") {
+                            "MP4 needs the desktop app"
+                        } else {
+                            "ffmpeg was not found on PATH"
+                        });
+                        ui.selectable_value(&mut self.video.format, video::Format::Gif, video::Format::Gif.label());
+                    });
+                ui.add(egui::Slider::new(&mut self.video.fps, 5..=60).text("frames per second"));
+                if self.video.effective_fps() != self.video.fps {
+                    ui.weak(format!("GIF is limited to {} fps", self.video.effective_fps()));
+                }
+                egui::ComboBox::from_label("tracking time per video second")
+                    .selected_text(SPEEDS[self.video.speed_idx].1)
+                    .show_ui(ui, |ui| {
+                        for (i, s) in SPEEDS.iter().enumerate() {
+                            ui.selectable_value(&mut self.video.speed_idx, i, s.1);
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.video.from_cursor, false, "whole timeline");
+                    ui.radio_value(&mut self.video.from_cursor, true, "from cursor to end");
+                });
+                let res = |k: usize| match k {
+                    1 => "full",
+                    2 => "1/2",
+                    _ => "1/3",
+                };
+                egui::ComboBox::from_label("resolution")
+                    .selected_text(res(self.video.downscale))
+                    .show_ui(ui, |ui| {
+                        for k in 1..=3 {
+                            ui.selectable_value(&mut self.video.downscale, k, res(k));
+                        }
+                    });
+                ui.checkbox(&mut self.video.include_timeline, "include timeline & sensor chart");
+                ui.separator();
+                let r = self.capture_rect();
+                let ppp = ctx.pixels_per_point();
+                let k = self.video.downscale as f32;
+                let (_, _, _, total) = self.video_plan();
+                ui.label(format!(
+                    "{total} frames · {:.1} s of video · {}×{} px",
+                    total as f32 / self.video.effective_fps() as f32,
+                    ((r.width() * ppp / k) as u32) & !1,
+                    ((r.height() * ppp / k) as u32) & !1,
+                ));
+                if self.skip_daytime {
+                    ui.weak("“skip daytime” is on: day hours are left out, so the video will be shorter.");
+                }
+                if total > 5000 {
+                    ui.colored_label(Color32::from_rgb(255, 180, 80), "That's a lot of frames — pick a faster speed?");
+                }
+                ui.weak(
+                    "Records the map (basemap, satellite layer, wind field, legend) as currently shown. \
+                     Set zoom and layers first and keep the window size fixed while recording.",
+                );
+                if ui.add_enabled(total > 0, egui::Button::new("Start recording")).clicked() {
+                    start = true;
+                }
+            });
+        self.video_dialog = open && !start;
+        if start {
+            self.start_recording(ctx);
+        }
+    }
+
     // ------------------------------------------------------------------ weather
 
     fn start_weather(&mut self) {
-        let pts = weather::sample_points(&self.tracks, &self.opts);
+        let mut pts = weather::sample_points(&self.tracks, &self.opts);
+        pts.extend(weather::field_points(&self.tracks, &self.opts));
         let reqs = self
             .store
             .plan(&pts, self.opts.model, weather::latest_available_day());
@@ -601,6 +982,13 @@ impl WingApp {
         self.memory.center_at(lon_lat((c + d) / 2.0, (a + b) / 2.0));
     }
 
+    fn wind_palette(&self) -> WindPalette {
+        self.wind_palettes
+            .get(&self.basemap)
+            .copied()
+            .unwrap_or(WindPalette::default_for(self.basemap))
+    }
+
     /// Corners and centre of the area of interest: the downloaded ERA5 cells, or the
     /// visible fixes when no weather is loaded.
     fn night_probe_points(&self) -> Vec<(f64, f64)> {
@@ -611,7 +999,11 @@ impl WingApp {
                 .flat_map(|t| t.fixes.iter().map(|f| (f.lat, f.lon)))
                 .collect()
         } else {
-            self.store.cells.keys().map(|&k| weather::cell_center(k)).collect()
+            self.store
+                .cells
+                .keys()
+                .map(|&k| weather::cell_center(k))
+                .collect()
         };
         let Some(&(la0, lo0)) = pts.first() else {
             return Vec::new();
@@ -623,7 +1015,13 @@ impl WingApp {
             w = w.min(lo);
             e = e.max(lo);
         }
-        vec![(s, w), (s, e), (n, w), (n, e), ((s + n) / 2.0, (w + e) / 2.0)]
+        vec![
+            (s, w),
+            (s, e),
+            (n, w),
+            (n, e),
+            ((s + n) / 2.0, (w + e) / 2.0),
+        ]
     }
 
     /// If it is day everywhere in the area at `t_now`, jump forward to the next night.
@@ -632,7 +1030,11 @@ impl WingApp {
         if probes.is_empty() {
             return;
         }
-        let night = |t: f64| probes.iter().any(|&(la, lo)| geo::is_night(t as i64, la, lo));
+        let night = |t: f64| {
+            probes
+                .iter()
+                .any(|&(la, lo)| geo::is_night(t as i64, la, lo))
+        };
         if night(self.t_now) {
             return;
         }
@@ -687,6 +1089,23 @@ impl WingApp {
             }
             if ui.add_enabled(!self.tracks.is_empty(), egui::Button::new("Export annotated CSV")).clicked() {
                 self.export();
+            }
+            if let Some(rec) = &self.rec {
+                let frac = rec.frames as f32 / rec.total.max(1) as f32;
+                let text = format!("REC {}/{}", rec.frames, rec.total);
+                ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(text));
+                if ui.button("Stop & save").clicked()
+                    && let Some(rec) = self.rec.take()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.finish_recording(rec, Ok(()), &ctx);
+                }
+            } else if ui
+                .add_enabled(!self.tracks.is_empty(), egui::Button::new("Export video…"))
+                .on_hover_text("MP4 or GIF of the animated map, legend and sensor chart")
+                .clicked()
+            {
+                self.open_video_dialog();
             }
             if ui.add_enabled(!self.tracks.is_empty(), egui::Button::new("Clear")).clicked() {
                 self.tracks.clear();
@@ -819,6 +1238,26 @@ impl WingApp {
                     .on_hover_text("Draw wind arrows only where the sun is more than 6° below the horizon at the cursor time");
                     ui.checkbox(&mut self.skip_daytime, "skip daytime during playback")
                         .on_hover_text("Playback jumps ahead whenever it is day across the whole wind-field / track area");
+                    let mut pal = self.wind_palette();
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("wind_palette").selected_text(pal.label()).show_ui(ui, |ui| {
+                            for p in WindPalette::ALL {
+                                ui.selectable_value(&mut pal, p, p.label());
+                            }
+                        });
+                        ui.label("palette");
+                        if self.wind_palettes.contains_key(&self.basemap)
+                            && ui.small_button("default").on_hover_text("Use this basemap's default palette").clicked()
+                        {
+                            self.wind_palettes.remove(&self.basemap);
+                            pal = WindPalette::default_for(self.basemap);
+                        }
+                    })
+                    .response
+                    .on_hover_text("Remembered separately for each basemap");
+                    if pal != self.wind_palette() {
+                        self.wind_palettes.insert(self.basemap, pal);
+                    }
                 });
                 ui.checkbox(&mut self.trail_to_cursor, "draw tracks only up to cursor");
                 ui.checkbox(&mut self.follow, "follow selected animal");
@@ -842,6 +1281,30 @@ impl WingApp {
                     self.opts.segments,
                     egui::Slider::new(&mut self.opts.max_segment_h, 6.0..=168.0).text("max step length (h)"),
                 );
+                ui.add(
+                    egui::Slider::new(&mut self.opts.field_margin_deg, 0.0..=5.0)
+                        .step_by(0.25)
+                        .suffix("°")
+                        .text("wind-field margin"),
+                )
+                .on_hover_text("Also download a grid of cells this far around the tracks, so the wind field covers the whole region");
+                let spacing = |s: i32| format!("{}°", s as f64 * weather::GRID);
+                ui.add_enabled_ui(self.opts.field_margin_deg > 0.0, |ui| {
+                    egui::ComboBox::from_label("wind-field spacing").selected_text(spacing(self.opts.field_stride)).show_ui(ui, |ui| {
+                        for s in [1, 2, 4] {
+                            ui.selectable_value(&mut self.opts.field_stride, s, spacing(s));
+                        }
+                    });
+                });
+                if self.opts.field_margin_deg > 0.0 && !self.tracks.is_empty() {
+                    let n = weather::field_cells(&self.tracks, &self.opts).len();
+                    let txt = format!("{n} wind-field cells (downloaded with the next Annotate)");
+                    if n > 600 {
+                        ui.colored_label(Color32::from_rgb(255, 180, 80), txt + " — many API calls; widen the spacing?");
+                    } else {
+                        ui.weak(txt);
+                    }
+                }
                 let busy = !self.queue.is_empty() || !self.in_flight.is_empty();
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.tracks.is_empty() && !busy, egui::Button::new("Annotate with ERA5")).clicked() {
@@ -1038,6 +1501,7 @@ impl WingApp {
         }
 
         let basemap = self.basemap;
+        let wind_pal = self.wind_palette();
         let base = self
             .base_tiles
             .entry(basemap)
@@ -1069,6 +1533,7 @@ impl WingApp {
             show_wind_arrows: self.show_wind_arrows,
             show_wind_field: self.show_wind_field,
             wind_field_night_only: self.wind_field_night_only,
+            wind_palette: wind_pal,
             store: &self.store,
             selected: self.selected,
             app: ViewCfg {
@@ -1087,6 +1552,7 @@ impl WingApp {
             map = map.with_layer(st as &mut dyn Tiles, self.sat_opacity);
         }
         let color_by = self.color_by;
+        let wind_legend = (self.show_wind_field && !self.store.is_empty()).then_some(wind_pal);
         let sat_on = self.sat_on;
         let sat_label = self.sat_layer.label();
         let t_now = self.t_now;
@@ -1150,7 +1616,7 @@ impl WingApp {
                 FontId::proportional(14.0),
                 Color32::WHITE,
             );
-            legend(p, r, color_by);
+            legend(p, r, color_by, wind_legend);
         });
 
         if let Some(sel) = interaction.clicked {
@@ -1285,6 +1751,7 @@ impl eframe::App for WingApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_messages();
         self.pump_weather(ctx);
+        self.record_tick(ctx);
         if self.playing {
             let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
             self.t_now += dt * SPEEDS[self.speed_idx].0;
@@ -1319,11 +1786,17 @@ impl eframe::App for WingApp {
             .resizable(true)
             .default_size(330.0)
             .show(ui, |ui| self.side_panel(ui));
-        egui::Panel::bottom("timeline")
+        self.timeline_rect = egui::Panel::bottom("timeline")
             .resizable(true)
             .default_size(250.0)
-            .show(ui, |ui| self.timeline(ui));
-        egui::CentralPanel::no_frame().show(ui, |ui| self.map(ui));
+            .show(ui, |ui| self.timeline(ui))
+            .response
+            .rect;
+        self.map_rect = egui::CentralPanel::no_frame()
+            .show(ui, |ui| self.map(ui))
+            .response
+            .rect;
+        self.video_window(&ctx);
     }
 }
 
@@ -1352,6 +1825,7 @@ struct TrackLayer<'a> {
     show_wind_arrows: bool,
     show_wind_field: bool,
     wind_field_night_only: bool,
+    wind_palette: WindPalette,
     store: &'a WeatherStore,
     selected: Option<(usize, usize)>,
     app: ViewCfg,
@@ -1413,10 +1887,11 @@ impl Plugin for TrackLayer<'_> {
             let ppm = projector.scale_pixel_per_meter(projector.unproject(clip.center().to_vec2()));
             let cell_px = (weather::GRID * 111_000.0) as f32 * ppm;
             let stride = ((22.0 / cell_px.max(0.1)).ceil() as i32).max(1);
+            // One arrow per stride×stride block of cells: the cell with data closest to the
+            // block's corner, so the pattern is stable while panning and works for cells on
+            // any download spacing (fix cells at 0.25°, wind-field grid at 0.5° / 1°).
+            let mut blocks: HashMap<(i32, i32), (i32, Pos2, f32, f32)> = HashMap::new();
             for &k in self.store.cells.keys() {
-                if k.0.rem_euclid(stride) != 0 || k.1.rem_euclid(stride) != 0 {
-                    continue;
-                }
                 let (la, lo) = weather::cell_center(k);
                 let p = to_screen(la, lo);
                 if !clip.expand(20.0).contains(p) {
@@ -1432,10 +1907,21 @@ impl Plugin for TrackLayer<'_> {
                 if ws.is_nan() || wd.is_nan() {
                     continue;
                 }
+                let score = k.0.rem_euclid(stride) + k.1.rem_euclid(stride);
+                let b = (k.0.div_euclid(stride), k.1.div_euclid(stride));
+                if blocks.get(&b).is_none_or(|e| score < e.0) {
+                    blocks.insert(b, (score, p, ws, wd));
+                }
+            }
+            let pal = self.wind_palette;
+            for (_, p, ws, wd) in blocks.into_values() {
                 let (u, vv) = geo::wind_uv(ws as f64, wd as f64);
                 let len = (ws * 2.2).clamp(4.0, 34.0);
                 let dir = vec2(u as f32, -(vv as f32)).normalized() * len;
-                let c = viridis(ws / 20.0).gamma_multiply(0.85);
+                if let Some(h) = pal.halo() {
+                    painter.arrow(p - dir * 0.5, dir, Stroke::new(3.8, h));
+                }
+                let c = pal.color(ws / 20.0).gamma_multiply(0.9);
                 painter.arrow(p - dir * 0.5, dir, Stroke::new(1.6, c));
             }
         }
@@ -1557,9 +2043,22 @@ impl Plugin for TrackLayer<'_> {
     }
 }
 
-fn legend(p: &egui::Painter, r: Rect, by: ColorBy) {
+/// Track colour legend, plus the wind-field speed scale stacked above it when shown.
+fn legend(p: &egui::Painter, r: Rect, by: ColorBy, wind: Option<WindPalette>) {
+    let mut origin = pos2(r.left() + 12.0, r.bottom() - 40.0);
+    if track_legend(p, origin, by) {
+        origin.y -= 60.0;
+    }
+    if let Some(pal) = wind {
+        colorbar(p, origin, "ERA5 wind speed (m/s)", "0", "20+", &|x| {
+            pal.color(x)
+        });
+    }
+}
+
+fn track_legend(p: &egui::Painter, origin: Pos2, by: ColorBy) -> bool {
     let (title, lo, hi, div): (&str, &str, &str, bool) = match by {
-        ColorBy::Individual => return,
+        ColorBy::Individual => return false,
         ColorBy::WindSupport => ("wind support at fix (m/s)", "-10 head", "+10 tail", true),
         ColorBy::SegmentWind => (
             "along-step wind support (m/s)",
@@ -1571,8 +2070,26 @@ fn legend(p: &egui::Painter, r: Rect, by: ColorBy) {
         ColorBy::GroundSpeed => ("ground speed (m/s)", "0", "15", false),
         ColorBy::Time => ("time within track", "start", "end", false),
     };
+    let f = |x: f32| {
+        if div {
+            diverging(x * 2.0 - 1.0)
+        } else {
+            viridis(x)
+        }
+    };
+    colorbar(p, origin, title, lo, hi, &f);
+    true
+}
+
+fn colorbar(
+    p: &egui::Painter,
+    origin: Pos2,
+    title: &str,
+    lo: &str,
+    hi: &str,
+    color: &dyn Fn(f32) -> Color32,
+) {
     let w = 180.0;
-    let origin = pos2(r.left() + 12.0, r.bottom() - 40.0);
     p.rect_filled(
         Rect::from_min_size(origin - vec2(6.0, 20.0), vec2(w + 12.0, 52.0)),
         4.0,
@@ -1588,11 +2105,7 @@ fn legend(p: &egui::Painter, r: Rect, by: ColorBy) {
     let n = 40;
     for i in 0..n {
         let x = i as f32 / (n - 1) as f32;
-        let c = if div {
-            diverging(x * 2.0 - 1.0)
-        } else {
-            viridis(x)
-        };
+        let c = color(x);
         let rr = Rect::from_min_size(
             origin + vec2(x * (w - w / n as f32), 0.0),
             vec2(w / n as f32 + 1.0, 10.0),
@@ -1649,15 +2162,15 @@ fn lerp_stops(s: &[[f32; 3]], x: f32) -> Color32 {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn web_download(name: &str, text: &str) -> Result<(), String> {
+fn web_download(name: &str, bytes: &[u8], mime: &str) -> Result<(), String> {
     use wasm_bindgen::JsCast;
     let win = web_sys::window().ok_or("no window")?;
     let doc = win.document().ok_or("no document")?;
     let parts = js_sys::Array::new();
-    parts.push(&wasm_bindgen::JsValue::from_str(text));
+    parts.push(&js_sys::Uint8Array::from(bytes));
     let opts = web_sys::BlobPropertyBag::new();
-    opts.set_type("text/csv");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &opts)
+    opts.set_type(mime);
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts)
         .map_err(|e| format!("{e:?}"))?;
     let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(|e| format!("{e:?}"))?;
     let a: web_sys::HtmlAnchorElement = doc

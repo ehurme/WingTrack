@@ -5,6 +5,7 @@
 //! * [`table`] + [`firmware`] — read CSV exports and turn them into [`model::Track`]s
 //! * [`weather`] — download ERA5 via Open-Meteo and annotate fixes with wind support etc.
 //! * [`export`] — write annotated tracks back to CSV (readable by R / SigfoxTagPrep)
+//! * [`video`] — MP4 / GIF export of the animated map and charts
 //! * [`app`] — the egui application (native and web)
 
 pub mod app;
@@ -15,6 +16,7 @@ pub mod geo;
 pub mod model;
 pub mod table;
 pub mod tiles;
+pub mod video;
 pub mod weather;
 
 pub use app::WingApp;
