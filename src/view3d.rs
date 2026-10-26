@@ -63,6 +63,9 @@ struct Particle {
     max_age: u32,
 }
 
+/// Camera, exaggeration, auto flag and origin from a shared link.
+type PendingCam = (Camera, Option<f32>, Option<bool>, Option<(f64, f64)>);
+
 pub struct View3D {
     pub cam: Camera,
     /// Vertical exaggeration.
@@ -85,6 +88,8 @@ pub struct View3D {
     /// A step is "not detected" (dotted) when longer than this × the track's median interval.
     pub gap_factor: f32,
     pub follow: bool,
+    /// Camera from a shared link, applied right after the first fit (which sets the origin).
+    pending_cam: Option<PendingCam>,
     origin: Option<(f64, f64)>,
     needs_fit: bool,
     particles: Vec<Vec<Particle>>,
@@ -110,6 +115,7 @@ impl Default for View3D {
             default_alt_m: 0.0,
             gap_factor: 2.5,
             follow: false,
+            pending_cam: None,
             origin: None,
             needs_fit: true,
             particles: Vec::new(),
@@ -279,6 +285,22 @@ impl View3D {
         self.needs_fit = true;
     }
 
+    /// Restore a camera (from a shared link) once the view has been fitted to the data.
+    pub fn set_camera_after_fit(
+        &mut self,
+        cam: Camera,
+        exag: Option<f32>,
+        auto_exag: Option<bool>,
+        origin: Option<(f64, f64)>,
+    ) {
+        self.pending_cam = Some((cam, exag, auto_exag, origin));
+    }
+
+    /// Reference point (lat, lon) the camera coordinates are relative to.
+    pub fn origin(&self) -> Option<(f64, f64)> {
+        self.origin
+    }
+
     fn rand(&mut self) -> f64 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
@@ -415,6 +437,24 @@ impl View3D {
         let mut out = Output::default();
         if self.needs_fit || self.origin.is_none() {
             self.fit(&scene);
+        }
+        if self.origin.is_some()
+            && !self.needs_fit
+            && let Some((cam, exag, auto, origin)) = self.pending_cam.take()
+        {
+            if origin.is_some() {
+                self.origin = origin;
+            }
+            self.cam = Camera {
+                fov_deg: self.cam.fov_deg,
+                ..cam
+            };
+            if let Some(e) = exag {
+                self.exag = e;
+            }
+            if let Some(a) = auto {
+                self.auto_exag = a;
+            }
         }
         let Some(origin) = self.origin else {
             ui.painter().text(
