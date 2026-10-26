@@ -15,6 +15,21 @@ use walkers::{Tile, TileId, Tiles};
 
 const EARTH_KM: f64 = 6371.0088;
 
+/// One colour per displayed level, lowest first: cyan, white, amber, magenta, lime.
+/// Used for particles, plane outlines, labels and the caption, so levels are easy to tell apart.
+pub const LEVEL_COLORS: [[u8; 3]; 5] = [
+    [80, 215, 255],
+    [245, 245, 245],
+    [255, 185, 60],
+    [255, 105, 200],
+    [150, 255, 110],
+];
+
+pub fn level_color(k: usize, alpha: u8) -> Color32 {
+    let c = LEVEL_COLORS[k % LEVEL_COLORS.len()];
+    Color32::from_rgba_unmultiplied(c[0], c[1], c[2], alpha)
+}
+
 #[derive(Clone, Debug)]
 pub struct Camera {
     /// Heading the camera looks towards (degrees from north).
@@ -52,6 +67,8 @@ pub struct View3D {
     pub cam: Camera,
     /// Vertical exaggeration.
     pub exag: f32,
+    /// Choose the exaggeration so the stack of levels is ~20 % as tall as the field is wide.
+    pub auto_exag: bool,
     pub ground_dim: f32,
     pub show_raster: bool,
     /// Which displayed level (index into the slice levels) colours the ground raster.
@@ -80,6 +97,7 @@ impl Default for View3D {
         View3D {
             cam: Camera::default(),
             exag: 120.0,
+            auto_exag: true,
             ground_dim: 0.45,
             show_raster: true,
             raster_level: 0,
@@ -425,6 +443,17 @@ impl View3D {
             self.cam.target[0] += (tgt[0] - self.cam.target[0]) * 0.15;
             self.cam.target[1] += (tgt[1] - self.cam.target[1]) * 0.15;
         }
+        if self.auto_exag
+            && let Some(sl) = scene.slice
+        {
+            let (s, n, w, e) = sl.bbox();
+            let width_km = ((e - w).to_radians() * EARTH_KM * ((s + n) / 2.0).to_radians().cos())
+                .max((n - s).to_radians() * EARTH_KM);
+            let top_km = sl.mean_z.iter().copied().fold(0.3f32, f32::max) / 1000.0;
+            let target = (0.2 * width_km as f32 / top_km).clamp(20.0, 3000.0);
+            // ease towards the target so it doesn't jump when the field changes
+            self.exag += (target - self.exag) * 0.2;
+        }
         let pr = Proj::new(&self.cam, origin, self.exag, rect);
 
         // ---------------------------------------------------------------- ground
@@ -494,7 +523,20 @@ impl View3D {
                 painter.add(Shape::mesh(mesh));
             }
             let (s, n, w, e) = slice.bbox();
+            // Corner posts from the ground to the top level tie the stack together.
+            if self.show_planes
+                && let Some(&top) = slice.mean_z.iter().max_by(|a, b| a.total_cmp(b))
+            {
+                for (la, lo) in [(s, w), (s, e), (n, e), (n, w)] {
+                    if let (Some(a), Some(b)) = (pr.geo(la, lo, 0.0), pr.geo(la, lo, top)) {
+                        painter
+                            .line_segment([a, b], Stroke::new(1.0, Color32::from_white_alpha(45)));
+                    }
+                }
+            }
+            let mut plane_labels: Vec<(Pos2, String, usize)> = Vec::new();
             for (k, &h) in slice.mean_z.iter().enumerate() {
+                let focus = k == rl;
                 if self.show_planes {
                     let corners = [(s, w), (s, e), (n, e), (n, w), (s, w)];
                     let pts: Vec<Pos2> = corners
@@ -502,9 +544,18 @@ impl View3D {
                         .filter_map(|&(la, lo)| pr.geo(la, lo, h))
                         .collect();
                     if pts.len() == 5 {
+                        // faint tinted fill so each level reads as a sheet
+                        painter.add(Shape::convex_polygon(
+                            pts[..4].to_vec(),
+                            level_color(k, if focus { 22 } else { 12 }),
+                            Stroke::NONE,
+                        ));
                         painter.add(Shape::line(
                             pts.clone(),
-                            Stroke::new(1.0, Color32::from_white_alpha(70)),
+                            Stroke::new(
+                                if focus { 2.0 } else { 1.3 },
+                                level_color(k, if focus { 230 } else { 150 }),
+                            ),
                         ));
                         let anchor = pts[..4]
                             .iter()
@@ -515,13 +566,7 @@ impl View3D {
                             Some(p) => format!("{h:.0} m  ({p:.0} hPa)"),
                             None => format!("{h:.0} m"),
                         };
-                        painter.text(
-                            anchor + vec2(-6.0, 0.0),
-                            Align2::RIGHT_CENTER,
-                            label,
-                            FontId::monospace(13.0),
-                            Color32::from_gray(220),
-                        );
+                        plane_labels.push((anchor + vec2(-6.0, 0.0), label, k));
                     }
                 }
                 if self.particles_on && k < self.particles.len() {
@@ -533,7 +578,7 @@ impl View3D {
                             .wind(k, p.lat, p.lon)
                             .map(|(u, v)| (u * u + v * v).sqrt())
                             .unwrap_or(0.0);
-                        let base_a = (90.0 + sp * 9.0).min(230.0);
+                        let base_a = (90.0 + sp * 9.0).min(230.0) * if focus { 1.0 } else { 0.6 };
                         let fade_in = (p.age as f32 / 10.0).min(1.0)
                             * (1.0 - (p.age as f32 / p.max_age as f32).powi(4));
                         let pts: Vec<Pos2> = p
@@ -546,11 +591,28 @@ impl View3D {
                             let a = (base_a * fade_in * (q + 1) as f32 / m as f32) as u8;
                             painter.line_segment(
                                 [seg[0], seg[1]],
-                                Stroke::new(1.1, Color32::from_white_alpha(a)),
+                                Stroke::new(if focus { 1.3 } else { 1.0 }, level_color(k, a)),
                             );
                         }
                     }
                 }
+            }
+            // Level labels, nudged apart so close levels don't overprint.
+            plane_labels.sort_by(|a, b| b.0.y.total_cmp(&a.0.y));
+            let mut last_y = f32::INFINITY;
+            for (mut p, label, k) in plane_labels {
+                if p.y > last_y - 16.0 {
+                    p.y = last_y - 16.0;
+                }
+                last_y = p.y;
+                let lr = painter.text(
+                    p,
+                    Align2::RIGHT_CENTER,
+                    label,
+                    FontId::monospace(13.0),
+                    level_color(k, 255),
+                );
+                painter.circle_filled(lr.left_center() - vec2(7.0, 0.0), 4.0, level_color(k, 255));
             }
         }
 
@@ -695,32 +757,45 @@ impl View3D {
             FontId::monospace(if compact { 13.0 } else { 16.0 }),
             Color32::from_gray(210),
         );
-        let (subtitle, col) = match scene.slice {
-            Some(slice) => {
-                let hs: Vec<String> = slice.mean_z.iter().map(|h| format!("{h:.0}")).collect();
-                (
-                    format!(
-                        "Winds shown at {} m. Dotted line: not detected.",
-                        hs.join(", ")
-                    ),
-                    Color32::from_gray(200),
-                )
+        let fs = if compact { 12.0 } else { 14.0 };
+        let mut y0 = r1.bottom() + 6.0;
+        if let Some(slice) = scene.slice {
+            // "Winds at" + one coloured chip per level (same colours as particles and planes)
+            let mut x = r1.left();
+            let r = painter.text(
+                pos2(x, y0),
+                Align2::LEFT_TOP,
+                "Winds at",
+                FontId::proportional(fs),
+                Color32::from_gray(200),
+            );
+            x = r.right() + 8.0;
+            for (k, h) in slice.mean_z.iter().enumerate() {
+                painter.circle_filled(pos2(x + 4.0, r.center().y), 4.0, level_color(k, 255));
+                let rr = painter.text(
+                    pos2(x + 11.0, y0),
+                    Align2::LEFT_TOP,
+                    format!("{h:.0} m"),
+                    FontId::proportional(fs),
+                    level_color(k, 255),
+                );
+                x = rr.right() + 10.0;
             }
+            y0 = r.bottom() + 2.0;
+        }
+        let (subtitle, col) = match scene.slice {
+            Some(_) => ("Dotted line: not detected.".to_string(), Color32::from_gray(170)),
             None => (
-                "No pressure-level wind for this time — download or import it in the side panel."
+                "No pressure-level wind around the animals at this time - it downloads automatically \
+                 (Open-Meteo), or import an ERA5 cube in the side panel."
                     .to_string(),
                 Color32::from_gray(170),
             ),
         };
         // wrap so it never runs under the camera buttons on the right
         let wrap = (rect.width() - 120.0).max(120.0);
-        let galley = painter.layout(
-            subtitle,
-            FontId::proportional(if compact { 12.0 } else { 14.0 }),
-            col,
-            wrap,
-        );
-        painter.galley(r1.left_bottom() + vec2(0.0, 6.0), galley, col);
+        let galley = painter.layout(subtitle, FontId::proportional(fs), col, wrap);
+        painter.galley(pos2(r1.left(), y0), galley, col);
 
         // km from where each was tagged
         let mut x = rect.left() + 18.0;
