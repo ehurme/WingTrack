@@ -44,10 +44,11 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
   - **wind support, crosswind, airspeed** relative to the step heading
   - **along-step wind support**: hourly samples along the great-circle path between fixes, optionally **night hours only** (sun < −6°)
   - **barometric altitude re-computed with the local ERA5 MSLP** instead of the 1013.25 hPa standard atmosphere
-  - ERA5 wind field (arrows) for the hour under the cursor, with a speed legend; by default it extends 1° around the
-    tracks on a 0.5° grid (*wind-field margin / spacing*), optionally night cells only. The arrow palette has a
-    default per basemap (bright on satellite imagery, viridis on street/topo maps) and can be changed per basemap.
-    Requests are batched by month, 25 grid cells per call, and cached
+  - ERA5 wind field (arrows) for the hour under the cursor, with a speed legend, drawn **around the animals**: after the
+    first *Annotate*, cells within the *wind-field radius* (default 3°, 1° grid) of each animal's position are fetched a
+    week at a time as you move through time, optionally night cells only. The arrow palette has a default per basemap
+    (bright on satellite imagery, viridis on street/topo maps) and can be changed per basemap. Requests are throttled to
+    Open-Meteo's free limits (600 calls/min, 5 000/h) and retried after a rate-limit response.
 - **3D winds at multiple altitudes** (*3D winds* tab) — a tilted map with the wind-speed field for one level,
   flowing particles on stacked pressure-level planes (labelled with their geopotential height), tracks drawn at
   flight altitude with drop lines and ground shadows, dotted segments where the animal was not detected,
@@ -66,8 +67,11 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
   - **Charts**: a *time × height curtain* of wind support / crosswind / speed along a track's path with the
     animal's altitude and the best level overlaid, a *wind profile* at the selected fix (support, crosswind,
     speed vs height), and time series of flight-level and best-level support.
-  - The regional field is downloaded lazily, one day at a time, for the day under the cursor
-    (0.25–2° resolution); along-track profiles are fetched at full 0.25° resolution.
+  - The 3D field follows the animals: nodes within the *field radius* (default 3°) of where they are, fetched a week at
+    a time from the cursor day (0.25–2° resolution); along-track profiles are fetched at full 0.25° resolution.
+  - Each level has its own colour (particles, plane outline, label, caption), planes are joined by corner posts, the
+    level shown in the colour field is highlighted, and the vertical exaggeration is set automatically (*auto*) so the
+    stack is about 20 % as tall as the field is wide.
 - **Timeline & charts** — play/pause at 10 min/s … 1 week/s, step fix-by-fix (← →, Space),
   linked chart of altitude, speeds, wind components, ERA5 variables, location error or raw sensor
   streams (VeDBA, tag temperature, pressure, activity). Click the chart to jump in time; click a fix on the map to inspect it,

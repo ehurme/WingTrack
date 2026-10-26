@@ -127,6 +127,10 @@ MP4 export needs `ffmpeg` on PATH. GIF export works everywhere. On Windows the a
   (level pressure > surface pressure) are masked.
 - `view3d::View3D`: camera, particles and display options; `show()` takes a `Scene` borrowed from the app each frame.
   Everything is projected on the CPU and painted with egui meshes/lines, so it needs no GPU code and runs on WASM.
+- Wind fields (2D surface and 3D pressure levels) are fetched lazily around the animals with
+  `weather::window_points()` (cells within a radius of each animal's position, a week at a time from the cursor day).
+  `app.rs::pump_weather()` throttles requests by their estimated Open-Meteo call weight (`weather::call_weight`:
+  locations × max(1, vars/10) × max(1, days/14)) to 450/min and 4200/h, and re-queues jobs after HTTP 429.
 - `table::Table`: tolerant column lookup by aliases (`t.col(&[...])`) and prefix (`t.col_prefix(...)`).
 
 ## Development conventions

@@ -89,8 +89,8 @@ pub struct AnnotateOptions {
     pub night_only: bool,
     /// Ignore steps longer than this when sampling segments.
     pub max_segment_h: f32,
-    /// Also download a regular grid of cells this far (degrees) around the tracks, so the
-    /// wind-field display extends beyond the fixes. 0 = only cells the fixes need.
+    /// Radius (degrees) of the wind-field window downloaded around each animal's position
+    /// for the days in view, so arrows surround the animals. 0 = only cells the fixes need.
     pub field_margin_deg: f32,
     /// Spacing of that grid, in 0.25° ERA5 cells.
     pub field_stride: i32,
@@ -104,8 +104,8 @@ impl Default for AnnotateOptions {
             segments: true,
             night_only: true,
             max_segment_h: 72.0,
-            field_margin_deg: 1.0,
-            field_stride: 2,
+            field_margin_deg: 3.0,
+            field_stride: 4,
         }
     }
 }
@@ -338,6 +338,11 @@ impl Request {
             url,
         }
     }
+
+    /// Estimated Open-Meteo call count for rate limiting.
+    pub fn weight(&self) -> f32 {
+        call_weight(self.cells.len(), NV, self.end_day - self.start_day + 1)
+    }
 }
 
 /// Latest day ERA5 is expected to be available (≈ 6 days behind real time).
@@ -394,6 +399,64 @@ pub fn field_cells(tracks: &[Track], opts: &AnnotateOptions) -> Vec<CellKey> {
         i += st;
     }
     out
+}
+
+/// Grid points around where each visible animal is on days `day0 .. day0 + ndays`:
+/// every `stride`-th cell within `margin_deg` of its position, checked every 6 h
+/// (positions are held for 12 h before the first and after the last fix).
+/// Each point is stamped 23:00 UTC of its day, so a plan covers that day and the next.
+/// Used to download the wind field lazily, around the animals, for the days in view.
+pub fn window_points(
+    tracks: &[Track],
+    day0: i64,
+    ndays: i64,
+    margin_deg: f64,
+    stride: i32,
+) -> Vec<(f64, f64, i64)> {
+    let st = stride.max(1);
+    let r = (margin_deg / GRID).ceil() as i32;
+    let mut set: HashSet<(CellKey, i64)> = HashSet::new();
+    for tr in tracks.iter().filter(|t| t.visible) {
+        let Some((t0, t1)) = tr.time_range() else {
+            continue;
+        };
+        for d in day0..day0 + ndays.max(1) {
+            for h in [0, 6, 12, 18, 24] {
+                let t = d * 86400 + h * 3600;
+                if t < t0 - 43_200 || t > t1 + 43_200 {
+                    continue;
+                }
+                let Some((la, lo, _)) = tr.position_at(t.clamp(t0, t1) as f64) else {
+                    continue;
+                };
+                let c = cell_of(la, lo);
+                let mut i = (c.0 - r).div_euclid(st) * st;
+                while i <= c.0 + r {
+                    let mut j = (c.1 - r).div_euclid(st) * st;
+                    while j <= c.1 + r {
+                        set.insert(((i, j), d));
+                        j += st;
+                    }
+                    i += st;
+                }
+            }
+        }
+    }
+    let mut pts: Vec<(f64, f64, i64)> = set
+        .into_iter()
+        .map(|(k, d)| {
+            let (la, lo) = cell_center(k);
+            (la, lo, d * 86400 + 82_800)
+        })
+        .collect();
+    pts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    pts
+}
+
+/// Open-Meteo counts a request as several calls when it asks for more than 10 variables or
+/// more than 14 days per location: weight ≈ locations × max(1, vars/10) × max(1, days/14).
+pub fn call_weight(locations: usize, vars: usize, days: i64) -> f32 {
+    locations as f32 * (vars as f32 / 10.0).max(1.0) * (days as f32 / 14.0).max(1.0)
 }
 
 /// One sample per day of the tracking period for every [`field_cells`] cell, for
@@ -719,6 +782,43 @@ mod tests {
             r#"{"error":true,"reason":"Parameter 'start_date' is out of allowed range"}"#,
         );
         assert!(e.unwrap_err().contains("out of allowed range"));
+    }
+
+    #[test]
+    fn window_follows_animals() {
+        let t0 = 1_756_684_800; // 2025-09-01
+        let mut tr = Track::new("a", "NanoFox", "t");
+        // Moves 8° south-west over 4 days.
+        tr.fixes = (0..5)
+            .map(|d| {
+                Fix::new(
+                    t0 + d * 86400,
+                    47.0 - d as f64 * 2.0,
+                    9.0 - d as f64 * 2.0,
+                    LocationSource::SigfoxAtlas,
+                )
+            })
+            .collect();
+        tr.finalize();
+        let tracks = vec![tr];
+        let day = day_of(t0);
+        let d0 = window_points(&tracks, day, 1, 1.0, 4);
+        assert!(!d0.is_empty());
+        // Day-0 points stay near the day's path (47→45 N, 9→7 E) ± radius.
+        assert!(
+            d0.iter()
+                .all(|p| p.0 > 43.5 && p.0 < 48.5 && p.1 > 5.5 && p.1 < 10.5),
+            "{d0:?}"
+        );
+        assert!(d0.iter().all(|p| day_of(p.2) == day));
+        // Day 3 is far from day 0.
+        let d3 = window_points(&tracks, day + 3, 1, 1.0, 4);
+        assert!(!d3.is_empty() && d3.iter().all(|p| p.0 < 43.0));
+        // Long before the track starts / long after it ends: nothing.
+        assert!(window_points(&tracks, day - 3, 1, 1.0, 4).is_empty());
+        assert!(window_points(&tracks, day + 10, 2, 1.0, 4).is_empty());
+        assert!((call_weight(10, 33, 7) - 33.0).abs() < 1e-4);
+        assert!((call_weight(25, 9, 31) - 25.0 * 31.0 / 14.0).abs() < 1e-3);
     }
 
     #[test]

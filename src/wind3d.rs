@@ -697,12 +697,9 @@ impl ProfileRequest {
         let mut vars = vec!["surface_pressure".to_string()];
         for &l in levels {
             let l = l as i32;
-            for v in [
-                "wind_speed",
-                "wind_direction",
-                "geopotential_height",
-                "temperature",
-            ] {
+            // Temperature is not requested: not needed for display or annotation, and it
+            // keeps each request at 25 variables (fewer Open-Meteo calls).
+            for v in ["wind_speed", "wind_direction", "geopotential_height"] {
                 vars.push(format!("{v}_{l}hPa"));
             }
         }
@@ -724,6 +721,18 @@ impl ProfileRequest {
             end_day,
             url,
         }
+    }
+
+    /// Estimated Open-Meteo call count for rate limiting.
+    pub fn weight(&self) -> f32 {
+        let nvars = self
+            .url
+            .split("&hourly=")
+            .nth(1)
+            .and_then(|h| h.split('&').next())
+            .map(|h| h.split(',').count())
+            .unwrap_or(25);
+        crate::weather::call_weight(self.cells.len(), nvars, self.end_day - self.start_day + 1)
     }
 }
 

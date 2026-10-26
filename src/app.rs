@@ -46,6 +46,14 @@ enum Job {
 }
 
 impl Job {
+    /// Estimated Open-Meteo call count (see [`weather::call_weight`]).
+    fn weight(&self) -> f32 {
+        match self {
+            Job::Surface(r) => r.weight(),
+            Job::Profile(r) => r.weight(),
+        }
+    }
+
     fn url(&self) -> &str {
         match self {
             Job::Surface(r) => &r.url,
@@ -346,7 +354,18 @@ pub struct WingApp {
     om_model: OmModel,
     field_auto: bool,
     field_step_cells: i32,
-    field_days_requested: HashSet<i64>,
+    /// (day, visible-tracks key) for which the 3D field around the animals was requested.
+    field_days_requested: HashSet<(i64, u64)>,
+    /// Radius (degrees) of the 3D wind field around each animal.
+    field_radius_deg: f32,
+    /// Same bookkeeping for the 2D (surface) wind field; active after the first Annotate.
+    surface_field_on: bool,
+    surface_field_days: HashSet<(i64, u64)>,
+    // Open-Meteo rate limiting: (time sent, weight) of recent requests, pause after HTTP 429.
+    sent_log: VecDeque<(f64, f32)>,
+    pause_until: f64,
+    now: f64,
+    retries: HashMap<String, u8>,
     display_levels: Vec<usize>,
     view3d: View3D,
     slice_cache: Option<(SliceKey, Option<FieldSlice>)>,
@@ -446,6 +465,13 @@ impl WingApp {
             field_auto: true,
             field_step_cells: 4,
             field_days_requested: HashSet::new(),
+            field_radius_deg: 3.0,
+            surface_field_on: false,
+            surface_field_days: HashSet::new(),
+            sent_log: VecDeque::new(),
+            pause_until: 0.0,
+            now: 0.0,
+            retries: HashMap::new(),
             display_levels: Vec::new(),
             view3d: View3D::default(),
             slice_cache: None,
@@ -937,8 +963,11 @@ impl WingApp {
     // ------------------------------------------------------------------ weather
 
     fn start_weather(&mut self) {
-        let mut pts = weather::sample_points(&self.tracks, &self.opts);
-        pts.extend(weather::field_points(&self.tracks, &self.opts));
+        let pts = weather::sample_points(&self.tracks, &self.opts);
+        // The wind field around the animals is fetched lazily for the days in view.
+        self.surface_field_on = true;
+        self.surface_field_days.clear();
+        self.maybe_request_surface_field();
         let reqs = self
             .store
             .plan(&pts, self.opts.model, weather::latest_available_day());
@@ -1007,20 +1036,31 @@ impl WingApp {
     }
 
     /// Bounding box of the visible tracks plus a margin, limited to 30° × 40°.
+    /// Box around where the visible animals are at the cursor time (held 12 h past the
+    /// ends of each track), padded by the 3D field radius and limited to 30° × 40°.
     fn field_bbox(&self) -> Option<(f64, f64, f64, f64)> {
+        let t = self.t_now;
         let (mut s, mut n, mut w, mut e) = (90.0f64, -90.0f64, 180.0f64, -180.0f64);
+        let mut any = false;
         for tr in self.tracks.iter().filter(|t| t.visible) {
-            for f in &tr.fixes {
-                s = s.min(f.lat);
-                n = n.max(f.lat);
-                w = w.min(f.lon);
-                e = e.max(f.lon);
+            let Some((t0, t1)) = tr.time_range() else {
+                continue;
+            };
+            if t < t0 as f64 - 43_200.0 || t > t1 as f64 + 43_200.0 {
+                continue;
+            }
+            if let Some((la, lo, _)) = tr.position_at(t.clamp(t0 as f64, t1 as f64)) {
+                s = s.min(la);
+                n = n.max(la);
+                w = w.min(lo);
+                e = e.max(lo);
+                any = true;
             }
         }
-        if s > n {
+        if !any {
             return None;
         }
-        let m = ((n - s).max(e - w) * 0.2).max(1.5);
+        let m = self.field_radius_deg as f64;
         let (s, n, w, e) = (
             (s - m).max(-85.0),
             (n + m).min(85.0),
@@ -1036,10 +1076,21 @@ impl WingApp {
         ))
     }
 
+    /// Distinct 3D field nodes needed for the week from the cursor day.
     fn field_node_count(&self) -> usize {
-        self.field_bbox()
-            .map(|(s, n, w, e)| self.profiles.field_nodes(s, n, w, e).len())
-            .unwrap_or(0)
+        let day = weather::day_of(self.t_now as i64);
+        let pts = weather::window_points(
+            &self.tracks,
+            day,
+            7,
+            self.field_radius_deg as f64,
+            self.profiles.node_step,
+        );
+        let mut cells: Vec<weather::CellKey> =
+            pts.iter().map(|p| weather::cell_of(p.0, p.1)).collect();
+        cells.sort_unstable();
+        cells.dedup();
+        cells.len()
     }
 
     fn start_profiles(&mut self) {
@@ -1068,7 +1119,30 @@ impl WingApp {
         self.enqueue(reqs.into_iter().map(Job::Profile).collect());
     }
 
-    /// Lazily download the regional field for the day under the cursor (Open-Meteo only).
+    /// Key that changes when the set of visible tracks changes (field windows depend on it).
+    fn visible_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (i, t) in self.tracks.iter().enumerate() {
+            if t.visible {
+                (i, &t.id, t.fixes.len()).hash(&mut h);
+            }
+        }
+        h.finish()
+    }
+
+    /// Days to request next: the cursor day, or two days ahead if that is already covered,
+    /// so playback prefetches. Returns the first day of a 7-day window not yet requested.
+    fn next_window_day(&self, done: &HashSet<(i64, u64)>) -> Option<i64> {
+        let key = self.visible_key();
+        let day = weather::day_of(self.t_now as i64);
+        [day, day + 2]
+            .into_iter()
+            .find(|d| !done.contains(&(*d, key)))
+    }
+
+    /// Lazily download the 3D field around the animals for the week from the cursor day
+    /// (Open-Meteo only). A cell needed on several days costs one call (≤ 14 days).
     fn maybe_request_field(&mut self) {
         if !self.field_auto
             || self.tracks.is_empty()
@@ -1076,33 +1150,74 @@ impl WingApp {
                 self.profiles.source,
                 wind3d::Source::File(_) | wind3d::Source::Synthetic
             )
+            || self.queue.len() > 20
         {
             return;
         }
-        if self.queue.len() > 8 {
-            return;
-        }
         self.ensure_open_meteo();
-        let day = weather::day_of(self.t_now as i64);
-        if self.field_days_requested.contains(&day) {
-            return;
-        }
-        self.field_days_requested.insert(day);
-        let Some((s, n, w, e)) = self.field_bbox() else {
+        let Some(day) = self.next_window_day(&self.field_days_requested) else {
             return;
         };
-        let nodes = self.profiles.field_nodes(s, n, w, e);
-        let reqs = self
-            .profiles
-            .plan_field_day(&nodes, day, wind3d::latest_available_day());
+        let key = self.visible_key();
+        for d in day..day + 7 {
+            self.field_days_requested.insert((d, key));
+        }
+        let pts = weather::window_points(
+            &self.tracks,
+            day,
+            7,
+            self.field_radius_deg as f64,
+            self.profiles.node_step,
+        );
+        let reqs = self.profiles.plan(&pts, wind3d::latest_available_day());
         if !reqs.is_empty() {
+            let w: f32 = reqs.iter().map(|r| r.weight()).sum();
             self.status(format!(
-                "3D wind field for {}: {} nodes, {} request(s)",
+                "3D wind around the animals, {} – {}: {} request(s), ≈{w:.0} API calls",
                 weather::day_str(day),
-                nodes.len(),
+                weather::day_str(day + 6),
                 reqs.len()
             ));
             self.enqueue(reqs.into_iter().map(Job::Profile).collect());
+        }
+    }
+
+    /// Same for the 2D (surface ERA5) wind field, once the user has annotated at least once.
+    fn maybe_request_surface_field(&mut self) {
+        if !self.surface_field_on
+            || !self.show_wind_field
+            || self.opts.field_margin_deg <= 0.0
+            || self.tracks.is_empty()
+            || self.queue.len() > 20
+        {
+            return;
+        }
+        let Some(day) = self.next_window_day(&self.surface_field_days) else {
+            return;
+        };
+        let key = self.visible_key();
+        for d in day..day + 7 {
+            self.surface_field_days.insert((d, key));
+        }
+        let pts = weather::window_points(
+            &self.tracks,
+            day,
+            7,
+            self.opts.field_margin_deg as f64,
+            self.opts.field_stride,
+        );
+        let reqs = self
+            .store
+            .plan(&pts, self.opts.model, weather::latest_available_day());
+        if !reqs.is_empty() {
+            let w: f32 = reqs.iter().map(|r| r.weight()).sum();
+            self.status(format!(
+                "ERA5 wind field around the animals, {} – {}: {} request(s), ≈{w:.0} API calls",
+                weather::day_str(day),
+                weather::day_str(day + 6),
+                reqs.len()
+            ));
+            self.enqueue(reqs.into_iter().map(Job::Surface).collect());
         }
     }
 
@@ -1179,10 +1294,38 @@ impl WingApp {
     }
 
     fn pump_weather(&mut self, ctx: &egui::Context) {
+        // Stay under Open-Meteo's free limits (600 calls/min, 5000/h) with some headroom.
+        const PER_MIN: f32 = 450.0;
+        const PER_HOUR: f32 = 4200.0;
+        let now = self.now;
+        while self.sent_log.front().is_some_and(|(t, _)| now - t > 3600.0) {
+            self.sent_log.pop_front();
+        }
+        if now < self.pause_until {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
         while self.in_flight.len() < 3 {
+            let Some(w) = self.queue.front().map(|j| j.weight()) else {
+                break;
+            };
+            let minute: f32 = self
+                .sent_log
+                .iter()
+                .filter(|(t, _)| now - t < 60.0)
+                .map(|x| x.1)
+                .sum();
+            let hour: f32 = self.sent_log.iter().map(|x| x.1).sum();
+            // A single request heavier than the budget may still go when nothing else is pending.
+            let empty_min = minute == 0.0;
+            if (minute + w > PER_MIN && !empty_min) || hour + w > PER_HOUR {
+                ctx.request_repaint_after(std::time::Duration::from_secs(2));
+                break;
+            }
             let Some(req) = self.queue.pop_front() else {
                 break;
             };
+            self.sent_log.push_back((now, w));
             let id = self.next_req_id;
             self.next_req_id += 1;
             let tx = self.tx.clone();
@@ -1228,6 +1371,22 @@ impl WingApp {
                     let Some(job) = self.in_flight.remove(&id) else {
                         continue;
                     };
+                    // Rate limited: wait and retry instead of giving up on these cells.
+                    if let Err(e) = &result
+                        && (e.starts_with("HTTP 429") || e.to_lowercase().contains("too many"))
+                    {
+                        let n = self.retries.entry(job.url().to_string()).or_insert(0);
+                        *n += 1;
+                        if *n <= 4 {
+                            let wait = 65.0 * *n as f64;
+                            self.pause_until = self.now + wait;
+                            self.status(format!(
+                                "Open-Meteo rate limit reached - pausing {wait:.0} s, then retrying"
+                            ));
+                            self.queue.push_front(job);
+                            continue;
+                        }
+                    }
                     self.req_done += 1;
                     let res = match &job {
                         Job::Surface(req) => result.and_then(|body| self.store.ingest(req, &body)),
@@ -1681,13 +1840,14 @@ impl WingApp {
                     self.opts.segments,
                     egui::Slider::new(&mut self.opts.max_segment_h, 6.0..=168.0).text("max step length (h)"),
                 );
+                let old_field = (self.opts.field_margin_deg, self.opts.field_stride);
                 ui.add(
-                    egui::Slider::new(&mut self.opts.field_margin_deg, 0.0..=5.0)
+                    egui::Slider::new(&mut self.opts.field_margin_deg, 0.0..=8.0)
                         .step_by(0.25)
                         .suffix("°")
-                        .text("wind-field margin"),
+                        .text("wind-field radius"),
                 )
-                .on_hover_text("Also download a grid of cells this far around the tracks, so the wind field covers the whole region");
+                .on_hover_text("Download wind arrows this far around each animal, for the week in view (fetched as you move through time). 0 = only at the fixes");
                 let spacing = |s: i32| format!("{}°", s as f64 * weather::GRID);
                 ui.add_enabled_ui(self.opts.field_margin_deg > 0.0, |ui| {
                     egui::ComboBox::from_label("wind-field spacing").selected_text(spacing(self.opts.field_stride)).show_ui(ui, |ui| {
@@ -1696,11 +1856,23 @@ impl WingApp {
                         }
                     });
                 });
+                if old_field != (self.opts.field_margin_deg, self.opts.field_stride) {
+                    self.surface_field_days.clear();
+                }
                 if self.opts.field_margin_deg > 0.0 && !self.tracks.is_empty() {
-                    let n = weather::field_cells(&self.tracks, &self.opts).len();
-                    let txt = format!("{n} wind-field cells (downloaded with the next Annotate)");
-                    if n > 600 {
-                        ui.colored_label(Color32::from_rgb(255, 180, 80), txt + " — many API calls; widen the spacing?");
+                    let day = weather::day_of(self.t_now as i64);
+                    let pts = weather::window_points(&self.tracks, day, 7, self.opts.field_margin_deg as f64, self.opts.field_stride);
+                    let mut cells: Vec<weather::CellKey> = pts.iter().map(|p| weather::cell_of(p.0, p.1)).collect();
+                    cells.sort_unstable();
+                    cells.dedup();
+                    let n = cells.len();
+                    let txt = if self.surface_field_on {
+                        format!("≈{n} wind-field cells for this week (≈{n} API calls)")
+                    } else {
+                        format!("≈{n} wind-field cells per week, fetched after the first Annotate")
+                    };
+                    if n > 1500 {
+                        ui.colored_label(Color32::from_rgb(255, 180, 80), txt + " - consider a smaller radius or wider spacing");
                     } else {
                         ui.weak(txt);
                     }
@@ -2254,8 +2426,22 @@ impl WingApp {
         ui.add_enabled_ui(!is_file, |ui| {
             ui.checkbox(
                 &mut self.field_auto,
-                "auto-download the regional field for the day in view (3D tab)",
+                "auto-download the wind field around the animals (3D tab)",
+            )
+            .on_hover_text(
+                "Fetched a week at a time from the cursor day, as you move through time",
             );
+            let old_r = self.field_radius_deg;
+            ui.add(
+                egui::Slider::new(&mut self.field_radius_deg, 1.0..=10.0)
+                    .step_by(0.5)
+                    .suffix("°")
+                    .text("field radius around animals"),
+            );
+            if old_r != self.field_radius_deg {
+                self.field_days_requested.clear();
+                self.slice_cache = None;
+            }
             let old = self.field_step_cells;
             egui::ComboBox::from_label("field resolution")
                 .selected_text(format!(
@@ -2278,8 +2464,11 @@ impl WingApp {
             }
             let n = self.field_node_count();
             if n > 0 {
-                let txt = format!("≈ {n} field points per day ({} requests)", n.div_ceil(10));
-                if n > 400 {
+                let txt = format!(
+                    "≈ {n} field points this week (≈ {:.0} API calls)",
+                    n as f32 * 2.5
+                );
+                if n > 1000 {
                     ui.colored_label(
                         Color32::from_rgb(240, 160, 60),
                         txt + " - consider a coarser resolution",
@@ -2345,11 +2534,17 @@ impl WingApp {
         }
         ui.separator();
         let v = &mut self.view3d;
-        ui.add(
-            egui::Slider::new(&mut v.exag, 10.0..=500.0)
-                .logarithmic(true)
-                .text("vertical exaggeration"),
-        );
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut v.auto_exag, "auto").on_hover_text(
+                "Spread the levels so the stack is ~20 % as tall as the wind field is wide",
+            );
+            ui.add_enabled(
+                !v.auto_exag,
+                egui::Slider::new(&mut v.exag, 10.0..=3000.0)
+                    .logarithmic(true)
+                    .text("vertical exaggeration"),
+            );
+        });
         ui.horizontal(|ui| {
             ui.checkbox(&mut v.particles_on, "flowing particles");
             ui.checkbox(&mut v.show_raster, "speed colours");
@@ -2804,9 +2999,11 @@ fn fix_details(ui: &mut Ui, tr: &Track, f: &Fix) {
 
 impl eframe::App for WingApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.now = ctx.input(|i| i.time);
         self.process_messages();
-        if self.view_tab == ViewTab::ThreeD {
-            self.maybe_request_field();
+        match self.view_tab {
+            ViewTab::ThreeD => self.maybe_request_field(),
+            ViewTab::Map => self.maybe_request_surface_field(),
         }
         self.pump_weather(ctx);
         self.record_tick(ctx);
