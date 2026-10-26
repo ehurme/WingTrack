@@ -5373,6 +5373,7 @@ dependencies = [
  "egui_plot",
  "ehttp",
  "env_logger",
+ "flate2",
  "gif",
  "js-sys",
  "log",

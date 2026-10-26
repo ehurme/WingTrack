@@ -6,10 +6,14 @@ use crate::model::{Fix, LocationSource, SensorKind, Track};
 use crate::table::{Table, fmt_date, fmt_time};
 use crate::tiles::{Basemap, Gibs, SatLayer};
 use crate::video;
+use crate::view3d::{Scene, View3D};
 use crate::weather::{self, AnnotateOptions, Model, Request, WeatherStore, WindLevel};
+use crate::wind3d::{
+    self, Curtain, CurtainMetric, FieldSlice, OmModel, ProfileRequest, ProfileStore,
+};
 use egui::{Align2, Color32, ColorImage, FontId, Pos2, Rect, Stroke, Ui, pos2, vec2};
 use egui_plot::{GridMark, HoverPosition, Legend, Line, Plot, PlotPoints, Points, VLine};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use walkers::{HttpTiles, MapMemory, Plugin, Position, Projector, Tiles, lon_lat};
@@ -28,6 +32,32 @@ enum Msg {
         result: Result<String, String>,
     },
     Status(String),
+    /// An ERA5 wind-cube file picked by the user.
+    Cube {
+        name: String,
+        bytes: Vec<u8>,
+    },
+}
+
+/// One queued download.
+enum Job {
+    Surface(Request),
+    Profile(ProfileRequest),
+}
+
+impl Job {
+    fn url(&self) -> &str {
+        match self {
+            Job::Surface(r) => &r.url,
+            Job::Profile(r) => &r.url,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViewTab {
+    Map,
+    ThreeD,
 }
 
 struct LoadedFile {
@@ -160,10 +190,22 @@ enum ChartVar {
     Precip,
     LocError,
     Sensor(SensorKind),
+    FlightSupport,
+    BestSupport,
+    FlightHeight,
+    /// Time × height wind along one track (pressure levels).
+    Curtain,
+    /// Wind profile at the selected fix / cursor.
+    Profile,
 }
 
 impl ChartVar {
-    const ALL: [ChartVar; 14] = [
+    const ALL: [ChartVar; 19] = [
+        ChartVar::Curtain,
+        ChartVar::Profile,
+        ChartVar::FlightSupport,
+        ChartVar::BestSupport,
+        ChartVar::FlightHeight,
         ChartVar::Altitude,
         ChartVar::GroundSpeed,
         ChartVar::WindSupport,
@@ -192,6 +234,11 @@ impl ChartVar {
             ChartVar::Precip => "ERA5 precipitation (mm/h)",
             ChartVar::LocError => "Location error (km)",
             ChartVar::Sensor(k) => k.label(),
+            ChartVar::FlightSupport => "3D: wind support at flight altitude (m/s)",
+            ChartVar::BestSupport => "3D: wind support at best level (m/s)",
+            ChartVar::FlightHeight => "3D: flight height from profile (m ASL)",
+            ChartVar::Curtain => "3D: time × height wind curtain along track",
+            ChartVar::Profile => "3D: wind profile at selected fix / cursor",
         }
     }
     fn of_fix(self, f: &Fix) -> Option<f32> {
@@ -206,7 +253,10 @@ impl ChartVar {
             ChartVar::Era5Temp => f.weather.temp_2m,
             ChartVar::Precip => f.weather.precipitation_mm,
             ChartVar::LocError => f.error_m.map(|e| e / 1000.0),
-            ChartVar::Sensor(_) => None,
+            ChartVar::FlightSupport => f.weather.flight.as_ref().and_then(|w| w.wind_support),
+            ChartVar::BestSupport => f.weather.flight.as_ref().and_then(|w| w.best_wind_support),
+            ChartVar::FlightHeight => f.weather.flight.as_ref().and_then(|w| w.flight_height_m),
+            ChartVar::Sensor(_) | ChartVar::Curtain | ChartVar::Profile => None,
         }
     }
 }
@@ -277,13 +327,26 @@ pub struct WingApp {
     // weather
     store: WeatherStore,
     opts: AnnotateOptions,
-    queue: VecDeque<Request>,
-    in_flight: HashMap<usize, Request>,
+    queue: VecDeque<Job>,
+    in_flight: HashMap<usize, Job>,
     next_req_id: usize,
     req_total: usize,
     req_done: usize,
     req_failed: usize,
     since_annotate: usize,
+
+    // 3D wind
+    view_tab: ViewTab,
+    profiles: ProfileStore,
+    om_model: OmModel,
+    field_auto: bool,
+    field_step_cells: i32,
+    field_days_requested: HashSet<i64>,
+    display_levels: Vec<usize>,
+    view3d: View3D,
+    slice_cache: Option<(SliceKey, Option<FieldSlice>)>,
+    curtain_metric: CurtainMetric,
+    curtain_cache: Option<(CurtainKey, Option<Curtain>)>,
 
     // video export
     video: video::Settings,
@@ -312,6 +375,9 @@ struct Recording {
     total: usize,
     name: String,
 }
+
+type CurtainKey = (usize, u64, CurtainMetric, usize);
+type SliceKey = (i64, u64, Vec<usize>, (i32, i32, i32, i32));
 
 impl WingApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -365,6 +431,17 @@ impl WingApp {
             rec: None,
             map_rect: Rect::NOTHING,
             timeline_rect: Rect::NOTHING,
+            view_tab: ViewTab::Map,
+            profiles: ProfileStore::default(),
+            om_model: OmModel::Gfs,
+            field_auto: true,
+            field_step_cells: 4,
+            field_days_requested: HashSet::new(),
+            display_levels: Vec::new(),
+            view3d: View3D::default(),
+            slice_cache: None,
+            curtain_metric: CurtainMetric::WindSupport,
+            curtain_cache: None,
         };
         let _ = app.memory.set_zoom(5.0);
         app.memory.center_at(lon_lat(9.17, 47.67));
@@ -378,6 +455,24 @@ impl WingApp {
             app.status(format!(
                 "SYNTHETIC test wind field loaded (not ERA5) - {n} fixes annotated"
             ));
+            wind3d::synthetic_profiles(&mut app.profiles, &app.tracks);
+            app.reset_display_levels();
+            let n3 = wind3d::annotate(&mut app.tracks, &app.profiles);
+            app.status(format!(
+                "SYNTHETIC pressure-level winds (not real data) - {n3} fixes annotated"
+            ));
+            if let Ok(v) = std::env::var("WINGTRACK_3D") {
+                app.view_tab = ViewTab::ThreeD;
+                app.chart_var = if v == "profile" {
+                    ChartVar::Profile
+                } else {
+                    ChartVar::Curtain
+                };
+                app.selected_track = Some(0);
+                if v == "profile" {
+                    app.t_now = app.t_min + 0.3 * (app.t_max - app.t_min);
+                }
+            }
         }
         app
     }
@@ -433,8 +528,13 @@ impl WingApp {
                 if !self.store.is_empty() {
                     weather::annotate(&mut self.tracks, &self.store, &self.opts);
                 }
+                if !self.profiles.is_empty() {
+                    wind3d::annotate(&mut self.tracks, &self.profiles);
+                }
                 self.selected = None;
                 self.fit_pending = true;
+                self.view3d.request_fit();
+                self.curtain_cache = None;
             }
             Err(e) => self.status(format!("! {e}")),
         }
@@ -844,10 +944,229 @@ impl WingApp {
             pts.len(),
             6
         ));
-        self.req_total = reqs.len() + self.queue.len() + self.in_flight.len();
-        self.req_done = 0;
-        self.req_failed = 0;
-        self.queue.extend(reqs);
+        self.enqueue(reqs.into_iter().map(Job::Surface).collect());
+    }
+
+    fn enqueue(&mut self, jobs: Vec<Job>) {
+        if jobs.is_empty() {
+            return;
+        }
+        if self.queue.is_empty() && self.in_flight.is_empty() {
+            self.req_total = 0;
+            self.req_done = 0;
+            self.req_failed = 0;
+        }
+        self.req_total += jobs.len();
+        self.queue.extend(jobs);
+    }
+
+    // ------------------------------------------------------------------ 3D wind
+
+    /// Default display levels: those closest to ~300, 800 and 1500 m (standard atmosphere).
+    fn reset_display_levels(&mut self) {
+        let lv = &self.profiles.levels;
+        let mut out: Vec<usize> = Vec::new();
+        for h in [300.0, 800.0, 1500.0] {
+            if let Some(i) = (0..lv.len()).min_by(|&a, &b| {
+                let ha = geo::pressure_to_altitude_m(lv[a] as f64, 1013.25);
+                let hb = geo::pressure_to_altitude_m(lv[b] as f64, 1013.25);
+                (ha - h).abs().total_cmp(&(hb - h).abs())
+            }) && !out.contains(&i)
+            {
+                out.push(i);
+            }
+        }
+        out.sort_unstable();
+        self.display_levels = out;
+        self.view3d.raster_level = 0;
+        self.slice_cache = None;
+        self.curtain_cache = None;
+    }
+
+    fn ensure_open_meteo(&mut self) {
+        if !matches!(
+            self.profiles.source,
+            wind3d::Source::File(_) | wind3d::Source::Synthetic
+        ) {
+            let before = self.profiles.levels.len();
+            self.profiles.use_open_meteo(self.om_model);
+            self.profiles.node_step = self.field_step_cells;
+            if before != self.profiles.levels.len() || self.display_levels.is_empty() {
+                self.reset_display_levels();
+            }
+        }
+    }
+
+    /// Bounding box of the visible tracks plus a margin, limited to 30° × 40°.
+    fn field_bbox(&self) -> Option<(f64, f64, f64, f64)> {
+        let (mut s, mut n, mut w, mut e) = (90.0f64, -90.0f64, 180.0f64, -180.0f64);
+        for tr in self.tracks.iter().filter(|t| t.visible) {
+            for f in &tr.fixes {
+                s = s.min(f.lat);
+                n = n.max(f.lat);
+                w = w.min(f.lon);
+                e = e.max(f.lon);
+            }
+        }
+        if s > n {
+            return None;
+        }
+        let m = ((n - s).max(e - w) * 0.2).max(1.5);
+        let (s, n, w, e) = (
+            (s - m).max(-85.0),
+            (n + m).min(85.0),
+            (w - m).max(-180.0),
+            (e + m).min(180.0),
+        );
+        let (cl, co) = ((s + n) / 2.0, (w + e) / 2.0);
+        Some((
+            s.max(cl - 15.0),
+            n.min(cl + 15.0),
+            w.max(co - 20.0),
+            e.min(co + 20.0),
+        ))
+    }
+
+    fn field_node_count(&self) -> usize {
+        self.field_bbox()
+            .map(|(s, n, w, e)| self.profiles.field_nodes(s, n, w, e).len())
+            .unwrap_or(0)
+    }
+
+    fn start_profiles(&mut self) {
+        self.ensure_open_meteo();
+        if matches!(
+            self.profiles.source,
+            wind3d::Source::File(_) | wind3d::Source::Synthetic
+        ) {
+            let n = wind3d::annotate(&mut self.tracks, &self.profiles);
+            self.status(format!("3D wind (file): annotated {n} fixes"));
+            return;
+        }
+        let pts = wind3d::annotation_points(&self.tracks, true, self.opts.max_segment_h);
+        let reqs = self.profiles.plan(&pts, wind3d::latest_available_day());
+        if reqs.is_empty() {
+            let n = wind3d::annotate(&mut self.tracks, &self.profiles);
+            self.status(format!("3D wind: everything cached - annotated {n} fixes"));
+            return;
+        }
+        self.status(format!(
+            "3D wind: {} request(s) along the tracks ({} levels, {})",
+            reqs.len(),
+            self.profiles.levels.len(),
+            self.profiles.source.label()
+        ));
+        self.enqueue(reqs.into_iter().map(Job::Profile).collect());
+    }
+
+    /// Lazily download the regional field for the day under the cursor (Open-Meteo only).
+    fn maybe_request_field(&mut self) {
+        if !self.field_auto
+            || self.tracks.is_empty()
+            || matches!(
+                self.profiles.source,
+                wind3d::Source::File(_) | wind3d::Source::Synthetic
+            )
+        {
+            return;
+        }
+        if self.queue.len() > 8 {
+            return;
+        }
+        self.ensure_open_meteo();
+        let day = weather::day_of(self.t_now as i64);
+        if self.field_days_requested.contains(&day) {
+            return;
+        }
+        self.field_days_requested.insert(day);
+        let Some((s, n, w, e)) = self.field_bbox() else {
+            return;
+        };
+        let nodes = self.profiles.field_nodes(s, n, w, e);
+        let reqs = self
+            .profiles
+            .plan_field_day(&nodes, day, wind3d::latest_available_day());
+        if !reqs.is_empty() {
+            self.status(format!(
+                "3D wind field for {}: {} nodes, {} request(s)",
+                weather::day_str(day),
+                nodes.len(),
+                reqs.len()
+            ));
+            self.enqueue(reqs.into_iter().map(Job::Profile).collect());
+        }
+    }
+
+    fn open_cube_dialog(&self, ctx: &egui::Context) {
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("ERA5 wind cube", &["csv", "gz", "txt"])
+                .pick_file()
+            {
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                match std::fs::read(&p) {
+                    Ok(bytes) => {
+                        let _ = tx.send(Msg::Cube { name, bytes });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Status(format!("! {}: {e}", p.display())));
+                    }
+                }
+                ctx.request_repaint();
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(f) = rfd::AsyncFileDialog::new()
+                .add_filter("ERA5 wind cube", &["csv", "gz", "txt"])
+                .pick_file()
+                .await
+            {
+                let bytes = f.read().await;
+                let _ = tx.send(Msg::Cube {
+                    name: f.file_name(),
+                    bytes,
+                });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn current_slice(&mut self) -> Option<&FieldSlice> {
+        let bbox = self.field_bbox()?;
+        if self.profiles.is_empty() || self.display_levels.is_empty() {
+            return None;
+        }
+        let q = |x: f64| (x * 4.0).round() as i32;
+        let key: SliceKey = (
+            (self.t_now as i64) / 300,
+            self.profiles.generation,
+            self.display_levels.clone(),
+            (q(bbox.0), q(bbox.1), q(bbox.2), q(bbox.3)),
+        );
+        if self.slice_cache.as_ref().is_none_or(|c| c.0 != key) {
+            let slice = FieldSlice::build(
+                &self.profiles,
+                &self.display_levels,
+                bbox,
+                self.t_now as i64,
+            );
+            self.slice_cache = Some((key, slice));
+        }
+        self.slice_cache.as_ref().and_then(|c| c.1.as_ref())
+    }
+
+    /// Track used by single-track charts: isolated track, else selected fix's track, else first visible.
+    fn chart_track(&self) -> Option<usize> {
+        self.selected_track
+            .or(self.selected.map(|s| s.0))
+            .or_else(|| self.tracks.iter().position(|t| t.visible))
     }
 
     fn pump_weather(&mut self, ctx: &egui::Context) {
@@ -859,7 +1178,7 @@ impl WingApp {
             self.next_req_id += 1;
             let tx = self.tx.clone();
             let ctx2 = ctx.clone();
-            ehttp::fetch(ehttp::Request::get(&req.url), move |res| {
+            ehttp::fetch(ehttp::Request::get(req.url()), move |res| {
                 let result = match res {
                     Ok(r) if r.ok => r
                         .text()
@@ -886,29 +1205,53 @@ impl WingApp {
             match msg {
                 Msg::File { name, bytes } => self.add_file(name, bytes, None),
                 Msg::Status(s) => self.status(s),
+                Msg::Cube { name, bytes } => match self.profiles.import_cube(&name, &bytes) {
+                    Ok(msg) => {
+                        self.status(format!("Imported wind cube {msg}"));
+                        self.field_days_requested.clear();
+                        self.reset_display_levels();
+                        let n = wind3d::annotate(&mut self.tracks, &self.profiles);
+                        self.status(format!("3D wind (file): annotated {n} fixes"));
+                    }
+                    Err(e) => self.status(format!("! wind cube: {e}")),
+                },
                 Msg::Weather { id, result } => {
-                    let Some(req) = self.in_flight.remove(&id) else {
+                    let Some(job) = self.in_flight.remove(&id) else {
                         continue;
                     };
                     self.req_done += 1;
-                    match result.and_then(|body| self.store.ingest(&req, &body)) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            self.req_failed += 1;
-                            self.store.mark_done(&req);
-                            self.status(format!("! ERA5 request failed: {e}"));
+                    let res = match &job {
+                        Job::Surface(req) => result.and_then(|body| self.store.ingest(req, &body)),
+                        Job::Profile(req) => {
+                            result.and_then(|body| self.profiles.ingest(req, &body))
                         }
+                    };
+                    if let Err(e) = res {
+                        self.req_failed += 1;
+                        match &job {
+                            Job::Surface(req) => self.store.mark_done(req),
+                            Job::Profile(req) => self.profiles.mark_done(req),
+                        }
+                        self.status(format!("! weather request failed: {e}"));
                     }
                     self.since_annotate += 1;
                     let finished = self.queue.is_empty() && self.in_flight.is_empty();
                     if finished || self.since_annotate >= 4 {
                         let n = weather::annotate(&mut self.tracks, &self.store, &self.opts);
+                        let n3 = if self.profiles.is_empty() {
+                            0
+                        } else {
+                            wind3d::annotate(&mut self.tracks, &self.profiles)
+                        };
                         self.since_annotate = 0;
+                        self.curtain_cache = None;
                         if finished {
                             self.status(format!(
-                                "ERA5 done: {} cells, {} hours cached; {n} fixes annotated{}",
+                                "Downloads done: surface {} cells / {} h ({n} fixes), pressure levels {} cells / {} h ({n3} fixes){}",
                                 self.store.cells.len(),
                                 self.store.hours(),
+                                self.profiles.cells.len(),
+                                self.profiles.hours(),
                                 if self.req_failed > 0 {
                                     format!(" ({} requests failed)", self.req_failed)
                                 } else {
@@ -1080,6 +1423,9 @@ impl WingApp {
     fn top_bar(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.strong("WingTrack");
+            ui.separator();
+            ui.selectable_value(&mut self.view_tab, ViewTab::Map, "2D map");
+            ui.selectable_value(&mut self.view_tab, ViewTab::ThreeD, "3D winds");
             ui.separator();
             if ui.button("Open…").on_hover_text("CSV from Wildcloud, Movebank, CTT or R").clicked() {
                 self.open_dialog(ui.ctx());
@@ -1325,6 +1671,11 @@ impl WingApp {
                 }
             });
 
+            // ---- 3D wind
+            egui::CollapsingHeader::new("3D wind (pressure levels)").default_open(true).show(ui, |ui| {
+                self.wind3d_panel(ui);
+            });
+
             // ---- selected fix
             if let Some((ti, fi)) = self.selected
                 && let Some(f) = self.tracks.get(ti).and_then(|t| t.fixes.get(fi)) {
@@ -1392,6 +1743,15 @@ impl WingApp {
                         ui.selectable_value(&mut self.chart_var, v, v.label());
                     }
                 });
+            if self.chart_var == ChartVar::Curtain {
+                egui::ComboBox::from_id_salt("curtain_metric")
+                    .selected_text(self.curtain_metric.label())
+                    .show_ui(ui, |ui| {
+                        for m in CurtainMetric::ALL {
+                            ui.selectable_value(&mut self.curtain_metric, m, m.label());
+                        }
+                    });
+            }
             ui.weak(match self.selected_track {
                 Some(i) => format!(
                     "showing {}",
@@ -1400,6 +1760,11 @@ impl WingApp {
                 None => "showing all visible tracks (click a track name to isolate)".into(),
             });
         });
+        match self.chart_var {
+            ChartVar::Curtain => return self.curtain_chart(ui),
+            ChartVar::Profile => return self.profile_chart(ui),
+            _ => {}
+        }
 
         let var = self.chart_var;
         let mut series: Vec<(String, Color32, Vec<[f64; 2]>)> = Vec::new();
@@ -1625,41 +1990,600 @@ impl WingApp {
             self.playing = false;
         }
         if let Some((ti, fi, pos)) = interaction.hover {
-            let tr = &self.tracks[ti];
-            let f = &tr.fixes[fi];
-            let mut s = format!("{} · {}\n{}", tr.id, tr.tag, fmt_time(f.t));
-            if let Some(e) = f.error_m {
-                s.push_str(&format!("\n± {:.1} km", e / 1000.0));
+            self.fix_tooltip(ui, ti, fi, pos);
+        }
+    }
+
+    fn fix_tooltip(&self, ui: &Ui, ti: usize, fi: usize, pos: Pos2) {
+        let tr = &self.tracks[ti];
+        let f = &tr.fixes[fi];
+        let mut s = format!("{} · {}\n{}", tr.id, tr.tag, fmt_time(f.t));
+        if let Some(e) = f.error_m {
+            s.push_str(&format!("\n± {:.1} km", e / 1000.0));
+        }
+        if let Some(a) = f.best_alt() {
+            s.push_str(&format!("\nalt {a:.0} m"));
+        }
+        if let Some(w) = f.weather.wind_support {
+            s.push_str(&format!("\nwind support {w:+.1} m/s"));
+        }
+        if let Some(w) = f.weather.seg_wind_support {
+            s.push_str(&format!("\nstep wind {w:+.1} m/s"));
+        }
+        if let Some(fw) = &f.weather.flight {
+            if let Some(ws) = fw.wind_support {
+                s.push_str(&format!(
+                    "\nflight-level support {ws:+.1} m/s ({:.0} hPa)",
+                    fw.matched_level_hpa
+                ));
             }
-            if let Some(a) = f.best_alt() {
-                s.push_str(&format!("\nalt {a:.0} m"));
+            if let (Some(b), Some(bs)) = (fw.best_level_hpa, fw.best_wind_support) {
+                s.push_str(&format!("\nbest level {b:.0} hPa: {bs:+.1} m/s"));
             }
-            if let Some(w) = f.weather.wind_support {
-                s.push_str(&format!("\nwind support {w:+.1} m/s"));
+        }
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::unique("maptip"),
+        ));
+        let galley_rect = painter.text(
+            pos + vec2(14.0, 0.0),
+            Align2::LEFT_TOP,
+            &s,
+            FontId::proportional(12.0),
+            Color32::WHITE,
+        );
+        painter.rect_filled(galley_rect.expand(5.0), 4.0, Color32::from_black_alpha(200));
+        painter.text(
+            pos + vec2(14.0, 0.0),
+            Align2::LEFT_TOP,
+            &s,
+            FontId::proportional(12.0),
+            Color32::WHITE,
+        );
+    }
+
+    fn map3d(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let _ = self.current_slice();
+        let date = fmt_date(self.t_now as i64);
+        let sat_key = (self.sat_layer, date.clone());
+        if self.sat_on && !self.sat_tiles.contains_key(&sat_key) {
+            if self.sat_tiles.len() > 4 {
+                self.sat_tiles.clear();
             }
-            if let Some(w) = f.weather.seg_wind_support {
-                s.push_str(&format!("\nstep wind {w:+.1} m/s"));
-            }
-            let painter = ui.ctx().layer_painter(egui::LayerId::new(
-                egui::Order::Tooltip,
-                egui::Id::unique("maptip"),
-            ));
-            let galley_rect = painter.text(
-                pos + vec2(14.0, 0.0),
-                Align2::LEFT_TOP,
-                &s,
-                FontId::proportional(12.0),
-                Color32::WHITE,
-            );
-            painter.rect_filled(galley_rect.expand(5.0), 4.0, Color32::from_black_alpha(200));
-            painter.text(
-                pos + vec2(14.0, 0.0),
-                Align2::LEFT_TOP,
-                &s,
-                FontId::proportional(12.0),
-                Color32::WHITE,
+            self.sat_tiles.insert(
+                sat_key.clone(),
+                HttpTiles::new(
+                    Gibs {
+                        layer: self.sat_layer,
+                        date,
+                    },
+                    ctx.clone(),
+                ),
             );
         }
+        let basemap = self.basemap;
+        let base = self
+            .base_tiles
+            .entry(basemap)
+            .or_insert_with(|| HttpTiles::new(basemap, ctx.clone()));
+        let attribution = base.attribution().text.to_string();
+        let slice = self.slice_cache.as_ref().and_then(|c| c.1.as_ref());
+        let slice_level_hpa: Vec<f32> = slice
+            .map(|sl| sl.levels.iter().map(|&i| self.profiles.levels[i]).collect())
+            .unwrap_or_default();
+        let sat = if self.sat_on {
+            self.sat_tiles
+                .get_mut(&sat_key)
+                .map(|t| (t as &mut dyn Tiles, self.sat_opacity))
+        } else {
+            None
+        };
+        let scene = Scene {
+            tracks: &self.tracks,
+            t_now: self.t_now,
+            trail_to_cursor: self.trail_to_cursor,
+            selected: self.selected,
+            focus_track: self.selected_track,
+            slice,
+            slice_level_hpa,
+            base: Some(base as &mut dyn Tiles),
+            sat,
+            source_label: self.profiles.source.label(),
+            basemap_attribution: attribution,
+            max_error_m: self.max_error_km * 1000.0,
+        };
+        let out = self.view3d.show(ui, scene);
+        if let Some(sel) = out.clicked {
+            self.selected = Some(sel);
+            self.t_now = self.tracks[sel.0].fixes[sel.1].t as f64;
+            self.playing = false;
+        }
+        if let Some((ti, fi, pos)) = out.hover {
+            self.fix_tooltip(ui, ti, fi, pos);
+        }
+    }
+
+    fn wind3d_panel(&mut self, ui: &mut Ui) {
+        let is_file = matches!(
+            self.profiles.source,
+            wind3d::Source::File(_) | wind3d::Source::Synthetic
+        );
+        ui.weak(format!("source: {}", self.profiles.source.label()));
+        if !self.profiles.levels.is_empty() {
+            ui.weak(format!(
+                "{} levels {:.0}–{:.0} hPa · {} cells · {} hours",
+                self.profiles.levels.len(),
+                self.profiles.levels.first().copied().unwrap_or(0.0),
+                self.profiles.levels.last().copied().unwrap_or(0.0),
+                self.profiles.cells.len(),
+                self.profiles.hours()
+            ));
+        }
+        let old_model = self.om_model;
+        egui::ComboBox::from_label("Open-Meteo model")
+            .selected_text(self.om_model.label())
+            .show_ui(ui, |ui| {
+                for m in OmModel::ALL {
+                    ui.selectable_value(&mut self.om_model, m, m.label());
+                }
+            });
+        if old_model != self.om_model && !is_file && !self.profiles.is_empty() {
+            self.profiles.use_open_meteo(self.om_model);
+            self.field_days_requested.clear();
+            self.reset_display_levels();
+        }
+        let busy = !self.queue.is_empty() || !self.in_flight.is_empty();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!self.tracks.is_empty() && !busy, egui::Button::new("Download along tracks"))
+                .on_hover_text("Pressure-level wind at every fix and every 3 h along each step; annotates flight-level and best-level wind support")
+                .clicked()
+            {
+                self.start_profiles();
+            }
+            if ui
+                .button("Import ERA5 cube…")
+                .on_hover_text("CSV / CSV.gz from tools/era5_wind_cube.py (any pressure levels, e.g. 1000–500 hPa)")
+                .clicked()
+            {
+                self.open_cube_dialog(ui.ctx());
+            }
+            if is_file && ui.button("Back to Open-Meteo").clicked() {
+                self.profiles.clear();
+                self.field_days_requested.clear();
+                self.ensure_open_meteo();
+                self.reset_display_levels();
+            }
+        });
+        ui.add_enabled_ui(!is_file, |ui| {
+            ui.checkbox(
+                &mut self.field_auto,
+                "auto-download the regional field for the day in view (3D tab)",
+            );
+            let old = self.field_step_cells;
+            egui::ComboBox::from_label("field resolution")
+                .selected_text(format!(
+                    "{:.2}°",
+                    self.field_step_cells as f64 * weather::GRID
+                ))
+                .show_ui(ui, |ui| {
+                    for st in [1, 2, 4, 8] {
+                        ui.selectable_value(
+                            &mut self.field_step_cells,
+                            st,
+                            format!("{:.2}°", st as f64 * weather::GRID),
+                        );
+                    }
+                });
+            if old != self.field_step_cells {
+                self.profiles.node_step = self.field_step_cells;
+                self.field_days_requested.clear();
+                self.slice_cache = None;
+            }
+            let n = self.field_node_count();
+            if n > 0 {
+                let txt = format!("≈ {n} field points per day ({} requests)", n.div_ceil(10));
+                if n > 400 {
+                    ui.colored_label(
+                        Color32::from_rgb(240, 160, 60),
+                        txt + " - consider a coarser resolution",
+                    );
+                } else {
+                    ui.weak(txt);
+                }
+            }
+        });
+        if !self.profiles.levels.is_empty() {
+            ui.label("levels shown in 3D:");
+            let mean_z: HashMap<usize, f32> = self
+                .slice_cache
+                .as_ref()
+                .and_then(|c| c.1.as_ref())
+                .map(|sl| {
+                    sl.levels
+                        .iter()
+                        .copied()
+                        .zip(sl.mean_z.iter().copied())
+                        .collect()
+                })
+                .unwrap_or_default();
+            ui.horizontal_wrapped(|ui| {
+                for i in 0..self.profiles.levels.len() {
+                    let p = self.profiles.levels[i];
+                    let h = mean_z
+                        .get(&i)
+                        .copied()
+                        .unwrap_or(geo::pressure_to_altitude_m(p as f64, 1013.25) as f32);
+                    let mut on = self.display_levels.contains(&i);
+                    if ui
+                        .checkbox(&mut on, format!("{p:.0} (~{h:.0} m)"))
+                        .changed()
+                    {
+                        if on && self.display_levels.len() < 5 {
+                            self.display_levels.push(i);
+                        } else {
+                            self.display_levels.retain(|&x| x != i);
+                        }
+                        self.display_levels.sort_unstable();
+                        self.slice_cache = None;
+                    }
+                }
+            });
+            if !self.display_levels.is_empty() {
+                let cur = self.view3d.raster_level.min(self.display_levels.len() - 1);
+                egui::ComboBox::from_label("colour field = wind at")
+                    .selected_text(format!(
+                        "{:.0} hPa",
+                        self.profiles.levels[self.display_levels[cur]]
+                    ))
+                    .show_ui(ui, |ui| {
+                        for (k, &li) in self.display_levels.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.view3d.raster_level,
+                                k,
+                                format!("{:.0} hPa", self.profiles.levels[li]),
+                            );
+                        }
+                    });
+            }
+        }
+        ui.separator();
+        let v = &mut self.view3d;
+        ui.add(
+            egui::Slider::new(&mut v.exag, 10.0..=500.0)
+                .logarithmic(true)
+                .text("vertical exaggeration"),
+        );
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut v.particles_on, "flowing particles");
+            ui.checkbox(&mut v.show_raster, "speed colours");
+            ui.checkbox(&mut v.show_planes, "level planes");
+        });
+        if v.particles_on {
+            ui.add(
+                egui::Slider::new(&mut v.particles_per_level, 100..=2500).text("particles / level"),
+            );
+            ui.add(
+                egui::Slider::new(&mut v.flow_hours_per_s, 0.5..=12.0)
+                    .text("flow speed (h of wind / s)"),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut v.show_drop_lines, "drop lines");
+            ui.checkbox(&mut v.show_shadows, "ground shadows");
+        });
+        ui.add(egui::Slider::new(&mut v.ground_dim, 0.0..=0.9).text("dim basemap"));
+        ui.add(
+            egui::Slider::new(&mut v.default_alt_m, 0.0..=2000.0).text("altitude if unknown (m)"),
+        );
+        ui.add(
+            egui::Slider::new(&mut v.gap_factor, 1.5..=8.0)
+                .text("dotted if gap > × median interval"),
+        );
+    }
+
+    fn curtain_chart(&mut self, ui: &mut Ui) {
+        let Some(ti) = self.chart_track() else {
+            ui.weak("No visible track.");
+            return;
+        };
+        if self.profiles.is_empty() {
+            ui.weak("No pressure-level wind yet - use \"Download along tracks\" or \"Import ERA5 cube…\" in the side panel.");
+            return;
+        }
+        let key = (
+            ti,
+            self.profiles.generation,
+            self.curtain_metric,
+            self.tracks[ti].fixes.len(),
+        );
+        if self.curtain_cache.as_ref().is_none_or(|c| c.0 != key) {
+            let c = wind3d::curtain(&self.profiles, &self.tracks[ti], self.curtain_metric, 300);
+            self.curtain_cache = Some((key, c));
+        }
+        let Some(c) = self.curtain_cache.as_ref().and_then(|c| c.1.as_ref()) else {
+            ui.weak("No wind data along this track yet.");
+            return;
+        };
+        let tr = &self.tracks[ti];
+        let metric = self.curtain_metric;
+        let nl = self.profiles.levels.len();
+        let dx = c.step_s as f64 / 86400.0;
+        let mut cells: Vec<([[f64; 2]; 4], Color32)> = Vec::new();
+        for (i, &t) in c.times.iter().enumerate() {
+            let x0 = t as f64 / 86400.0 - dx / 2.0;
+            let x1 = x0 + dx;
+            for j in 0..nl {
+                let (v, z) = (c.val[i][j], c.z[i][j]);
+                if !v.is_finite() || !z.is_finite() {
+                    continue;
+                }
+                let zp = if j > 0 { c.z[i][j - 1] } else { f32::NAN };
+                let zn = if j + 1 < nl { c.z[i][j + 1] } else { f32::NAN };
+                let mut lo = if zp.is_finite() {
+                    (zp + z) / 2.0
+                } else if zn.is_finite() {
+                    z - (zn - z) / 2.0
+                } else {
+                    z - 100.0
+                };
+                if c.ground_z[i].is_finite() {
+                    lo = lo.max(c.ground_z[i]);
+                }
+                let hi = if zn.is_finite() {
+                    (z + zn) / 2.0
+                } else if zp.is_finite() {
+                    z + (z - zp) / 2.0
+                } else {
+                    z + 100.0
+                };
+                let col = match metric {
+                    CurtainMetric::WindSpeed => crate::view3d::wind_color(v, 255),
+                    _ => diverging(v / 10.0),
+                };
+                cells.push((
+                    [
+                        [x0, lo as f64],
+                        [x1, lo as f64],
+                        [x1, hi as f64],
+                        [x0, hi as f64],
+                    ],
+                    col,
+                ));
+            }
+        }
+        let alt: Vec<[f64; 2]> = tr
+            .fixes
+            .iter()
+            .filter_map(|f| {
+                let h = f
+                    .weather
+                    .flight
+                    .as_ref()
+                    .and_then(|w| w.flight_height_m)
+                    .or(f.best_alt())?;
+                Some([f.t as f64 / 86400.0, h as f64])
+            })
+            .collect();
+        let best: Vec<[f64; 2]> = c
+            .times
+            .iter()
+            .zip(&c.best_z)
+            .filter(|(_, z)| z.is_finite())
+            .map(|(t, z)| [*t as f64 / 86400.0, *z as f64])
+            .collect();
+        let ground: Vec<[f64; 2]> = c
+            .times
+            .iter()
+            .zip(&c.ground_z)
+            .filter(|(_, z)| z.is_finite())
+            .map(|(t, z)| [*t as f64 / 86400.0, *z as f64])
+            .collect();
+        let tcol = Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]);
+        let id = tr.id.clone();
+        ui.weak(format!(
+            "{} along {id}'s path (colour: {}) · line = animal altitude · dashed = level with best wind support",
+            metric.label(),
+            if metric == CurtainMetric::WindSpeed { "speed 0–28 m/s" } else { "blue tailwind / red headwind, ±10 m/s" }
+        ));
+        let t_now_d = self.t_now / 86400.0;
+        let resp = Plot::new("curtain")
+            .legend(Legend::default())
+            .allow_scroll(false)
+            .y_axis_label("height (m ASL)")
+            .x_axis_formatter(|m: GridMark, _r| fmt_date((m.value * 86400.0) as i64))
+            .label_formatter(|h: &HoverPosition<'_>| {
+                let p = match h {
+                    HoverPosition::NearDataPoint { position, .. } => position,
+                    HoverPosition::Elsewhere { position } => position,
+                };
+                Some(format!(
+                    "{}\n{:.0} m",
+                    fmt_time((p.x * 86400.0) as i64),
+                    p.y
+                ))
+            })
+            .show(ui, |pui| {
+                for (k, (pts, col)) in cells.iter().enumerate() {
+                    pui.polygon(
+                        egui_plot::Polygon::new("", PlotPoints::from(pts.to_vec()))
+                            .fill_color(*col)
+                            .stroke(Stroke::NONE)
+                            .allow_hover(false)
+                            .id(("cell", k)),
+                    );
+                }
+                if !ground.is_empty() {
+                    pui.line(
+                        Line::new("ground", PlotPoints::from(ground))
+                            .color(Color32::from_gray(60))
+                            .width(2.0),
+                    );
+                }
+                if !best.is_empty() {
+                    pui.line(
+                        Line::new("best level", PlotPoints::from(best))
+                            .color(Color32::from_rgb(255, 230, 120))
+                            .style(egui_plot::LineStyle::dashed_loose())
+                            .width(1.2),
+                    );
+                }
+                if !alt.is_empty() {
+                    pui.line(
+                        Line::new(format!("{id} altitude"), PlotPoints::from(alt.clone()))
+                            .color(Color32::WHITE)
+                            .width(2.0),
+                    );
+                    pui.points(
+                        Points::new(format!("{id} altitude"), PlotPoints::from(alt))
+                            .color(tcol)
+                            .radius(3.0),
+                    );
+                }
+                pui.vline(VLine::new("now", t_now_d).color(Color32::from_rgb(255, 80, 80)));
+                if pui.response().clicked() {
+                    pui.pointer_coordinate()
+                } else {
+                    None
+                }
+            });
+        if let Some(p) = resp.inner {
+            self.t_now = (p.x * 86400.0).clamp(self.t_min, self.t_max);
+            self.playing = false;
+        }
+    }
+
+    fn profile_chart(&mut self, ui: &mut Ui) {
+        if self.profiles.is_empty() {
+            ui.weak("No pressure-level wind yet - use \"Download along tracks\" or \"Import ERA5 cube…\" in the side panel.");
+            return;
+        }
+        // Selected fix, else the chart track's position at the cursor.
+        let target = if let Some((ti, fi)) = self.selected
+            && let Some(f) = self.tracks.get(ti).and_then(|t| t.fixes.get(fi))
+        {
+            let h = f
+                .weather
+                .flight
+                .as_ref()
+                .and_then(|w| w.flight_height_m)
+                .or(f.best_alt());
+            Some((
+                ti,
+                f.lat,
+                f.lon,
+                f.t,
+                f.reported_heading.or(f.bearing_deg),
+                h,
+            ))
+        } else if let Some(ti) = self.chart_track()
+            && let Some((la, lo, idx)) = self.tracks[ti].position_at(self.t_now)
+        {
+            let tr = &self.tracks[ti];
+            let hd = tr.fixes.get(idx + 1).map(|b| {
+                geo::bearing_deg(tr.fixes[idx].lat, tr.fixes[idx].lon, b.lat, b.lon) as f32
+            });
+            Some((ti, la, lo, self.t_now as i64, hd, None))
+        } else {
+            None
+        };
+        let Some((ti, la, lo, t, hd, h_animal)) = target else {
+            ui.weak("Select a fix or move the cursor into a track's time range.");
+            return;
+        };
+        let Some(prof) = self.profiles.sample(la, lo, t) else {
+            ui.weak(format!(
+                "No wind profile at {} for this location yet.",
+                fmt_time(t)
+            ));
+            return;
+        };
+        let st = &self.profiles;
+        let (mut sup, mut crs, mut spd) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..st.levels.len() {
+            if !st.above_ground(&prof, i) || !prof.lv[i].z.is_finite() {
+                continue;
+            }
+            let l = prof.lv[i];
+            let z = l.z as f64;
+            spd.push([l.speed() as f64, z]);
+            if let Some(h) = hd {
+                let (s, c) = geo::wind_components(l.u as f64, l.v as f64, h as f64);
+                sup.push([s, z]);
+                crs.push([c, z]);
+            }
+        }
+        let ground = if prof.sp.is_finite() {
+            st.height_of_pressure(&prof, prof.sp)
+        } else {
+            None
+        };
+        let tr = &self.tracks[ti];
+        let tcol = Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]);
+        ui.weak(format!(
+            "Wind profile · {} · {} · {:.3}, {:.3}{}",
+            tr.id,
+            fmt_time(t),
+            la,
+            lo,
+            hd.map(|h| format!(" · heading {h:.0}°"))
+                .unwrap_or_else(|| " · no heading (support not defined)".into())
+        ));
+        Plot::new("profile")
+            .legend(Legend::default())
+            .allow_scroll(false)
+            .x_axis_label("m/s")
+            .y_axis_label("height (m ASL)")
+            .show(ui, |pui| {
+                pui.vline(VLine::new("", 0.0).color(Color32::from_gray(90)));
+                pui.line(
+                    Line::new("wind speed", PlotPoints::from(spd.clone()))
+                        .color(Color32::from_gray(190))
+                        .width(1.5),
+                );
+                pui.points(
+                    Points::new("wind speed", PlotPoints::from(spd))
+                        .color(Color32::from_gray(190))
+                        .radius(3.0),
+                );
+                if !sup.is_empty() {
+                    pui.line(
+                        Line::new("wind support", PlotPoints::from(sup.clone()))
+                            .color(Color32::from_rgb(80, 160, 230))
+                            .width(2.0),
+                    );
+                    pui.points(
+                        Points::new("wind support", PlotPoints::from(sup))
+                            .color(Color32::from_rgb(80, 160, 230))
+                            .radius(3.0),
+                    );
+                    pui.line(
+                        Line::new("crosswind", PlotPoints::from(crs.clone()))
+                            .color(Color32::from_rgb(230, 150, 60))
+                            .width(1.5),
+                    );
+                    pui.points(
+                        Points::new("crosswind", PlotPoints::from(crs))
+                            .color(Color32::from_rgb(230, 150, 60))
+                            .radius(2.5),
+                    );
+                }
+                if let Some(h) = h_animal {
+                    pui.hline(
+                        egui_plot::HLine::new("animal altitude", h as f64)
+                            .color(tcol)
+                            .width(2.0),
+                    );
+                }
+                if let Some(g) = ground {
+                    pui.hline(
+                        egui_plot::HLine::new("ground", g as f64)
+                            .color(Color32::from_gray(70))
+                            .width(2.0),
+                    );
+                }
+            });
     }
 }
 
@@ -1736,6 +2660,40 @@ fn fix_details(ui: &mut Ui, tr: &Track, f: &Fix) {
             row(ui, "ERA5 MSLP", o(w.msl_hpa, "hPa", 1));
             row(ui, "precipitation", o(w.precipitation_mm, "mm", 1));
             row(ui, "cloud cover", o(w.cloud_cover, "%", 0));
+            if let Some(fw) = &w.flight {
+                row(
+                    ui,
+                    "flight pressure",
+                    format!("{:.1} hPa", fw.flight_pressure_hpa),
+                );
+                row(ui, "flight height (profile)", o(fw.flight_height_m, "m", 0));
+                row(
+                    ui,
+                    "matched level",
+                    format!("{:.0} hPa", fw.matched_level_hpa),
+                );
+                row(ui, "flight-level wind", format!("{:.1} m/s", fw.wind_speed));
+                row(ui, "flight-level support", o(fw.wind_support, "m/s", 1));
+                row(ui, "flight-level crosswind", o(fw.crosswind, "m/s", 1));
+                row(ui, "flight-level airspeed", o(fw.airspeed, "m/s", 1));
+                row(
+                    ui,
+                    "best level",
+                    match (fw.best_level_hpa, fw.best_wind_support) {
+                        (Some(l), Some(b)) => format!("{l:.0} hPa ({b:+.1} m/s)"),
+                        _ => "-".into(),
+                    },
+                );
+                row(
+                    ui,
+                    "at best level",
+                    fw.at_best_wind
+                        .map(|b| if b { "yes" } else { "no" })
+                        .unwrap_or("-")
+                        .into(),
+                );
+                row(ui, "3D wind source", fw.source.clone());
+            }
             for (k, v) in &f.extra {
                 row(ui, k, v.clone());
             }
@@ -1750,6 +2708,9 @@ fn fix_details(ui: &mut Ui, tr: &Track, f: &Fix) {
 impl eframe::App for WingApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_messages();
+        if self.view_tab == ViewTab::ThreeD {
+            self.maybe_request_field();
+        }
         self.pump_weather(ctx);
         self.record_tick(ctx);
         if self.playing {
@@ -1793,7 +2754,10 @@ impl eframe::App for WingApp {
             .response
             .rect;
         self.map_rect = egui::CentralPanel::no_frame()
-            .show(ui, |ui| self.map(ui))
+            .show(ui, |ui| match self.view_tab {
+                ViewTab::Map => self.map(ui),
+                ViewTab::ThreeD => self.map3d(ui),
+            })
             .response
             .rect;
         self.video_window(&ctx);

@@ -79,6 +79,33 @@ pub struct WeatherAnno {
     pub seg_hours: Option<u16>,
     /// Barometric altitude recomputed with the local ERA5 mean-sea-level pressure.
     pub alt_msl_corrected: Option<f32>,
+    /// Pressure-level ("3D") wind at flight altitude — see [`crate::wind3d`].
+    /// Names follow `SigfoxTagPrep::annotate_era5()`.
+    pub flight: Option<FlightWind>,
+}
+
+/// Wind at the animal's flight altitude and at the best available pressure level.
+#[derive(Clone, Debug, Default)]
+pub struct FlightWind {
+    /// Pressure the animal flew at (tag barometer, or GPS altitude converted with the profile).
+    pub flight_pressure_hpa: f32,
+    /// Height (m above sea level) of that pressure in the wind profile.
+    pub flight_height_m: Option<f32>,
+    /// Nearest pressure level to the flight pressure (as in `annotate_era5()`).
+    pub matched_level_hpa: f32,
+    pub u: f32,
+    pub v: f32,
+    pub wind_speed: f32,
+    pub wind_support: Option<f32>,
+    pub crosswind: Option<f32>,
+    pub airspeed: Option<f32>,
+    /// Above-ground level with the strongest wind support for this heading.
+    pub best_level_hpa: Option<f32>,
+    pub best_level_height_m: Option<f32>,
+    pub best_wind_support: Option<f32>,
+    pub at_best_wind: Option<bool>,
+    /// Data source label, e.g. "Open-Meteo gfs_seamless" or "ERA5 file".
+    pub source: String,
 }
 
 /// One location fix.
