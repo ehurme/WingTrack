@@ -45,8 +45,9 @@ fn is_wildcloud(t: &Table) -> bool {
 }
 
 fn bins(t: &Table, prefix: &str) -> Vec<(usize, i64)> {
-    // e.g. "vedba_sum_36_min_ago" → (col, 36)
-    t.cols_where(|n| n.starts_with(prefix) && n.ends_with("min_ago"))
+    // e.g. "vedba_sum_36_min_ago" or, with a unit suffix,
+    // "VeDBA sum 36 min ago (m/s²)" → "vedba_sum_36_min_ago_m_s" → (col, 36)
+    t.cols_where(|n| n.starts_with(prefix) && n.contains("_min_ago"))
         .into_iter()
         .filter_map(|c| {
             let mins = t.norm[c]

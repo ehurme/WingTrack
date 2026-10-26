@@ -183,6 +183,8 @@ pub struct WingApp {
     show_error: bool,
     show_wind_arrows: bool,
     show_wind_field: bool,
+    wind_field_night_only: bool,
+    skip_daytime: bool,
     max_error_km: f32,
     hide_insignificant: bool,
     selected: Option<(usize, usize)>,
@@ -230,6 +232,8 @@ impl WingApp {
             show_error: true,
             show_wind_arrows: false,
             show_wind_field: true,
+            wind_field_night_only: false,
+            skip_daytime: false,
             max_error_km: 25.0,
             hide_insignificant: false,
             selected: None,
@@ -597,6 +601,52 @@ impl WingApp {
         self.memory.center_at(lon_lat((c + d) / 2.0, (a + b) / 2.0));
     }
 
+    /// Corners and centre of the area of interest: the downloaded ERA5 cells, or the
+    /// visible fixes when no weather is loaded.
+    fn night_probe_points(&self) -> Vec<(f64, f64)> {
+        let pts: Vec<(f64, f64)> = if self.store.is_empty() {
+            self.tracks
+                .iter()
+                .filter(|t| t.visible)
+                .flat_map(|t| t.fixes.iter().map(|f| (f.lat, f.lon)))
+                .collect()
+        } else {
+            self.store.cells.keys().map(|&k| weather::cell_center(k)).collect()
+        };
+        let Some(&(la0, lo0)) = pts.first() else {
+            return Vec::new();
+        };
+        let (mut s, mut n, mut w, mut e) = (la0, la0, lo0, lo0);
+        for &(la, lo) in &pts {
+            s = s.min(la);
+            n = n.max(la);
+            w = w.min(lo);
+            e = e.max(lo);
+        }
+        vec![(s, w), (s, e), (n, w), (n, e), ((s + n) / 2.0, (w + e) / 2.0)]
+    }
+
+    /// If it is day everywhere in the area at `t_now`, jump forward to the next night.
+    fn skip_to_night(&mut self) {
+        let probes = self.night_probe_points();
+        if probes.is_empty() {
+            return;
+        }
+        let night = |t: f64| probes.iter().any(|&(la, lo)| geo::is_night(t as i64, la, lo));
+        if night(self.t_now) {
+            return;
+        }
+        // 10-min steps, at most two days ahead (polar summer has no night).
+        let limit = (self.t_now + 2.0 * 86400.0).min(self.t_max);
+        let mut t = self.t_now;
+        while t < limit && !night(t) {
+            t += 600.0;
+        }
+        if night(t) {
+            self.t_now = t;
+        }
+    }
+
     fn step_selected(&mut self, dir: i32) {
         let ti = self
             .selected
@@ -700,6 +750,26 @@ impl WingApp {
 
             // ---- tracks
             egui::CollapsingHeader::new(format!("Tracks ({})", self.tracks.len())).default_open(true).show(ui, |ui| {
+                if !self.tracks.is_empty() {
+                    let n_vis = self.tracks.iter().filter(|t| t.visible).count();
+                    let mut all = n_vis == self.tracks.len();
+                    ui.horizontal(|ui| {
+                        let partial = n_vis > 0 && !all;
+                        if ui
+                            .add(egui::Checkbox::new(&mut all, format!("all individuals ({n_vis}/{})", self.tracks.len())).indeterminate(partial))
+                            .changed()
+                        {
+                            self.tracks.iter_mut().for_each(|t| t.visible = all);
+                        }
+                        if ui.small_button("none").clicked() {
+                            self.tracks.iter_mut().for_each(|t| t.visible = false);
+                        }
+                        if ui.small_button("invert").clicked() {
+                            self.tracks.iter_mut().for_each(|t| t.visible = !t.visible);
+                        }
+                    });
+                    ui.separator();
+                }
                 let mut zoom_to = None;
                 for (i, tr) in self.tracks.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
@@ -741,6 +811,15 @@ impl WingApp {
                 ui.checkbox(&mut self.show_error, "location-error circles");
                 ui.checkbox(&mut self.show_wind_arrows, "wind arrows at fixes");
                 ui.checkbox(&mut self.show_wind_field, "ERA5 wind field at cursor time");
+                ui.indent("wind_field_opts", |ui| {
+                    ui.add_enabled(
+                        self.show_wind_field,
+                        egui::Checkbox::new(&mut self.wind_field_night_only, "night cells only (sun < −6°)"),
+                    )
+                    .on_hover_text("Draw wind arrows only where the sun is more than 6° below the horizon at the cursor time");
+                    ui.checkbox(&mut self.skip_daytime, "skip daytime during playback")
+                        .on_hover_text("Playback jumps ahead whenever it is day across the whole wind-field / track area");
+                });
                 ui.checkbox(&mut self.trail_to_cursor, "draw tracks only up to cursor");
                 ui.checkbox(&mut self.follow, "follow selected animal");
             });
@@ -989,6 +1068,7 @@ impl WingApp {
             show_error: self.show_error,
             show_wind_arrows: self.show_wind_arrows,
             show_wind_field: self.show_wind_field,
+            wind_field_night_only: self.wind_field_night_only,
             store: &self.store,
             selected: self.selected,
             app: ViewCfg {
@@ -1208,6 +1288,9 @@ impl eframe::App for WingApp {
         if self.playing {
             let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
             self.t_now += dt * SPEEDS[self.speed_idx].0;
+            if self.skip_daytime {
+                self.skip_to_night();
+            }
             if self.t_now >= self.t_max {
                 self.t_now = self.t_max;
                 self.playing = false;
@@ -1268,6 +1351,7 @@ struct TrackLayer<'a> {
     show_error: bool,
     show_wind_arrows: bool,
     show_wind_field: bool,
+    wind_field_night_only: bool,
     store: &'a WeatherStore,
     selected: Option<(usize, usize)>,
     app: ViewCfg,
@@ -1336,6 +1420,9 @@ impl Plugin for TrackLayer<'_> {
                 let (la, lo) = weather::cell_center(k);
                 let p = to_screen(la, lo);
                 if !clip.expand(20.0).contains(p) {
+                    continue;
+                }
+                if self.wind_field_night_only && !geo::is_night(t, la, lo) {
                     continue;
                 }
                 let Some(v) = self.store.sample_cell(k, t) else {

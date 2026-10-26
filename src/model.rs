@@ -218,7 +218,9 @@ impl Track {
             a.t == b.t && (a.lat - b.lat).abs() < 1e-9 && (a.lon - b.lon).abs() < 1e-9
         });
         self.sensors.sort_by_key(|s| (s.kind, s.t));
-        self.sensors.dedup_by(|a, b| a.kind == b.kind && a.t == b.t);
+        // Same-time samples with different values are kept (e.g. 3 h min + max temperature).
+        self.sensors
+            .dedup_by(|a, b| a.kind == b.kind && a.t == b.t && a.value == b.value);
         self.compute_steps();
     }
 

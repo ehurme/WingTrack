@@ -189,3 +189,29 @@ fn demo_files_parse() {
         assert!(out.tracks.iter().all(|tr| tr.fixes.len() > 5), "{name}");
     }
 }
+
+#[test]
+fn wildcloud_fsp_unit_suffixed_headers() {
+    // Real Wildcloud export layout: ';' delimited, units appended to the bin headers.
+    let csv = "Device;Time (UTC);Raw Data;Position;Radius (m) (Source/Status);Sequence Number;LQI;Link Quality;Operator Name;Country Code;Base Stations (ID, RSSI, Reps);\
+VeDBA sum 144 min ago (m/s²);VeDBA sum 108 min ago (m/s²);VeDBA sum 72 min ago (m/s²);VeDBA sum 36 min ago (m/s²);VeDBA sum 0 min ago (m/s²);\
+Pressure 144 min ago (mbar);Pressure 108 min ago (mbar);Pressure 72 min ago (mbar);Pressure 36 min ago (mbar);Pressure 0 min ago (mbar);\
+Min Temperature of last 3 hrs (°C);Max Temperature of last 3 hrs (°C)\n\
+9EA1C8;12.09.2026, 20:40:01;403d36373ca4abcddfe7101c;45.590026, 12.865482;9800 (2/1);221;Good;2;SIGFOX_Italy_EIT_Smart;380;2778, -129, 3 | 276E, -113, 1;6364.123584;6065.805291;5369.729274;5469.168705;5966.365860;914.6;925.0;975.7;1002.5;1014.4;16;28\n\
+9ECED1;23.08.2026, 17:17:10;076000;45.929724, 13.27686;12800 (2/1);62;Limit;0;SIGFOX_Italy_EIT_Smart;380;215F, -142, 1;N/A;N/A;N/A;N/A;N/A;N/A;N/A;N/A;N/A;N/A;N/A;N/A\n";
+    let t = tbl("14_09_2026_records_Friuli.csv", csv);
+    let (out, id) = parse(&t, None).unwrap();
+    assert_eq!(id, "wildcloud-nanofox-fsp");
+    let tr = out.tracks.iter().find(|t| t.id == "9EA1C8").unwrap();
+    let count = |k| tr.sensors.iter().filter(|s| s.kind == k).count();
+    assert_eq!(count(SensorKind::Vedba), 5);
+    assert_eq!(count(SensorKind::Pressure), 5);
+    assert_eq!(count(SensorKind::Temperature), 2);
+    let f = &tr.fixes[0];
+    assert_eq!(f.pressure_hpa, Some(1014.4));
+    assert_eq!(f.alt_source, Some(AltitudeSource::PressureInstant));
+    assert!((f.activity.unwrap() - 29235.19).abs() < 0.1);
+    // Short raw payload with N/A sensors still yields a fix.
+    let g = out.tracks.iter().find(|t| t.id == "9ECED1").unwrap();
+    assert_eq!(g.fixes.len(), 1);
+}
