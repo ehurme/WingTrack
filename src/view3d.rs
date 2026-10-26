@@ -298,6 +298,23 @@ impl View3D {
     }
 
     fn controls(&mut self, ui: &Ui, resp: &Response) {
+        // Two-finger touch: pan, pinch-zoom and twist to rotate.
+        if let Some(mt) = ui.input(|i| i.multi_touch())
+            && mt.num_touches >= 2
+            && resp.rect.contains(mt.center_pos)
+        {
+            let d = mt.translation_delta;
+            let k = self.cam.dist / 700.0;
+            let (sy, cy) = self.cam.yaw.to_radians().sin_cos();
+            self.cam.target[0] -= (d.x * cy - d.y * sy) * k;
+            self.cam.target[1] -= (-d.x * sy - d.y * cy) * k;
+            if mt.zoom_delta != 1.0 && mt.zoom_delta > 0.0 {
+                self.cam.dist = (self.cam.dist / mt.zoom_delta).clamp(5.0, 20000.0);
+            }
+            self.cam.yaw = (self.cam.yaw - mt.rotation_delta.to_degrees()).rem_euclid(360.0);
+            self.follow = false;
+            return;
+        }
         if resp.dragged_by(egui::PointerButton::Primary) && !ui.input(|i| i.modifiers.shift) {
             let d = resp.drag_delta();
             self.cam.yaw = (self.cam.yaw - d.x * 0.3).rem_euclid(360.0);
@@ -652,6 +669,8 @@ impl View3D {
 
     fn hud(&mut self, ui: &mut Ui, painter: &egui::Painter, rect: Rect, scene: &Scene) {
         let amber = Color32::from_rgb(245, 190, 90);
+        // Phone-width layout: smaller caption, wrapped subtitle, no mouse hints.
+        let compact = rect.width() < 600.0;
         // big date, like a story caption
         let t = scene.t_now as i64;
         let date = chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
@@ -666,41 +685,46 @@ impl View3D {
             rect.left_top() + vec2(18.0, 14.0),
             Align2::LEFT_TOP,
             &date.0,
-            FontId::monospace(30.0),
+            FontId::monospace(if compact { 22.0 } else { 30.0 }),
             amber,
         );
         painter.text(
             r1.right_bottom() + vec2(10.0, -4.0),
             Align2::LEFT_BOTTOM,
             &date.1,
-            FontId::monospace(16.0),
+            FontId::monospace(if compact { 13.0 } else { 16.0 }),
             Color32::from_gray(210),
         );
-        if let Some(slice) = scene.slice {
-            let hs: Vec<String> = slice.mean_z.iter().map(|h| format!("{h:.0}")).collect();
-            painter.text(
-                r1.left_bottom() + vec2(0.0, 6.0),
-                Align2::LEFT_TOP,
-                format!(
-                    "Winds shown at {} m. Dotted line: not detected.",
-                    hs.join(", ")
-                ),
-                FontId::proportional(14.0),
-                Color32::from_gray(200),
-            );
-        } else {
-            painter.text(
-                r1.left_bottom() + vec2(0.0, 6.0),
-                Align2::LEFT_TOP,
-                "No pressure-level wind for this time — download or import it in the side panel.",
-                FontId::proportional(14.0),
+        let (subtitle, col) = match scene.slice {
+            Some(slice) => {
+                let hs: Vec<String> = slice.mean_z.iter().map(|h| format!("{h:.0}")).collect();
+                (
+                    format!(
+                        "Winds shown at {} m. Dotted line: not detected.",
+                        hs.join(", ")
+                    ),
+                    Color32::from_gray(200),
+                )
+            }
+            None => (
+                "No pressure-level wind for this time — download or import it in the side panel."
+                    .to_string(),
                 Color32::from_gray(170),
-            );
-        }
+            ),
+        };
+        // wrap so it never runs under the camera buttons on the right
+        let wrap = (rect.width() - 120.0).max(120.0);
+        let galley = painter.layout(
+            subtitle,
+            FontId::proportional(if compact { 12.0 } else { 14.0 }),
+            col,
+            wrap,
+        );
+        painter.galley(r1.left_bottom() + vec2(0.0, 6.0), galley, col);
 
         // km from where each was tagged
         let mut x = rect.left() + 18.0;
-        let y = rect.bottom() - 46.0;
+        let y = rect.bottom() - if compact { 56.0 } else { 46.0 };
         painter.text(
             pos2(x, y - 6.0),
             Align2::LEFT_BOTTOM,
@@ -749,7 +773,11 @@ impl View3D {
                 .get(self.raster_level.min(slice.mean_z.len().saturating_sub(1)))
         {
             let w = 150.0;
-            let o = pos2(rect.right() - w - 40.0, rect.bottom() - 62.0);
+            let o = if compact {
+                pos2(rect.right() - w - 40.0, rect.bottom() - 100.0)
+            } else {
+                pos2(rect.right() - w - 40.0, rect.bottom() - 62.0)
+            };
             painter.text(
                 o - vec2(8.0, -5.0),
                 Align2::RIGHT_CENTER,
@@ -819,13 +847,15 @@ impl View3D {
             }
             y += 26.0;
         }
-        painter.text(
-            pos2(rect.right() - 12.0, y + 4.0),
-            Align2::RIGHT_TOP,
-            "drag: orbit\nshift/right-drag: pan\nscroll: zoom",
-            FontId::proportional(10.0),
-            Color32::from_gray(140),
-        );
+        if !compact {
+            painter.text(
+                pos2(rect.right() - 12.0, y + 4.0),
+                Align2::RIGHT_TOP,
+                "drag: orbit\nshift/right-drag or 2 fingers: pan\nscroll or pinch: zoom",
+                FontId::proportional(10.0),
+                Color32::from_gray(140),
+            );
+        }
     }
 }
 
