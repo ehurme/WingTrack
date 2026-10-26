@@ -76,6 +76,10 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
   legend, clock) plus, optionally, the timeline and sensor chart. Frames are captured at a fixed amount of tracking
   time per frame, so the result does not depend on render speed. MP4 (H.264) needs `ffmpeg` on PATH (desktop only);
   animated GIF works everywhere, including the web build. Honours *skip daytime during playback*.
+- **Phones and tablets** — the web app adapts to narrow screens: the side panel starts hidden behind a
+  **Panel** button (it also collapses on desktop), file and layer controls move into **File** / **Layers** menus,
+  the chart can be hidden with **Chart**, a tapped fix shows its summary on the map, and the 3D view supports
+  one-finger orbit, two-finger pan, pinch-zoom and twist-to-rotate.
 - **Export** — one CSV with every derived column (`wind_support_ms`, `segment_wind_support_ms`, `altitude_era5_msl_corrected_m`, …)
   and Movebank-style names, ready for R:
 

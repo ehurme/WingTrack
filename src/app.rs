@@ -337,6 +337,11 @@ pub struct WingApp {
 
     // 3D wind
     view_tab: ViewTab,
+    // layout (phones / small windows)
+    narrow: bool,
+    side_open: bool,
+    chart_open: bool,
+    layout_init: bool,
     profiles: ProfileStore,
     om_model: OmModel,
     field_auto: bool,
@@ -432,6 +437,10 @@ impl WingApp {
             map_rect: Rect::NOTHING,
             timeline_rect: Rect::NOTHING,
             view_tab: ViewTab::Map,
+            narrow: false,
+            side_open: true,
+            chart_open: true,
+            layout_init: false,
             profiles: ProfileStore::default(),
             om_model: OmModel::Gfs,
             field_auto: true,
@@ -1421,62 +1430,103 @@ impl WingApp {
     // ------------------------------------------------------------------ UI
 
     fn top_bar(&mut self, ui: &mut Ui) {
+        let narrow = self.narrow;
         ui.horizontal_wrapped(|ui| {
-            ui.strong("WingTrack");
+            ui.toggle_value(&mut self.side_open, "Panel")
+                .on_hover_text("Show or hide the side panel");
+            if !narrow {
+                ui.strong("WingTrack");
+            }
             ui.separator();
             ui.selectable_value(&mut self.view_tab, ViewTab::Map, "2D map");
             ui.selectable_value(&mut self.view_tab, ViewTab::ThreeD, "3D winds");
             ui.separator();
-            if ui.button("Open…").on_hover_text("CSV from Wildcloud, Movebank, CTT or R").clicked() {
-                self.open_dialog(ui.ctx());
+            if narrow {
+                ui.menu_button("File", |ui| self.file_actions(ui));
+                ui.menu_button("Layers", |ui| self.layer_actions(ui));
+            } else {
+                self.file_actions(ui);
+                ui.separator();
+                self.layer_actions(ui);
             }
-            if ui.button("Load demo").on_hover_text("Simulated NanoFox, TinyFox and CTT GPS files").clicked() {
-                self.load_demo();
-            }
-            if ui.add_enabled(!self.tracks.is_empty(), egui::Button::new("Export annotated CSV")).clicked() {
-                self.export();
-            }
-            if let Some(rec) = &self.rec {
-                let frac = rec.frames as f32 / rec.total.max(1) as f32;
-                let text = format!("REC {}/{}", rec.frames, rec.total);
-                ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(text));
-                if ui.button("Stop & save").clicked()
-                    && let Some(rec) = self.rec.take()
-                {
-                    let ctx = ui.ctx().clone();
-                    self.finish_recording(rec, Ok(()), &ctx);
-                }
-            } else if ui
-                .add_enabled(!self.tracks.is_empty(), egui::Button::new("Export video…"))
-                .on_hover_text("MP4 or GIF of the animated map, legend and sensor chart")
-                .clicked()
+        });
+    }
+
+    /// Open / demo / export / clear (inline on wide screens, a "File" menu on phones).
+    fn file_actions(&mut self, ui: &mut Ui) {
+        if ui
+            .button("Open…")
+            .on_hover_text("CSV from Wildcloud, Movebank, CTT or R")
+            .clicked()
+        {
+            self.open_dialog(ui.ctx());
+        }
+        if ui
+            .button("Load demo")
+            .on_hover_text("Simulated NanoFox, TinyFox and CTT GPS files")
+            .clicked()
+        {
+            self.load_demo();
+        }
+        if ui
+            .add_enabled(
+                !self.tracks.is_empty(),
+                egui::Button::new("Export annotated CSV"),
+            )
+            .clicked()
+        {
+            self.export();
+        }
+        if let Some(rec) = &self.rec {
+            let frac = rec.frames as f32 / rec.total.max(1) as f32;
+            let text = format!("REC {}/{}", rec.frames, rec.total);
+            ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(text));
+            if ui.button("Stop & save").clicked()
+                && let Some(rec) = self.rec.take()
             {
-                self.open_video_dialog();
+                let ctx = ui.ctx().clone();
+                self.finish_recording(rec, Ok(()), &ctx);
             }
-            if ui.add_enabled(!self.tracks.is_empty(), egui::Button::new("Clear")).clicked() {
-                self.tracks.clear();
-                self.files.clear();
-                self.selected = None;
-                self.selected_track = None;
-            }
-            ui.separator();
-            egui::ComboBox::from_id_salt("basemap").selected_text(self.basemap.label()).show_ui(ui, |ui| {
+        } else if ui
+            .add_enabled(!self.tracks.is_empty(), egui::Button::new("Export video…"))
+            .on_hover_text("MP4 or GIF of the animated map, legend and sensor chart")
+            .clicked()
+        {
+            self.open_video_dialog();
+        }
+        if ui
+            .add_enabled(!self.tracks.is_empty(), egui::Button::new("Clear"))
+            .clicked()
+        {
+            self.tracks.clear();
+            self.files.clear();
+            self.selected = None;
+            self.selected_track = None;
+        }
+    }
+
+    /// Basemap and daily-satellite controls (inline on wide screens, a "Layers" menu on phones).
+    fn layer_actions(&mut self, ui: &mut Ui) {
+        egui::ComboBox::from_id_salt("basemap")
+            .selected_text(self.basemap.label())
+            .show_ui(ui, |ui| {
                 for b in Basemap::ALL {
                     ui.selectable_value(&mut self.basemap, b, b.label());
                 }
             });
-            ui.checkbox(&mut self.sat_on, "Daily satellite").on_hover_text(
-                "NASA GIBS imagery for the date under the time cursor - see cloud fronts the animals flew through",
-            );
-            if self.sat_on {
-                egui::ComboBox::from_id_salt("sat").selected_text(self.sat_layer.label()).show_ui(ui, |ui| {
+        ui.checkbox(&mut self.sat_on, "Daily satellite").on_hover_text(
+            "NASA GIBS imagery for the date under the time cursor - see cloud fronts the animals flew through",
+        );
+        if self.sat_on {
+            egui::ComboBox::from_id_salt("sat")
+                .selected_text(self.sat_layer.label())
+                .show_ui(ui, |ui| {
                     for l in SatLayer::ALL {
                         ui.selectable_value(&mut self.sat_layer, l, l.label());
                     }
                 });
-                ui.add(egui::Slider::new(&mut self.sat_opacity, 0.1..=1.0).text("opacity"));
-            }
-        });
+            ui.add(egui::Slider::new(&mut self.sat_opacity, 0.1..=1.0).text("opacity"));
+        }
     }
 
     fn side_panel(&mut self, ui: &mut Ui) {
@@ -1560,6 +1610,10 @@ impl WingApp {
                 if let Some(i) = zoom_to {
                     self.selected_track = Some(i);
                     self.fit_pending = true;
+                    self.view3d.request_fit();
+                    if self.narrow {
+                        self.side_open = false; // show the map on phones
+                    }
                 }
             });
 
@@ -1693,6 +1747,20 @@ impl WingApp {
         });
     }
 
+    fn time_slider(&mut self, ui: &mut Ui) {
+        let (lo, hi) = (self.t_min, self.t_max);
+        let reserve = if self.narrow { 10.0 } else { 190.0 };
+        ui.spacing_mut().slider_width = (ui.available_width() - reserve).max(100.0);
+        ui.add(
+            egui::Slider::new(&mut self.t_now, lo..=hi)
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        if !self.narrow {
+            ui.monospace(fmt_time(self.t_now as i64) + " UTC");
+        }
+    }
+
     fn timeline(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             if ui
@@ -1726,16 +1794,24 @@ impl WingApp {
                         ui.selectable_value(&mut self.speed_idx, i, s.1);
                     }
                 });
-            let (lo, hi) = (self.t_min, self.t_max);
-            ui.spacing_mut().slider_width = (ui.available_width() - 190.0).max(100.0);
-            ui.add(
-                egui::Slider::new(&mut self.t_now, lo..=hi)
-                    .show_value(false)
-                    .trailing_fill(true),
-            );
-            ui.monospace(fmt_time(self.t_now as i64) + " UTC");
+            ui.toggle_value(&mut self.chart_open, "Chart")
+                .on_hover_text("Show or hide the chart");
+            if self.narrow {
+                let short = chrono::DateTime::<chrono::Utc>::from_timestamp(self.t_now as i64, 0)
+                    .map(|d| d.format("%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                ui.monospace(short);
+            } else {
+                self.time_slider(ui);
+            }
         });
-        ui.horizontal(|ui| {
+        if self.narrow {
+            ui.horizontal(|ui| self.time_slider(ui));
+        }
+        if !self.chart_open {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("chartvar")
                 .selected_text(self.chart_var.label())
                 .show_ui(ui, |ui| {
@@ -1752,13 +1828,15 @@ impl WingApp {
                         }
                     });
             }
-            ui.weak(match self.selected_track {
-                Some(i) => format!(
-                    "showing {}",
-                    self.tracks.get(i).map(|t| t.id.as_str()).unwrap_or("")
-                ),
-                None => "showing all visible tracks (click a track name to isolate)".into(),
-            });
+            if !self.narrow {
+                ui.weak(match self.selected_track {
+                    Some(i) => format!(
+                        "showing {}",
+                        self.tracks.get(i).map(|t| t.id.as_str()).unwrap_or("")
+                    ),
+                    None => "showing all visible tracks (click a track name to isolate)".into(),
+                });
+            }
         });
         match self.chart_var {
             ChartVar::Curtain => return self.curtain_chart(ui),
@@ -1800,7 +1878,7 @@ impl WingApp {
             ChartVar::WindSupport | ChartVar::SegmentWind | ChartVar::Crosswind
         );
         let resp = Plot::new("chart")
-            .legend(Legend::default())
+            .legend_if(!self.narrow)
             .allow_scroll(false)
             .x_axis_formatter(|m: GridMark, _r| fmt_date((m.value * 86400.0) as i64))
             .label_formatter(|h: &HoverPosition<'_>| {
@@ -1991,6 +2069,21 @@ impl WingApp {
         }
         if let Some((ti, fi, pos)) = interaction.hover {
             self.fix_tooltip(ui, ti, fi, pos);
+        } else {
+            self.selected_card(ui);
+        }
+    }
+
+    /// On phones (no hover, side panel usually hidden) keep the tapped fix's summary on the map.
+    fn selected_card(&self, ui: &Ui) {
+        if !(self.narrow && !self.side_open) {
+            return;
+        }
+        if let Some((ti, fi)) = self.selected
+            && self.tracks.get(ti).is_some_and(|t| fi < t.fixes.len())
+        {
+            let r = ui.max_rect();
+            self.fix_tooltip(ui, ti, fi, r.left_bottom() + vec2(-6.0, -150.0));
         }
     }
 
@@ -2101,6 +2194,8 @@ impl WingApp {
         }
         if let Some((ti, fi, pos)) = out.hover {
             self.fix_tooltip(ui, ti, fi, pos);
+        } else {
+            self.selected_card(ui);
         }
     }
 
@@ -2382,14 +2477,16 @@ impl WingApp {
             .collect();
         let tcol = Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]);
         let id = tr.id.clone();
-        ui.weak(format!(
+        if !self.narrow {
+            ui.weak(format!(
             "{} along {id}'s path (colour: {}) · line = animal altitude · dashed = level with best wind support",
             metric.label(),
             if metric == CurtainMetric::WindSpeed { "speed 0–28 m/s" } else { "blue tailwind / red headwind, ±10 m/s" }
         ));
+        }
         let t_now_d = self.t_now / 86400.0;
         let resp = Plot::new("curtain")
-            .legend(Legend::default())
+            .legend_if(!self.narrow)
             .allow_scroll(false)
             .y_axis_label("height (m ASL)")
             .x_axis_formatter(|m: GridMark, _r| fmt_date((m.value * 86400.0) as i64))
@@ -2531,7 +2628,7 @@ impl WingApp {
                 .unwrap_or_else(|| " · no heading (support not defined)".into())
         ));
         Plot::new("profile")
-            .legend(Legend::default())
+            .legend_if(!self.narrow)
             .allow_scroll(false)
             .x_axis_label("m/s")
             .y_axis_label("height (m ASL)")
@@ -2742,17 +2839,43 @@ impl eframe::App for WingApp {
                 self.step_selected(-1);
             }
         }
+        let screen = ctx.content_rect();
+        self.narrow = screen.width() < 760.0;
+        if !self.layout_init {
+            // Phones start with the side panel hidden and a shorter chart.
+            self.side_open = !self.narrow;
+            self.layout_init = true;
+        }
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
-        egui::Panel::left("side")
+        let side_w = if self.narrow {
+            (screen.width() * 0.85).min(330.0)
+        } else {
+            330.0
+        };
+        let mut side_open = self.side_open;
+        egui::Panel::left(if self.narrow { "side_narrow" } else { "side" })
             .resizable(true)
-            .default_size(330.0)
-            .show(ui, |ui| self.side_panel(ui));
-        self.timeline_rect = egui::Panel::bottom("timeline")
+            .default_size(side_w)
+            .size_range(180.0..=screen.width().max(200.0) * 0.95)
+            .show_collapsible(ui, &mut side_open, |ui| self.side_panel(ui));
+        self.side_open = side_open;
+        let chart_h = if self.narrow {
+            (screen.height() * 0.3).clamp(140.0, 220.0)
+        } else {
+            250.0
+        };
+        let bottom = if self.chart_open {
+            egui::Panel::bottom(if self.narrow {
+                "timeline_narrow"
+            } else {
+                "timeline"
+            })
             .resizable(true)
-            .default_size(250.0)
-            .show(ui, |ui| self.timeline(ui))
-            .response
-            .rect;
+            .default_size(chart_h)
+        } else {
+            egui::Panel::bottom("timeline_min").resizable(false)
+        };
+        self.timeline_rect = bottom.show(ui, |ui| self.timeline(ui)).response.rect;
         self.map_rect = egui::CentralPanel::no_frame()
             .show(ui, |ui| match self.view_tab {
                 ViewTab::Map => self.map(ui),
@@ -2761,6 +2884,21 @@ impl eframe::App for WingApp {
             .response
             .rect;
         self.video_window(&ctx);
+    }
+}
+
+/// Charts drop their legend on phone-width screens, where it would cover the plot.
+trait PlotLegendExt {
+    fn legend_if(self, on: bool) -> Self;
+}
+
+impl PlotLegendExt for Plot<'_> {
+    fn legend_if(self, on: bool) -> Self {
+        if on {
+            self.legend(Legend::default())
+        } else {
+            self
+        }
     }
 }
 
