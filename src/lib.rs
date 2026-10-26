@@ -17,6 +17,8 @@ pub mod model;
 pub mod table;
 pub mod tiles;
 pub mod video;
+pub mod view3d;
 pub mod weather;
+pub mod wind3d;
 
 pub use app::WingApp;

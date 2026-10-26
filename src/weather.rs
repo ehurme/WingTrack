@@ -128,11 +128,11 @@ pub fn cell_center(k: CellKey) -> (f64, f64) {
     (k.0 as f64 * GRID, k.1 as f64 * GRID)
 }
 
-fn day_of(t: i64) -> i64 {
+pub fn day_of(t: i64) -> i64 {
     t.div_euclid(86400)
 }
 
-fn day_str(d: i64) -> String {
+pub fn day_str(d: i64) -> String {
     DateTime::<Utc>::from_timestamp(d * 86400, 0)
         .map(|x| x.format("%Y-%m-%d").to_string())
         .unwrap_or_default()
@@ -173,41 +173,10 @@ impl WeatherStore {
 
     /// Plan the requests needed to cover `points` (lat, lon, t), skipping cached cell-days.
     pub fn plan(&self, points: &[(f64, f64, i64)], model: Model, latest_day: i64) -> Vec<Request> {
-        // Needed (cell, day), including the next day for interpolation across midnight.
-        let mut need: HashSet<(CellKey, i64)> = HashSet::new();
-        for &(lat, lon, t) in points {
-            let k = cell_of(lat, lon);
-            for d in [day_of(t), day_of(t + 3600)] {
-                if d <= latest_day && !self.days.contains(&(k, d)) {
-                    need.insert((k, d));
-                }
-            }
-        }
-        // Group by calendar month.
-        let mut by_month: BTreeMap<(i32, u32), BTreeMap<CellKey, (i64, i64)>> = BTreeMap::new();
-        for (k, d) in need {
-            let date = DateTime::<Utc>::from_timestamp(d * 86400, 0)
-                .expect("valid day")
-                .date_naive();
-            let e = by_month
-                .entry((date.year(), date.month()))
-                .or_default()
-                .entry(k)
-                .or_insert((d, d));
-            e.0 = e.0.min(d);
-            e.1 = e.1.max(d);
-        }
-        let mut reqs = Vec::new();
-        for (_, cells) in by_month {
-            let cells: Vec<_> = cells.into_iter().collect();
-            for chunk in cells.chunks(CELLS_PER_REQUEST) {
-                let start = chunk.iter().map(|c| c.1.0).min().expect("non-empty chunk");
-                let end = chunk.iter().map(|c| c.1.1).max().expect("non-empty chunk");
-                let keys: Vec<CellKey> = chunk.iter().map(|c| c.0).collect();
-                reqs.push(Request::new(keys, start, end, model));
-            }
-        }
-        reqs
+        plan_cell_days(points, &self.days, latest_day, CELLS_PER_REQUEST)
+            .into_iter()
+            .map(|(keys, start, end)| Request::new(keys, start, end, model))
+            .collect()
     }
 
     /// Store a JSON response for `req`. Returns the number of hours ingested.
@@ -281,6 +250,51 @@ impl WeatherStore {
             }
         }
     }
+}
+
+/// Group the (cell, day) pairs needed to cover `points` — skipping those in `done` and
+/// days after `latest_day` — into requests of at most `per_request` cells within one
+/// calendar month. Returns (cells, first day, last day) per request. Shared by the
+/// surface (ERA5) and pressure-level (3D wind) downloaders.
+pub fn plan_cell_days(
+    points: &[(f64, f64, i64)],
+    done: &HashSet<(CellKey, i64)>,
+    latest_day: i64,
+    per_request: usize,
+) -> Vec<(Vec<CellKey>, i64, i64)> {
+    // Needed (cell, day), including the next day for interpolation across midnight.
+    let mut need: HashSet<(CellKey, i64)> = HashSet::new();
+    for &(lat, lon, t) in points {
+        let k = cell_of(lat, lon);
+        for d in [day_of(t), day_of(t + 3600)] {
+            if d <= latest_day && !done.contains(&(k, d)) {
+                need.insert((k, d));
+            }
+        }
+    }
+    let mut by_month: BTreeMap<(i32, u32), BTreeMap<CellKey, (i64, i64)>> = BTreeMap::new();
+    for (k, d) in need {
+        let date = DateTime::<Utc>::from_timestamp(d * 86400, 0)
+            .expect("valid day")
+            .date_naive();
+        let e = by_month
+            .entry((date.year(), date.month()))
+            .or_default()
+            .entry(k)
+            .or_insert((d, d));
+        e.0 = e.0.min(d);
+        e.1 = e.1.max(d);
+    }
+    let mut out = Vec::new();
+    for (_, cells) in by_month {
+        let cells: Vec<_> = cells.into_iter().collect();
+        for chunk in cells.chunks(per_request.max(1)) {
+            let start = chunk.iter().map(|c| c.1.0).min().expect("non-empty chunk");
+            let end = chunk.iter().map(|c| c.1.1).max().expect("non-empty chunk");
+            out.push((chunk.iter().map(|c| c.0).collect(), start, end));
+        }
+    }
+    out
 }
 
 fn interp_angle(a: f32, b: f32, w: f32) -> f32 {

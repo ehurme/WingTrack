@@ -247,6 +247,40 @@ pub(crate) fn import_weather(t: &Table, row: &[String], f: &mut Fix) {
             v as f32
         });
     }
+    // Flight-level (pressure-level) wind from annotate_era5() or a WingTrack export.
+    if let (Some(lvl), Some(fp)) = (
+        t.num(row, t.col(&["matched_pressure_level"])),
+        t.num(row, t.col(&["flight_pressure_hpa"])),
+    ) {
+        let num = |names: &[&str]| t.num(row, t.col(names)).map(|v| v as f32);
+        let u = num(&["u_flight", "era5_u_flight"]).unwrap_or(f32::NAN);
+        let v = num(&["v_flight", "era5_v_flight"]).unwrap_or(f32::NAN);
+        let at_best = match t
+            .get(row, t.col(&["at_best_wind"]))
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        };
+        f.weather.flight = Some(crate::model::FlightWind {
+            flight_pressure_hpa: fp as f32,
+            flight_height_m: num(&["flight_height_m"]),
+            matched_level_hpa: lvl as f32,
+            u,
+            v,
+            wind_speed: num(&["wind_speed_flight"]).unwrap_or((u * u + v * v).sqrt()),
+            wind_support: num(&["wind_support_flight"]),
+            crosswind: num(&["crosswind_flight"]),
+            airspeed: num(&["airspeed_flight"]),
+            best_level_hpa: num(&["best_wind_level"]),
+            best_level_height_m: num(&["best_wind_level_height_m"]),
+            best_wind_support: num(&["best_wind_support"]),
+            at_best_wind: at_best,
+            source: "imported".into(),
+        });
+    }
 }
 
 /// Attach barometric altitude to fixes lacking it, from the minimum pressure sample in

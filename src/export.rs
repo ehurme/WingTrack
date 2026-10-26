@@ -61,6 +61,21 @@ pub fn to_csv<'a>(tracks: impl IntoIterator<Item = &'a Track> + Clone) -> String
         "era5_surface_pressure_hpa",
         "era5_precipitation_mm",
         "era5_cloud_cover_pct",
+        // pressure-level wind; names follow SigfoxTagPrep::annotate_era5()
+        "flight_pressure_hPa",
+        "flight_height_m",
+        "matched_pressure_level",
+        "u_flight",
+        "v_flight",
+        "wind_speed_flight",
+        "wind_support_flight",
+        "crosswind_flight",
+        "airspeed_flight",
+        "best_wind_level",
+        "best_wind_level_height_m",
+        "best_wind_support",
+        "at_best_wind",
+        "wind3d_source",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -109,6 +124,26 @@ pub fn to_csv<'a>(tracks: impl IntoIterator<Item = &'a Track> + Clone) -> String
                 f2(wa.surface_pressure_hpa),
                 f2(wa.precipitation_mm),
                 f2(wa.cloud_cover),
+                o(wa.flight.as_ref().map(|w| w.flight_pressure_hpa)),
+                f2(wa.flight.as_ref().and_then(|w| w.flight_height_m)),
+                o(wa.flight.as_ref().map(|w| w.matched_level_hpa)),
+                f2(wa.flight.as_ref().map(|w| w.u)),
+                f2(wa.flight.as_ref().map(|w| w.v)),
+                f2(wa.flight.as_ref().map(|w| w.wind_speed)),
+                f2(wa.flight.as_ref().and_then(|w| w.wind_support)),
+                f2(wa.flight.as_ref().and_then(|w| w.crosswind)),
+                f2(wa.flight.as_ref().and_then(|w| w.airspeed)),
+                o(wa.flight.as_ref().and_then(|w| w.best_level_hpa)),
+                f2(wa.flight.as_ref().and_then(|w| w.best_level_height_m)),
+                f2(wa.flight.as_ref().and_then(|w| w.best_wind_support)),
+                o(wa.flight
+                    .as_ref()
+                    .and_then(|w| w.at_best_wind)
+                    .map(|b| if b { "TRUE" } else { "FALSE" })),
+                wa.flight
+                    .as_ref()
+                    .map(|w| w.source.clone())
+                    .unwrap_or_default(),
             ];
             for k in &extra_keys {
                 rec.push(

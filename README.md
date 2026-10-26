@@ -13,6 +13,10 @@ Runs as a native desktop app (Linux / macOS / Windows) and, from the same code, 
 *Demo data shown with an offline test wind field (`WINGTRACK_SYNTHETIC_WIND=1`); with network access the
 basemap, daily satellite imagery and real ERA5 data load from the services below.*
 
+![3D winds view with stacked pressure levels](assets/screenshot_3d.png)
+
+*3D view with the demo tracks and the offline synthetic test wind field (`WINGTRACK_SYNTHETIC_WIND=1 WINGTRACK_3D=1`).*
+
 ## Features
 
 - **Firmware-aware import** — auto-detects the format of each CSV, with a per-file override:
@@ -44,6 +48,26 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
     tracks on a 0.5° grid (*wind-field margin / spacing*), optionally night cells only. The arrow palette has a
     default per basemap (bright on satellite imagery, viridis on street/topo maps) and can be changed per basemap.
     Requests are batched by month, 25 grid cells per call, and cached
+- **3D winds at multiple altitudes** (*3D winds* tab) — a tilted map with the wind-speed field for one level,
+  flowing particles on stacked pressure-level planes (labelled with their geopotential height), tracks drawn at
+  flight altitude with drop lines and ground shadows, dotted segments where the animal was not detected,
+  named position markers, a big date caption and a "km from where each was tagged" bar. Drag to orbit,
+  shift/right-drag to pan, scroll to zoom; *Follow* keeps the selected animal centred.
+  - **Two data sources** in one store:
+    [Open-Meteo Historical Forecast API](https://open-meteo.com/en/docs/historical-forecast-api) — 1000–700 hPa
+    (≈ 110 m – 3 km) wind, geopotential height and temperature from archived GFS / ICON / IFS analyses,
+    ~2021 onwards, no key, works in the browser; or an **ERA5 wind cube** exported from your own
+    `download_era5.py` files with `tools/era5_wind_cube.py` (any levels, e.g. 1000–500 hPa).
+  - **Flight-level annotation** per fix, with the same definitions and column names as
+    `SigfoxTagPrep::annotate_era5()`: flight pressure (tag barometer, or GPS altitude converted with the
+    profile), `matched_pressure_level` (nearest level), `wind_support_flight`, `crosswind_flight`,
+    `airspeed_flight`, `best_wind_level`, `best_wind_support`, `at_best_wind`. Unlike the R function,
+    levels below the ground (level pressure > surface pressure) are excluded from the best-level search.
+  - **Charts**: a *time × height curtain* of wind support / crosswind / speed along a track's path with the
+    animal's altitude and the best level overlaid, a *wind profile* at the selected fix (support, crosswind,
+    speed vs height), and time series of flight-level and best-level support.
+  - The regional field is downloaded lazily, one day at a time, for the day under the cursor
+    (0.25–2° resolution); along-track profiles are fetched at full 0.25° resolution.
 - **Timeline & charts** — play/pause at 10 min/s … 1 week/s, step fix-by-fix (← →, Space),
   linked chart of altitude, speeds, wind components, ERA5 variables, location error or raw sensor
   streams (VeDBA, tag temperature, pressure, activity). Click the chart to jump in time; click a fix on the map to inspect it,
@@ -179,6 +203,18 @@ Pushing to `main` on GitHub runs `.github/workflows/ci.yml`: tests + clippy, des
 Linux/macOS/Windows (downloadable artifacts), and a web build deployed to GitHub Pages
 (enable *Settings → Pages → Source: GitHub Actions*).
 
+## ERA5 wind cube for the 3D view
+
+```bash
+pip install xarray pandas numpy cfgrib netCDF4
+python tools/era5_wind_cube.py --era5-dir //10.0.16.7/grpdechmann/Postdoc-EdwardHurme/EnvData \
+    --tracks wingtrack_annotated.csv --step 0.5 --out my_cube.csv.gz
+```
+
+The area and dates come from the track file (plus a 2° margin); `--bbox S N W E --start --end` sets them
+explicitly. Add `"geopotential"` to `pressure_level_variables` in `era5_config.json` for exact level heights; without
+it heights are integrated from MSLP and temperature. Load the file with *3D wind → Import ERA5 cube…*.
+
 ## Adding a tag type / firmware
 
 Implement the `Firmware` trait in `src/firmware/` and add it to `registry()`:
@@ -199,8 +235,12 @@ and sensor samples go into `Track::sensors` so they appear in the chart automati
 
 ## Notes and limits
 
-- ERA5 single levels stop at **100 m**; bats often fly higher. For pressure-level winds matched to flight
-  altitude use `annotate_era5()` in SigfoxTagPrep and load the result — WingTrack shows those columns as imported weather.
+- ERA5 single levels stop at **100 m**; use the *3D winds* source (Open-Meteo pressure levels or an ERA5 cube) for
+  wind at flight altitude. Files annotated with `annotate_era5()` in R also load, with their flight-level columns shown as imported.
+- Open-Meteo pressure levels come from operational forecast archives (not ERA5) and start around 2021–2022; for older
+  tracks, or to match published analyses, export an ERA5 cube. With ECMWF IFS some intermediate levels (975, 950, 900, 800 hPa)
+  are missing; GFS has all of them. Each pressure-level request asks for 33 variables, which Open-Meteo counts as several calls —
+  keep the field resolution coarse (1°) for large areas.
 - Open-Meteo is free for non-commercial use (≈10 000 calls/day; a multi-location month request counts as several calls).
   Along-step sampling adds grid cells between fixes; turn it off for very large GPS datasets.
 - ERA5 is available with a ~5–6 day delay; newer fixes stay un-annotated.
@@ -217,6 +257,9 @@ and sensor samples go into `Track::sensors` so they appear in the chart automati
 | `src/weather.rs` | ERA5 request planning, response cache, wind support / along-step annotation         |
 | `src/geo.rs`     | great-circle maths, solar elevation, barometric altitude, wind vectors              |
 | `src/tiles.rs`   | basemaps and NASA GIBS date-specific tile sources                                   |
+| `src/wind3d.rs`  | pressure-level profiles: Open-Meteo + ERA5-cube sources, interpolation, flight-level annotation, curtains, field slices |
+| `src/view3d.rs`  | CPU-projected 3D view: textured ground tiles, wind raster, level planes, particles, tracks at altitude |
+| `tools/era5_wind_cube.py` | export an ERA5 wind cube (CSV.gz) from `download_era5.py` folders for the 3D view |
 | `src/app.rs`     | egui UI: map plugin, timeline, charts, export                                       |
 | `src/video.rs`   | video export: frame capture/cropping, MP4 (ffmpeg) and GIF encoders                 |
 | `src/demo.rs`    | simulated demo files in raw export formats                                          |

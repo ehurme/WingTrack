@@ -14,7 +14,9 @@ This file is written for AI coding agents. Assume the reader knows nothing about
 - **CSV parsing:** `csv` + custom tolerant header normalisation in `src/table.rs`.
 - **Date/time:** `chrono`.
 - **Video export:** `gif` crate for animated GIF; MP4 is produced by piping raw RGBA frames to `ffmpeg` (desktop only).
-- **Weather data:** Open-Meteo Historical Weather API (ERA5 / best-match).
+- **Weather data:** Open-Meteo Historical Weather API (ERA5 / best-match) for 10 m / 100 m wind and surface weather;
+  Open-Meteo Historical Forecast API (GFS / ICON / IFS pressure levels 1000–700 hPa) or a user-exported ERA5
+  "wind cube" (CSV/CSV.gz, any pressure levels) for 3D winds. `flate2` reads gzipped cubes.
 - **Tile sources:** Esri World Imagery / Topo, OpenStreetMap, CARTO dark; NASA GIBS for daily MODIS/VIIRS imagery.
 
 ## Repository layout
@@ -44,8 +46,11 @@ This file is written for AI coding agents. Assume the reader knows nothing about
 │   ├── geo.rs              # Great-circle maths, solar elevation, barometric altitude, wind vectors
 │   ├── tiles.rs            # Basemap and NASA GIBS tile sources
 │   ├── video.rs            # Frame capture/cropping, MP4 (ffmpeg) and GIF encoding
+│   ├── wind3d.rs           # Pressure-level profiles: Open-Meteo + ERA5-cube sources, flight-level annotation, curtains
+│   ├── view3d.rs           # CPU-projected 3D view: ground tiles, wind raster, level planes, particles, tracks at altitude
 │   ├── export.rs           # Annotated CSV export (Movebank-like column names)
 │   └── demo.rs             # Simulated demo datasets in raw export formats
+└── tools/era5_wind_cube.py # Python: export an ERA5 pressure-level wind cube from download_era5.py folders
 ```
 
 ## Build, run, and test commands
@@ -105,8 +110,11 @@ MP4 export needs `ffmpeg` on PATH. GIF export works everywhere. On Windows the a
 3. Each parser produces `model::Track`s: one track per animal/tag, containing `Fix`es (locations) and `SensorSample`s (non-location sensor streams).
 4. `Track::finalize()` sorts and deduplicates fixes/sensors and computes step distances, bearings, ground speeds and `step_significant`.
 5. `weather.rs` plans Open-Meteo requests, caches responses in `WeatherStore`, and annotates every fix with wind, weather, along-step wind support and ERA5-corrected barometric altitude.
-6. `app.rs` renders the map, timeline, charts and export UI; it drives asynchronous HTTP weather fetches and video recording.
-7. `export.rs` writes a single CSV with all derived columns.
+6. `wind3d.rs` keeps pressure-level profiles in a `ProfileStore` (cell → hour → per-level u, v, geopotential height,
+   temperature, plus surface pressure) and annotates fixes with `FlightWind` (flight-level and best-level wind,
+   named as in `SigfoxTagPrep::annotate_era5()`). `view3d.rs` draws the *3D winds* tab from a `FieldSlice`.
+7. `app.rs` renders the map, timeline, charts and export UI; it drives asynchronous HTTP weather fetches and video recording.
+8. `export.rs` writes a single CSV with all derived columns (including the flight-level ones).
 
 ### Key abstractions
 
@@ -114,6 +122,11 @@ MP4 export needs `ffmpeg` on PATH. GIF export works everywhere. On Windows the a
 - `model::Fix`: one location fix. Carries source (`Gps`, `SigfoxAtlas`, `Station`, `Other`), error radius, altitude source, pressure, reported speed/heading, activity, step metrics and a `WeatherAnno`.
 - `model::SensorSample`: non-location measurement (VeDBA, temperature, pressure, activity) with a timestamp so it can be plotted.
 - `weather::WeatherStore`: cell → hour → values cache. Bins points into 0.25° ERA5 grid cells; requests are grouped by calendar month, up to 25 cells per call.
+- `wind3d::ProfileStore`: pressure-level cache shared by both 3D-wind sources. `sample()` tries the exact 0.25° cell,
+  then bilinear interpolation between regional-field nodes spaced `node_step` cells apart. Levels below the ground
+  (level pressure > surface pressure) are masked.
+- `view3d::View3D`: camera, particles and display options; `show()` takes a `Scene` borrowed from the app each frame.
+  Everything is projected on the CPU and painted with egui meshes/lines, so it needs no GPU code and runs on WASM.
 - `table::Table`: tolerant column lookup by aliases (`t.col(&[...])`) and prefix (`t.col_prefix(...)`).
 
 ## Development conventions
@@ -136,6 +149,10 @@ MP4 export needs `ffmpeg` on PATH. GIF export works everywhere. On Windows the a
 - `src/export.rs` tests a round-trip through the generic parser.
 - `src/video.rs` tests frame cropping/downscaling, GIF round-trip and (if `ffmpeg` is available) MP4 encoding.
 - `src/tiles.rs` tests tile URL generation.
+- `src/wind3d.rs` tests Open-Meteo request URLs/planning, JSON ingestion, ln-p and height interpolation, underground
+  masking, flight-level annotation, curtains, field slices and CSV/gzip cube import. An ignored test reads a real cube:
+  `WINGTRACK_CUBE=cube.csv.gz cargo test --lib -- --ignored cube_file --nocapture`.
+- `src/view3d.rs` tests the camera projection and tile maths.
 - There are no integration tests or UI tests; the desktop and web apps are exercised manually.
 
 ## CI and deployment
@@ -170,40 +187,26 @@ Enable GitHub Pages via *Settings → Pages → Source: GitHub Actions*.
 4. Add a unit test in `src/firmware/tests.rs` with a minimal representative CSV.
 5. Update this `AGENTS.md` and `README.md` if the feature is user-facing.
 
-## Current state (working tree)
+## Current state
 
-As of the latest exploration, the working tree contains significant uncommitted work-in-progress changes (not yet committed to `main`):
-
-- Video export support is being added in `src/video.rs` and wired into `src/app.rs`.
-- `Cargo.toml`/`Cargo.lock` add the `gif` crate.
-- `src/weather.rs` adds a wind-field grid (`field_cells`, `field_points`) so ERA5 wind arrows extend beyond the track fixes.
-- `README.md` has been expanded with user documentation.
-
-These changes do **not currently compile**. The failures observed are:
-
-```text
-error[E0599]: no method named `wind_palette` found for mutable reference `&mut WingApp`
-    --> src/app.rs:1234, 1251, 1528
-
-error[E0283]: type annotations needed for `Track::new("a", "NanoFox".into(), "")`
-    --> src/weather.rs:721
-```
-
-The `wind_palette()` method is referenced in `src/app.rs` but is not defined, and `src/weather.rs` tests use `.into()` where the compiler cannot infer the target type. Run `cargo test --lib` and `cargo clippy --all-targets -- -D warnings` after fixing these before declaring the branch ready.
-
-The last known-good commit on `main` is `7c708d1 functional on nanofox`.
+`main` builds and passes `cargo test --lib` and `cargo clippy --all-targets -- -D warnings`. The 3D-winds feature
+(`wind3d.rs`, `view3d.rs`, curtain/profile charts, `tools/era5_wind_cube.py`) was added on top of the
+"wind tracks and video" commit.
 
 ## Useful environment variables
 
 | Variable | Effect |
 | --- | --- |
 | `WINGTRACK_DEMO=1` | Load simulated demo files on startup |
-| `WINGTRACK_SYNTHETIC_WIND=1` | Fill the weather store with a rotating synthetic wind field for offline UI testing |
+| `WINGTRACK_SYNTHETIC_WIND=1` | Fill the weather store with a rotating synthetic wind field, and the pressure-level store with a sheared synthetic profile field, for offline UI testing (not real data) |
+| `WINGTRACK_3D=1` / `=profile` | With the synthetic wind: open the *3D winds* tab with the curtain (or profile) chart |
+| `WINGTRACK_CUBE=path` | Path for the ignored real-cube import test |
 
 ## External resources
 
 - Repository: https://github.com/ehurme/wingtrack
 - Open-Meteo Historical Weather API: https://open-meteo.com/en/docs/historical-weather-api
+- Open-Meteo Historical Forecast API (pressure levels): https://open-meteo.com/en/docs/historical-forecast-api
 - NASA GIBS: https://earthdata.nasa.gov/gibs
 - egui: https://github.com/emilk/egui
 - walkers: https://github.com/podusowski/walkers
