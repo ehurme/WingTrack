@@ -1217,9 +1217,19 @@ impl WingApp {
 
     /// Download a CSV from a URL into the app.
     fn fetch_url(&self, url: String, force: Option<String>, from_share: bool) {
+        // Dropbox / GitHub page links → direct downloads (also fixes older shared links).
+        let url = share::direct_download_url(&url);
         let tx = self.tx.clone();
         ehttp::fetch(ehttp::Request::get(&url), move |res| {
             let msg = match res {
+                Ok(r) if r.ok && share::looks_like_html(&r.bytes) => Msg::FetchFailed {
+                    url,
+                    err: "got a web page instead of a CSV - use a direct download link \
+                          (Dropbox and GitHub page links are converted automatically; \
+                          Google Drive and OneDrive share links can't be read by browsers)"
+                        .into(),
+                    from_share,
+                },
                 Ok(r) if r.ok => Msg::RemoteFile {
                     url,
                     bytes: r.bytes,
@@ -1357,12 +1367,12 @@ impl WingApp {
             .collapsible(false)
             .default_width(420.0)
             .show(ctx, |ui| {
-                ui.label("Direct link to a CSV file, e.g. https://raw.githubusercontent.com/<user>/<repo>/main/bats.csv");
+                ui.label("Link to a CSV file: a Dropbox share link (\"Copy link\"), a GitHub file, or any direct download address.");
                 let r = ui.add(egui::TextEdit::singleline(&mut self.url_input).desired_width(f32::INFINITY));
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     go = true;
                 }
-                ui.weak("The server must allow downloads from other sites (CORS); GitHub raw links and most data portals do.");
+                ui.weak("Dropbox and GitHub links work as copied. Other servers must allow downloads from other sites (CORS); Google Drive and OneDrive share links don't.");
                 if ui.button("Load").clicked() {
                     go = true;
                 }

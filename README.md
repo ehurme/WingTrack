@@ -87,8 +87,8 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
 - **Shareable links** — **Share** makes a link that opens exactly the current view for anyone: data, time, 2D map
   position/zoom or 3D camera, tab, basemap and satellite layer, track visibility/colours/selection, chart, and all
   wind and 3D settings. On the web the address bar updates as you go (like a map app), so a reload or a bookmark keeps
-  the view. Data travels as `demo=1`, as `data=<url>` for files opened with **File → Open URL…** (e.g. GitHub raw
-  links), or embedded gzip-compressed in the link for local files (optional; long links for big files). Weather is
+  the view. Data travels as `demo=1`, as `data=<url>` for files opened with **File → Open URL…** (Dropbox share links and GitHub
+  file links are converted to direct downloads automatically), or embedded gzip-compressed in the link for local files (optional; long links for big files). Weather is
   downloaded again on the recipient's side. Everything sits after `#`, so it is never sent to the web server.
   The desktop app makes links to the web app and also opens them: `wingtrack "https://…/WingTrack/#v=1&…"`.
 - **Export** — one CSV with every derived column (`wind_support_ms`, `segment_wind_support_ms`, `altitude_era5_msl_corrected_m`, …)
