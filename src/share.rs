@@ -221,6 +221,60 @@ pub fn file_name_from_url(url: &str) -> String {
     pct_decode(last)
 }
 
+/// Turn "share" links from common hosts into direct-download addresses a browser can fetch:
+/// * Dropbox `www.dropbox.com/scl/fi/…?rlkey=…&dl=0` (and older `/s/…` links) →
+///   `dl.dropboxusercontent.com/…?rlkey=…` (the www host returns a preview page and no CORS header);
+/// * GitHub `github.com/<user>/<repo>/blob/<branch>/<path>` → `raw.githubusercontent.com/…`.
+///
+/// Other URLs are returned unchanged.
+pub fn direct_download_url(url: &str) -> String {
+    let url = url.trim();
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let (host_path, query) = match rest.split_once('?') {
+        Some((h, q)) => (h, Some(q)),
+        None => (rest, None),
+    };
+    let (host, path) = host_path.split_once('/').unwrap_or((host_path, ""));
+    let host_l = host.to_ascii_lowercase();
+    if host_l == "www.dropbox.com" || host_l == "dropbox.com" {
+        // keep rlkey (required for /scl/ links) and anything else except the viewer switches
+        let q: Vec<&str> = query
+            .unwrap_or("")
+            .split('&')
+            .filter(|kv| {
+                let k = kv.split('=').next().unwrap_or("");
+                !kv.is_empty() && !matches!(k, "dl" | "raw" | "st" | "e")
+            })
+            .collect();
+        let q = if q.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", q.join("&"))
+        };
+        let _ = scheme;
+        return format!("https://dl.dropboxusercontent.com/{path}{q}");
+    }
+    if host_l == "github.com" {
+        let parts: Vec<&str> = path.splitn(4, '/').collect();
+        if parts.len() == 4 && parts[2] == "blob" {
+            return format!(
+                "https://raw.githubusercontent.com/{}/{}/{}",
+                parts[0], parts[1], parts[3]
+            );
+        }
+    }
+    url.to_string()
+}
+
+/// True if downloaded bytes look like an HTML page rather than a data file.
+pub fn looks_like_html(bytes: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]).to_ascii_lowercase();
+    let t = head.trim_start_matches('\u{feff}').trim_start();
+    t.starts_with("<!doctype html") || t.starts_with("<html") || t.starts_with("<head")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +321,34 @@ mod tests {
             file_name_from_url("https://x.org/d/My%20bats.csv?raw=1"),
             "My bats.csv"
         );
+    }
+
+    #[test]
+    fn direct_links() {
+        assert_eq!(
+            direct_download_url(
+                "https://www.dropbox.com/scl/fi/j43tlirah9kj0o5cfzcx1/9_10_2026_records_Belgium.csv?rlkey=4ut76cx9buflw2vj50axrm1oe&st=mbgovkkc&dl=0"
+            ),
+            "https://dl.dropboxusercontent.com/scl/fi/j43tlirah9kj0o5cfzcx1/9_10_2026_records_Belgium.csv?rlkey=4ut76cx9buflw2vj50axrm1oe"
+        );
+        assert_eq!(
+            direct_download_url("https://www.dropbox.com/s/abc123/bats.csv?dl=0"),
+            "https://dl.dropboxusercontent.com/s/abc123/bats.csv"
+        );
+        assert_eq!(
+            direct_download_url("https://github.com/ehurme/WingTrack/blob/main/data/x.csv"),
+            "https://raw.githubusercontent.com/ehurme/WingTrack/main/data/x.csv"
+        );
+        let raw = "https://raw.githubusercontent.com/a/b/main/c.csv";
+        assert_eq!(direct_download_url(raw), raw);
+        assert_eq!(
+            file_name_from_url(&direct_download_url(
+                "https://www.dropbox.com/scl/fi/x/9_10_2026_records_Belgium.csv?rlkey=k&dl=0"
+            )),
+            "9_10_2026_records_Belgium.csv"
+        );
+        assert!(looks_like_html(b"\n<!DOCTYPE html><html>"));
+        assert!(!looks_like_html(b"Device;Time (UTC);Position"));
     }
 
     #[test]
