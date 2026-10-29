@@ -215,3 +215,55 @@ Min Temperature of last 3 hrs (°C);Max Temperature of last 3 hrs (°C)\n\
     let g = out.tracks.iter().find(|t| t.id == "9ECED1").unwrap();
     assert_eq!(g.fixes.len(), 1);
 }
+
+#[test]
+fn ctt_detections_export() {
+    // Layout of a CTT detections export (crowd-sourced phones and a receiver).
+    let csv = "source,receiver_id,tag_id,time_utc,lat,lon,conf,rssi,payload\n\
+crowd_sourced,,45B7D4D6,2026-09-18T13:45:36.000Z,47.691696,9.187442,74,,\n\
+crowd_sourced,,45B7D4D6,2026-09-18T14:13:53.000Z,47.689634,9.186385,74,,\n\
+crowd_sourced,,45B7D4D6,2026-09-18T14:13:53.000Z,47.689636,9.186389,60,,\n\
+crowd_sourced,,45B7D4D6,2026-09-19T21:49:47.000Z,50.224306,8.885031,59,,\n\
+node,V30B01,573B8D0E,2026-09-28T20:46:13.000Z,47.086377,10.690864,56,-92,ab01\n\
+node,V30B01,573B8D0E,2026-09-28T21:26:25.000Z,,,62,-95,\n";
+    let t = tbl("2026-3508_detections_export290626.csv", csv);
+    assert_eq!(rank(&t)[0].0, "ctt-detections");
+    let (out, id) = parse(&t, None).unwrap();
+    assert_eq!(id, "ctt-detections");
+    assert_eq!(out.tracks.len(), 2);
+    let a = &out.tracks[0];
+    assert_eq!(a.id, "45B7D4D6");
+    assert_eq!(a.tag, "CTT detections");
+    assert_eq!(a.fixes.len(), 3, "same-second detections merged");
+    let m = &a.fixes[1];
+    assert_eq!(m.source, LocationSource::Station);
+    assert!((m.lat - 47.689635).abs() < 1e-9 && (m.lon - 9.186387).abs() < 1e-9);
+    assert!(
+        m.extra
+            .iter()
+            .any(|(k, v)| k == "detections_merged" && v == "2")
+    );
+    assert!(m.extra.iter().any(|(k, v)| k == "conf" && v == "74"));
+    assert!(
+        m.extra
+            .iter()
+            .any(|(k, v)| k == "detection_source" && v == "crowd_sourced")
+    );
+    // Overnight flight Konstanz -> Frankfurt area: a real step with a heading.
+    assert!(a.fixes[2].step_m.unwrap() > 250_000.0);
+    let b = &out.tracks[1];
+    assert_eq!(b.fixes.len(), 1, "detection without position skipped");
+    assert!(
+        b.fixes[0]
+            .extra
+            .iter()
+            .any(|(k, v)| k == "receiver_id" && v == "V30B01")
+    );
+    assert!(
+        b.fixes[0]
+            .extra
+            .iter()
+            .any(|(k, v)| k == "rssi_max" && v == "-92")
+    );
+    assert_eq!(out.warnings.len(), 2);
+}

@@ -18,7 +18,7 @@ use crate::model::{AltitudeSource, Fix, ParseOutput, SensorKind, SensorSample, T
 use crate::table::Table;
 use std::collections::BTreeMap;
 
-pub use ctt::CttGps;
+pub use ctt::{CttDetections, CttGps};
 pub use generic::Generic;
 pub use movebank::{MovebankGps, MovebankSigfox};
 pub use wildcloud::{Wildcloud, WildcloudVariant};
@@ -44,6 +44,7 @@ pub fn registry() -> Vec<Box<dyn Firmware>> {
         Box::new(Wildcloud::new(WildcloudVariant::NanoFoxFineScalePressure)),
         Box::new(MovebankSigfox),
         Box::new(CttGps),
+        Box::new(CttDetections),
         Box::new(MovebankGps),
         Box::new(Generic),
     ]

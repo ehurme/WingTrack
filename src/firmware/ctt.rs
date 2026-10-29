@@ -174,3 +174,172 @@ impl Firmware for CttGps {
         Ok(out)
     }
 }
+
+/// CTT detection exports (`*_detections_export*.csv`): one row per time a tag was heard,
+/// located at the receiver — a CTT node / SensorStation (`receiver_id`) or a crowd-sourced
+/// phone (`source = crowd_sourced`). Columns: `source, receiver_id, tag_id, time_utc, lat, lon,
+/// conf, rssi, payload`.
+///
+/// The positions are where the *receiver* was, so fixes are marked as station locations.
+/// Detections of the same tag in the same second (heard by several receivers) are merged into
+/// one fix at their mean position. `conf`, `rssi`, `source`, `receiver_id` and `payload` are kept
+/// as extra columns; `conf` is not interpreted as a location error.
+pub struct CttDetections;
+
+impl Firmware for CttDetections {
+    fn id(&self) -> &'static str {
+        "ctt-detections"
+    }
+    fn label(&self) -> &'static str {
+        "CTT · detections (receivers / crowd-sourced)"
+    }
+    fn description(&self) -> &'static str {
+        "CTT detection export: tag_id, time_utc, receiver/phone lat & lon, conf, rssi, source, receiver_id"
+    }
+    fn detect(&self, t: &Table) -> f32 {
+        let core = t.has(&["tag_id"])
+            && t.has(&["time_utc", "time"])
+            && t.has(&["lat", "latitude"])
+            && t.has(&["lon", "lng", "longitude"]);
+        if !core {
+            return 0.0;
+        }
+        let markers = [
+            &["conf"][..],
+            &["rssi"],
+            &["receiver_id"],
+            &["payload"],
+            &["source"],
+        ]
+        .iter()
+        .filter(|m| t.has(m))
+        .count();
+        match markers {
+            0 => 0.0,
+            1 => 0.5,
+            2 => 0.8,
+            _ => 0.94,
+        }
+    }
+
+    fn parse(&self, t: &Table) -> Result<ParseOutput, String> {
+        let c_tag = t.col(&["tag_id"]);
+        let c_time = t
+            .col(&["time_utc", "time"])
+            .ok_or("missing time_utc column")?;
+        let c_lat = t.col(&["lat", "latitude"]);
+        let c_lon = t.col(&["lon", "lng", "longitude"]);
+        let c_src = t.col(&["source"]);
+        let c_rec = t.col(&["receiver_id"]);
+        let c_conf = t.col(&["conf"]);
+        let c_rssi = t.col(&["rssi"]);
+        let c_payload = t.col(&["payload"]);
+
+        struct Det {
+            lat: f64,
+            lon: f64,
+            conf: Option<f64>,
+            rssi: Option<f64>,
+            source: String,
+            receiver: String,
+            payload: String,
+        }
+        // (tag, time) -> detections, in first-seen tag order
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: std::collections::BTreeMap<(String, i64), Vec<Det>> = Default::default();
+        let (mut no_pos, mut bad_time) = (0usize, 0usize);
+        let fallback = file_stem(&t.name);
+        for row in &t.rows {
+            let Some(ts) = parse_time(t.get(row, Some(c_time))) else {
+                bad_time += 1;
+                continue;
+            };
+            let (Some(la), Some(lo)) = (t.num(row, c_lat), t.num(row, c_lon)) else {
+                no_pos += 1;
+                continue;
+            };
+            if (la == 0.0 && lo == 0.0) || la.abs() > 90.0 || lo.abs() > 180.0 {
+                no_pos += 1;
+                continue;
+            }
+            let tag = {
+                let s = t.get(row, c_tag).trim();
+                if s.is_empty() {
+                    fallback.clone()
+                } else {
+                    s.to_string()
+                }
+            };
+            if !order.contains(&tag) {
+                order.push(tag.clone());
+            }
+            groups.entry((tag, ts)).or_default().push(Det {
+                lat: la,
+                lon: lo,
+                conf: t.num(row, c_conf),
+                rssi: t.num(row, c_rssi),
+                source: t.get(row, c_src).trim().to_string(),
+                receiver: t.get(row, c_rec).trim().to_string(),
+                payload: t.get(row, c_payload).trim().to_string(),
+            });
+        }
+
+        let mut b = TrackBuilder::new("CTT detections");
+        for id in &order {
+            b.track(id);
+        }
+        let mut merged = 0usize;
+        for ((tag, ts), dets) in groups {
+            let n = dets.len();
+            merged += n - 1;
+            let lat = dets.iter().map(|d| d.lat).sum::<f64>() / n as f64;
+            let lon = dets.iter().map(|d| d.lon).sum::<f64>() / n as f64;
+            let mut f = Fix::new(ts, lat, lon, LocationSource::Station);
+            let join = |v: Vec<String>| {
+                let mut v: Vec<String> = v.into_iter().filter(|s| !s.is_empty()).collect();
+                v.sort();
+                v.dedup();
+                v.join(" ")
+            };
+            let src = join(dets.iter().map(|d| d.source.clone()).collect());
+            let rec = join(dets.iter().map(|d| d.receiver.clone()).collect());
+            let payload = join(dets.iter().map(|d| d.payload.clone()).collect());
+            if !src.is_empty() {
+                f.extra.push(("detection_source".into(), src));
+            }
+            if !rec.is_empty() {
+                f.extra.push(("receiver_id".into(), rec));
+            }
+            if let Some(c) = dets.iter().filter_map(|d| d.conf).reduce(f64::max) {
+                f.extra.push(("conf".into(), format!("{c}")));
+            }
+            if let Some(r) = dets.iter().filter_map(|d| d.rssi).reduce(f64::max) {
+                f.extra.push(("rssi_max".into(), format!("{r}")));
+            }
+            if !payload.is_empty() {
+                f.extra.push(("payload".into(), payload));
+            }
+            if n > 1 {
+                f.extra.push(("detections_merged".into(), n.to_string()));
+            }
+            b.track(&tag).fixes.push(f);
+        }
+        let mut out = ParseOutput {
+            tracks: b.finish(),
+            ..Default::default()
+        };
+        if merged > 0 {
+            out.warnings.push(format!(
+                "{}: merged {merged} same-second detections (heard by several receivers) into their mean position",
+                t.name
+            ));
+        }
+        if no_pos + bad_time > 0 {
+            out.warnings.push(format!(
+                "{}: skipped {no_pos} detections without a receiver position, {bad_time} with bad time",
+                t.name
+            ));
+        }
+        Ok(out)
+    }
+}
