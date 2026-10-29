@@ -104,6 +104,7 @@ impl Firmware for MovebankSigfox {
         let c_vedba = t.col(&["vedba", "acceleration_vedba"]);
         let c_tf_total = t.col(&["tinyfox_total_vedba"]);
         let c_tf_act = t.col(&["tinyfox_activity_percent_last_24h"]);
+        let c_fell = t.col(&["tag_fell_off"]);
         let c_tf_pmin = t.col(&["tinyfox_pressure_min_last_24h"]);
         let c_tf_tmin = t.col(&["tinyfox_temperature_min_last_24h"]);
         let c_tf_tmax = t.col(&["tinyfox_temperature_max_last_24h"]);
@@ -193,6 +194,11 @@ impl Firmware for MovebankSigfox {
                     }
                     if let Some(s) = t.num(row, c_seq) {
                         f.extra.push(("sequence_number".into(), format!("{s}")));
+                    }
+                    // SigfoxTagPrep's detect_tag_fell_off() result, if exported
+                    let fell = t.get(row, c_fell).trim();
+                    if fell.eq_ignore_ascii_case("true") || fell.eq_ignore_ascii_case("false") {
+                        f.extra.push(("tag_fell_off".into(), fell.to_uppercase()));
                     }
                     if let Some(q) = t.num(row, c_lqi) {
                         f.extra.push(("lqi".into(), format!("{q}")));

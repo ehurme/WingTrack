@@ -9,11 +9,14 @@
 //! * [`app`] — the egui application (native and web)
 
 pub mod app;
+pub mod cds;
 pub mod demo;
 pub mod export;
+pub mod falloff;
 pub mod firmware;
 pub mod geo;
 pub mod model;
+pub mod prefs;
 pub mod share;
 pub mod table;
 pub mod terrain;

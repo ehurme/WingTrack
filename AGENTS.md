@@ -36,6 +36,9 @@ This file is written for AI coding agents. Assume the reader knows nothing about
 │   ├── model.rs            # Core data model: Track, Fix, SensorSample, WeatherAnno
 │   ├── table.rs            # Tolerant CSV reader (delimiter sniffing, header normalisation, timestamp parsing)
 │   ├── terrain.rs          # AWS Terrarium elevation tiles for the 3D view: fetch, decode, bilinear sampling
+│   ├── cds.rs              # Copernicus CDS ERA5 time-series client (user's API key)
+│   ├── falloff.rs          # Fallen-tag detection (port of SigfoxTagPrep detect_tag_fell_off)
+│   ├── prefs.rs            # Per-device settings kept out of share links (API keys)
 │   ├── firmware/           # One module per data source
 │   │   ├── mod.rs          # Firmware trait, registry, shared helpers
 │   │   ├── wildcloud.rs    # TinyFox / NanoFox 30Days / NanoFox FineScalePressure
@@ -137,6 +140,12 @@ MP4 export needs `ffmpeg` on PATH. GIF export works everywhere. On Windows the a
   the dashboard state as `key=value` pairs in the URL fragment. **When adding a user-visible setting, add it to
   `share_map` and the matching apply function** (enums are encoded by their `Debug` name; unknown/missing keys are
   ignored, so links stay backward compatible). `app::share_tests` round-trips a full state.
+  Exception: API keys and the ERA5 source (`cds_key`, `om_key`, `era5_source`) are per-user secrets kept in
+  `prefs.rs` (localStorage on the web, a config file on desktop) and must never go into share links.
+- ERA5 via Copernicus CDS (`cds.rs`): one async job per 0.25° cell (`cds::plan`), driven by `WingApp::pump_cds` /
+  `on_cds_response` (submit → poll → results → download ZIP/CSV → `WeatherStore`). Open-Meteo requests have a
+  watchdog (`OM_TIMEOUT_S`); HTTP 429 reasons "daily"/"hourly" stop or pause the queue (`om_blocked_until`, `pause_until`).
+- `falloff.rs`: port of SigfoxTagPrep `detect_tag_fell_off()`; `WingApp::remove_fallen_tags` applies the cut as a date filter.
 - `table::Table`: tolerant column lookup by aliases (`t.col(&[...])`) and prefix (`t.col_prefix(...)`).
 
 ## Development conventions

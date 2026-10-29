@@ -45,6 +45,11 @@ enum Msg {
         err: String,
         from_share: bool,
     },
+    /// A step of a Copernicus CDS job: HTTP status and body, or a network error.
+    Cds {
+        run: u64,
+        result: Result<(u16, Vec<u8>), String>,
+    },
     /// An ERA5 wind-cube file picked by the user.
     Cube {
         name: String,
@@ -73,6 +78,63 @@ impl Job {
             Job::Profile(r) => &r.url,
         }
     }
+}
+
+/// Where point annotation gets ERA5 surface data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Era5Source {
+    /// Open-Meteo archive API: free, no key, limits per IP address (shared by everyone on
+    /// the same network).
+    OpenMeteo,
+    /// Copernicus Climate Data Store with the user's own key and quota.
+    Cds,
+}
+
+impl Era5Source {
+    fn label(self) -> &'static str {
+        match self {
+            Era5Source::OpenMeteo => "Open-Meteo (free, no key)",
+            Era5Source::Cds => "Copernicus CDS (your API key)",
+        }
+    }
+}
+
+/// Stage of one CDS cell job.
+#[derive(Clone, Debug)]
+enum CdsStage {
+    Submit,
+    Poll(String),
+    Results(String),
+    Download(String),
+}
+
+#[derive(Clone, Debug)]
+struct CdsRun {
+    id: u64,
+    job: crate::cds::CellJob,
+    stage: CdsStage,
+    /// A request for this run is in flight.
+    busy: bool,
+    /// Don't poll again before this time (app clock, s).
+    next_at: f64,
+    polls: u32,
+}
+
+/// Parallel CDS jobs (the CDS also queues per user, so more doesn't help).
+const CDS_PARALLEL: usize = 4;
+/// Give up on a hanging Open-Meteo request after this many seconds.
+const OM_TIMEOUT_S: f64 = 150.0;
+
+/// Point an Open-Meteo URL at the customer servers when the user has an API key.
+fn om_url(url: &str, key: &str) -> String {
+    let key = key.trim();
+    if key.is_empty() {
+        return url.to_string();
+    }
+    format!(
+        "{}&apikey={key}",
+        url.replacen("https://", "https://customer-", 1)
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -356,6 +418,7 @@ pub struct WingApp {
     selected_track: Option<usize>,
     /// Track whose date-range editor is open, with the From / To text.
     date_edit: Option<usize>,
+    falloff: crate::falloff::Params,
     date_from: String,
     date_to: String,
     chart_var: ChartVar,
@@ -367,6 +430,21 @@ pub struct WingApp {
     in_flight: HashMap<usize, Job>,
     next_req_id: usize,
     req_total: usize,
+    era5_source: Era5Source,
+    /// Copernicus CDS personal access token (kept in prefs, never in share links).
+    cds_key: String,
+    /// Optional Open-Meteo API key (customer servers, higher limits).
+    om_key: String,
+    show_keys: bool,
+    cds_pending: VecDeque<crate::cds::CellJob>,
+    cds_running: Vec<CdsRun>,
+    cds_next_id: u64,
+    /// Send time of each in-flight Open-Meteo request (for the timeout watchdog).
+    in_flight_t: HashMap<usize, f64>,
+    /// Why queued downloads are waiting, shown under the progress bar.
+    wait_note: Option<String>,
+    /// Open-Meteo refused with its daily limit: no more requests before this time.
+    om_blocked_until: f64,
     req_done: usize,
     req_failed: usize,
     since_annotate: usize,
@@ -496,6 +574,7 @@ impl WingApp {
             selected: None,
             selected_track: None,
             date_edit: None,
+            falloff: crate::falloff::Params::default(),
             date_from: String::new(),
             date_to: String::new(),
             chart_var: ChartVar::Altitude,
@@ -508,6 +587,19 @@ impl WingApp {
             req_done: 0,
             req_failed: 0,
             since_annotate: 0,
+            era5_source: match crate::prefs::load("era5_source").as_deref() {
+                Some("cds") => Era5Source::Cds,
+                _ => Era5Source::OpenMeteo,
+            },
+            cds_key: crate::prefs::load("cds_key").unwrap_or_default(),
+            om_key: crate::prefs::load("open_meteo_key").unwrap_or_default(),
+            show_keys: false,
+            cds_pending: VecDeque::new(),
+            cds_running: Vec::new(),
+            cds_next_id: 0,
+            in_flight_t: HashMap::new(),
+            wait_note: None,
+            om_blocked_until: 0.0,
             share_dialog: false,
             share_embed: true,
             url_dialog: false,
@@ -1427,6 +1519,55 @@ impl WingApp {
         self.url_dialog = open;
     }
 
+    /// Cut the after-fall-off tail of every visible track (via its date filter, so it can be
+    /// undone and travels in share links).
+    fn remove_fallen_tags(&mut self) {
+        let mut cut = Vec::new();
+        let mut kept = 0;
+        for i in 0..self.tracks.len() {
+            if !self.tracks[i].visible {
+                continue;
+            }
+            let tr = &self.tracks[i];
+            match crate::falloff::detect(tr, &self.falloff) {
+                Some(f) => {
+                    let n = tr.fixes.iter().filter(|x| x.t >= f.cut_t).count();
+                    let start = tr
+                        .date_filter
+                        .map(|r| r.0)
+                        .or(tr.full_time_range().map(|r| r.0))
+                        .unwrap_or(f.cut_t);
+                    if n == 0 || f.cut_t <= start {
+                        kept += 1;
+                        continue;
+                    }
+                    self.tracks[i].set_date_filter(Some((start, f.cut_t - 1)));
+                    cut.push(format!(
+                        "{} ({} fixes from {}, {})",
+                        self.tracks[i].id,
+                        n,
+                        fmt_time(f.cut_t),
+                        f.signal
+                    ));
+                }
+                None => kept += 1,
+            }
+        }
+        // refresh time range, selection and caches
+        self.set_date_filter(&[], None);
+        if cut.is_empty() {
+            self.status(format!(
+                "No fallen tags found among {kept} visible track(s)"
+            ));
+        } else {
+            self.status(format!(
+                "Removed fallen-tag tails from {} track(s): {}. {kept} track(s) unchanged.",
+                cut.len(),
+                cut.join("; ")
+            ));
+        }
+    }
+
     /// Restrict tracks `idxs` to `range` (or restore all data), keeping the time cursor.
     fn set_date_filter(&mut self, idxs: &[usize], range: Option<(i64, i64)>) {
         for &i in idxs {
@@ -1831,6 +1972,30 @@ impl WingApp {
         // The wind field around the animals is fetched lazily for the days in view.
         self.surface_field_on = true;
         self.surface_field_days.clear();
+        if self.era5_source == Era5Source::Cds {
+            if self.cds_key.trim().is_empty() {
+                self.status(
+                    "! Copernicus CDS selected but no API key entered (ERA5 panel → data source)"
+                        .to_string(),
+                );
+                return;
+            }
+            let jobs = crate::cds::plan(&pts, &self.store.days, weather::latest_available_day());
+            if jobs.is_empty() {
+                let n = weather::annotate(&mut self.tracks, &self.store, &self.opts);
+                self.status(format!("ERA5: everything cached - annotated {n} fixes"));
+                return;
+            }
+            self.status(format!(
+                "ERA5 via Copernicus CDS: {} grid-cell job(s) for {} sample points (each takes ~10–60 s at CDS; {CDS_PARALLEL} at a time)",
+                jobs.len(),
+                pts.len()
+            ));
+            self.reset_counters_if_idle();
+            self.req_total += jobs.len();
+            self.cds_pending.extend(jobs);
+            return;
+        }
         self.maybe_request_surface_field();
         let reqs = self
             .store
@@ -1846,20 +2011,43 @@ impl WingApp {
             pts.len(),
             6
         ));
-        self.enqueue(reqs.into_iter().map(Job::Surface).collect());
+        // Annotation first: wind-field windows queued earlier can wait.
+        self.enqueue_front(reqs.into_iter().map(Job::Surface).collect());
+    }
+
+    fn downloads_idle(&self) -> bool {
+        self.queue.is_empty()
+            && self.in_flight.is_empty()
+            && self.cds_pending.is_empty()
+            && self.cds_running.is_empty()
+    }
+
+    fn reset_counters_if_idle(&mut self) {
+        if self.downloads_idle() {
+            self.req_total = 0;
+            self.req_done = 0;
+            self.req_failed = 0;
+        }
     }
 
     fn enqueue(&mut self, jobs: Vec<Job>) {
         if jobs.is_empty() {
             return;
         }
-        if self.queue.is_empty() && self.in_flight.is_empty() {
-            self.req_total = 0;
-            self.req_done = 0;
-            self.req_failed = 0;
-        }
+        self.reset_counters_if_idle();
         self.req_total += jobs.len();
         self.queue.extend(jobs);
+    }
+
+    fn enqueue_front(&mut self, jobs: Vec<Job>) {
+        if jobs.is_empty() {
+            return;
+        }
+        self.reset_counters_if_idle();
+        self.req_total += jobs.len();
+        for j in jobs.into_iter().rev() {
+            self.queue.push_front(j);
+        }
     }
 
     // ------------------------------------------------------------------ 3D wind
@@ -2165,10 +2353,59 @@ impl WingApp {
         while self.sent_log.front().is_some_and(|(t, _)| now - t > 3600.0) {
             self.sent_log.pop_front();
         }
+        // Watchdog: a request that never answers would otherwise block the queue forever.
+        let stale: Vec<usize> = self
+            .in_flight_t
+            .iter()
+            .filter(|(_, t)| now - **t > OM_TIMEOUT_S)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            self.in_flight_t.remove(&id);
+            if let Some(job) = self.in_flight.remove(&id) {
+                let n = self.retries.entry(job.url().to_string()).or_insert(0);
+                *n += 1;
+                if *n <= 2 {
+                    self.status(format!(
+                        "Open-Meteo did not answer within {OM_TIMEOUT_S:.0} s - retrying"
+                    ));
+                    self.queue.push_front(job);
+                } else {
+                    self.req_done += 1;
+                    self.req_failed += 1;
+                    match &job {
+                        Job::Surface(req) => self.store.mark_done(req),
+                        Job::Profile(req) => self.profiles.mark_done(req),
+                    }
+                    self.status("! Open-Meteo request timed out repeatedly - skipped".to_string());
+                    self.on_download_complete();
+                }
+            }
+        }
+        if !self.queue.is_empty() && now < self.om_blocked_until {
+            let n = self.queue.len();
+            self.queue.clear();
+            self.req_done += n;
+            self.req_failed += n;
+            self.wait_note = None;
+            self.on_download_complete();
+            return;
+        }
         if now < self.pause_until {
+            self.wait_note = Some(format!(
+                "Open-Meteo rate limit: resuming in {:.0} s",
+                self.pause_until - now
+            ));
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
             return;
         }
+        self.wait_note = None;
+        // A key raises the limits a lot; keep a (looser) budget anyway.
+        let scale = if self.om_key.trim().is_empty() {
+            1.0
+        } else {
+            10.0
+        };
         while self.in_flight.len() < 3 {
             let Some(w) = self.queue.front().map(|j| j.weight()) else {
                 break;
@@ -2182,7 +2419,15 @@ impl WingApp {
             let hour: f32 = self.sent_log.iter().map(|x| x.1).sum();
             // A single request heavier than the budget may still go when nothing else is pending.
             let empty_min = minute == 0.0;
-            if (minute + w > PER_MIN && !empty_min) || hour + w > PER_HOUR {
+            if (minute + w > PER_MIN * scale && !empty_min) || hour + w > PER_HOUR * scale {
+                self.wait_note = Some(if hour + w > PER_HOUR * scale {
+                    format!(
+                        "waiting for the hourly Open-Meteo budget ({hour:.0} of {:.0} calls used in the last hour; free limit 5 000/h per IP)",
+                        PER_HOUR * scale
+                    )
+                } else {
+                    format!("pacing requests ({minute:.0} calls in the last minute)")
+                });
                 ctx.request_repaint_after(std::time::Duration::from_secs(2));
                 break;
             }
@@ -2194,7 +2439,10 @@ impl WingApp {
             self.next_req_id += 1;
             let tx = self.tx.clone();
             let ctx2 = ctx.clone();
-            ehttp::fetch(ehttp::Request::get(req.url()), move |res| {
+            let mut http = ehttp::Request::get(om_url(req.url(), &self.om_key));
+            http.timeout = Some(std::time::Duration::from_secs_f64(OM_TIMEOUT_S));
+            self.in_flight_t.insert(id, now);
+            ehttp::fetch(http, move |res| {
                 let result = match res {
                     Ok(r) if r.ok => r
                         .text()
@@ -2257,10 +2505,36 @@ impl WingApp {
                     let Some(job) = self.in_flight.remove(&id) else {
                         continue;
                     };
+                    self.in_flight_t.remove(&id);
                     // Rate limited: wait and retry instead of giving up on these cells.
                     if let Err(e) = &result
                         && (e.starts_with("HTTP 429") || e.to_lowercase().contains("too many"))
                     {
+                        let el = e.to_lowercase();
+                        if el.contains("daily") {
+                            // Nothing will succeed before midnight UTC: stop instead of retrying.
+                            let day = 86_400.0;
+                            let wall = chrono::Utc::now().timestamp() as f64;
+                            self.om_blocked_until = self.now + (day - wall.rem_euclid(day)) + 60.0;
+                            self.queue.push_front(job);
+                            self.status(
+                                "! Open-Meteo daily limit (10 000 calls) reached for your IP address - it is shared by everyone on your network. \
+                                 Remaining requests skipped. Try again after midnight UTC, enter an Open-Meteo API key, or switch the ERA5 source to Copernicus CDS."
+                                    .to_string(),
+                            );
+                            continue;
+                        }
+                        if el.contains("hourly") {
+                            let wall = chrono::Utc::now().timestamp() as f64;
+                            let wait = 3600.0 - wall.rem_euclid(3600.0) + 30.0;
+                            self.pause_until = self.now + wait;
+                            self.queue.push_front(job);
+                            self.status(format!(
+                                "Open-Meteo hourly limit reached for your IP - waiting {:.0} min for the next hour",
+                                wait / 60.0
+                            ));
+                            continue;
+                        }
                         let n = self.retries.entry(job.url().to_string()).or_insert(0);
                         *n += 1;
                         if *n <= 4 {
@@ -2288,19 +2562,28 @@ impl WingApp {
                         }
                         self.status(format!("! weather request failed: {e}"));
                     }
-                    self.since_annotate += 1;
-                    let finished = self.queue.is_empty() && self.in_flight.is_empty();
-                    if finished || self.since_annotate >= 4 {
-                        let n = weather::annotate(&mut self.tracks, &self.store, &self.opts);
-                        let n3 = if self.profiles.is_empty() {
-                            0
-                        } else {
-                            wind3d::annotate(&mut self.tracks, &self.profiles)
-                        };
-                        self.since_annotate = 0;
-                        self.curtain_cache = None;
-                        if finished {
-                            self.status(format!(
+                    self.on_download_complete();
+                }
+                Msg::Cds { run, result } => self.on_cds_response(run, result),
+            }
+        }
+    }
+
+    /// After each finished download: annotate every few results and once at the end.
+    fn on_download_complete(&mut self) {
+        self.since_annotate += 1;
+        let finished = self.downloads_idle();
+        if finished || self.since_annotate >= 4 {
+            let n = weather::annotate(&mut self.tracks, &self.store, &self.opts);
+            let n3 = if self.profiles.is_empty() {
+                0
+            } else {
+                wind3d::annotate(&mut self.tracks, &self.profiles)
+            };
+            self.since_annotate = 0;
+            self.curtain_cache = None;
+            if finished {
+                self.status(format!(
                                 "Downloads done: surface {} cells / {} h ({n} fixes), pressure levels {} cells / {} h ({n3} fixes){}",
                                 self.store.cells.len(),
                                 self.store.hours(),
@@ -2312,9 +2595,206 @@ impl WingApp {
                                     String::new()
                                 }
                             ));
-                        }
-                    }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ Copernicus CDS
+
+    /// Data source picker and API keys (keys are stored on this device only).
+    fn era5_source_ui(&mut self, ui: &mut egui::Ui) {
+        let before = self.era5_source;
+        egui::ComboBox::from_label("ERA5 source")
+            .selected_text(self.era5_source.label())
+            .show_ui(ui, |ui| {
+                for s in [Era5Source::OpenMeteo, Era5Source::Cds] {
+                    ui.selectable_value(&mut self.era5_source, s, s.label());
                 }
+            });
+        if before != self.era5_source {
+            crate::prefs::save(
+                "era5_source",
+                if self.era5_source == Era5Source::Cds {
+                    "cds"
+                } else {
+                    ""
+                },
+            );
+        }
+        let show = self.show_keys;
+        let key_field = |ui: &mut egui::Ui, v: &mut String, hint: &str| {
+            ui.add(
+                egui::TextEdit::singleline(v)
+                    .password(!show)
+                    .hint_text(hint)
+                    .desired_width(210.0),
+            )
+            .changed()
+        };
+        match self.era5_source {
+            Era5Source::Cds => {
+                ui.horizontal(|ui| {
+                    ui.label("CDS API key");
+                    if key_field(ui, &mut self.cds_key, "personal access token") {
+                        crate::prefs::save("cds_key", self.cds_key.trim());
+                    }
+                    ui.toggle_value(&mut self.show_keys, "👁")
+                        .on_hover_text("Show / hide the key");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.hyperlink_to("get your key", crate::cds::PROFILE_PAGE);
+                    ui.label("·");
+                    ui.hyperlink_to(
+                        "accept the ERA5 time-series licence (once)",
+                        crate::cds::DATASET_PAGE,
+                    );
+                });
+                ui.weak(
+                    "Uses your own CDS quota (ERA5 hourly time series, one job per 0.25° cell; ~10–60 s each). \
+                     Point annotation only: wind-field arrows and 3D wind still come from Open-Meteo. \
+                     This dataset has no 100 m wind or cloud cover, so wind support uses 10 m wind. \
+                     The key is stored only on this device, never in share links.",
+                );
+            }
+            Era5Source::OpenMeteo => {
+                egui::CollapsingHeader::new("Open-Meteo API key (optional)").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if key_field(ui, &mut self.om_key, "paid-plan key") {
+                            crate::prefs::save("open_meteo_key", self.om_key.trim());
+                        }
+                        ui.toggle_value(&mut self.show_keys, "👁");
+                    });
+                    ui.weak(
+                        "Free use is limited per IP address (600/min, 5 000/h, 10 000/day), shared by everyone on \
+                         your network. A key (open-meteo.com/en/pricing) switches to the customer servers. \
+                         Stored on this device only.",
+                    );
+                });
+            }
+        }
+    }
+
+    /// Start queued CDS jobs and send the next request of each running one.
+    fn pump_cds(&mut self, ctx: &egui::Context) {
+        while self.cds_running.len() < CDS_PARALLEL
+            && let Some(job) = self.cds_pending.pop_front()
+        {
+            self.cds_next_id += 1;
+            self.cds_running.push(CdsRun {
+                id: self.cds_next_id,
+                job,
+                stage: CdsStage::Submit,
+                busy: false,
+                next_at: 0.0,
+                polls: 0,
+            });
+        }
+        let now = self.now;
+        let key = self.cds_key.clone();
+        for r in self.cds_running.iter_mut().filter(|r| !r.busy) {
+            if now < r.next_at {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(r.next_at - now));
+                continue;
+            }
+            let req = match &r.stage {
+                CdsStage::Submit => crate::cds::submit(&key, &r.job),
+                CdsStage::Poll(id) => crate::cds::status(&key, id),
+                CdsStage::Results(id) => crate::cds::results(&key, id),
+                // the download link is pre-signed: no key header
+                CdsStage::Download(href) => ehttp::Request::get(href),
+            };
+            r.busy = true;
+            let (tx, ctx2, run) = (self.tx.clone(), ctx.clone(), r.id);
+            ehttp::fetch(req, move |res| {
+                let result = res.map(|r| (r.status, r.bytes));
+                let _ = tx.send(Msg::Cds { run, result });
+                ctx2.request_repaint();
+            });
+        }
+    }
+
+    fn on_cds_response(&mut self, run: u64, result: Result<(u16, Vec<u8>), String>) {
+        let Some(i) = self.cds_running.iter().position(|r| r.id == run) else {
+            return;
+        };
+        self.cds_running[i].busy = false;
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let step: Result<Option<CdsStage>, String> = match result {
+            Err(e) => {
+                if matches!(self.cds_running[i].stage, CdsStage::Submit) && self.req_done == 0 {
+                    // First contact failed without any HTTP status: blocked or offline.
+                    Err(format!(
+                        "could not reach the Copernicus CDS ({e}). {}",
+                        if cfg!(target_arch = "wasm32") {
+                            "The browser may block calls to cds.climate.copernicus.eu from other web sites (CORS); the desktop app is not affected."
+                        } else {
+                            "Check the internet connection."
+                        }
+                    ))
+                } else {
+                    Err(e)
+                }
+            }
+            Ok((401 | 403, b)) if matches!(self.cds_running[i].stage, CdsStage::Submit) => {
+                let msg = crate::cds::error_text(&text(&b));
+                // A bad key or missing licence fails every job: stop them all.
+                let n = self.cds_pending.len() + self.cds_running.len() - 1;
+                self.cds_pending.clear();
+                self.cds_running.retain(|r| r.id == run);
+                self.req_done += n;
+                self.req_failed += n;
+                Err(format!(
+                    "CDS refused the request: {msg} (key from {})",
+                    crate::cds::PROFILE_PAGE
+                ))
+            }
+            Ok((s, b)) if !(200..300).contains(&s) => {
+                Err(format!("HTTP {s}: {}", crate::cds::error_text(&text(&b))))
+            }
+            Ok((_, b)) => {
+                let r = &mut self.cds_running[i];
+                match r.stage.clone() {
+                    CdsStage::Submit | CdsStage::Poll(_) => {
+                        crate::cds::parse_job(&text(&b)).and_then(|(id, st)| match st {
+                            crate::cds::JobState::Done => Ok(Some(CdsStage::Results(id))),
+                            crate::cds::JobState::Failed(m) => Err(m),
+                            crate::cds::JobState::Waiting => {
+                                r.polls += 1;
+                                // 3 s, then gradually up to 15 s between polls
+                                r.next_at = self.now + (3.0 + r.polls as f64).min(15.0);
+                                Ok(Some(CdsStage::Poll(id)))
+                            }
+                        })
+                    }
+                    CdsStage::Results(_) => {
+                        crate::cds::parse_results(&text(&b)).map(|h| Some(CdsStage::Download(h)))
+                    }
+                    CdsStage::Download(_) => crate::cds::payload_csv(&b)
+                        .and_then(|csv| crate::cds::parse_csv(&csv))
+                        .map(|series| {
+                            let job = r.job.clone();
+                            self.store.cells.entry(job.cell).or_default().extend(series);
+                            for d in job.start_day..=job.end_day {
+                                self.store.days.insert((job.cell, d));
+                            }
+                            None
+                        }),
+                }
+            }
+        };
+        match step {
+            Ok(Some(next)) => self.cds_running[i].stage = next,
+            Ok(None) | Err(_) => {
+                let r = self.cds_running.remove(i);
+                if let Err(e) = step {
+                    self.req_failed += 1;
+                    for d in r.job.start_day..=r.job.end_day {
+                        self.store.days.insert((r.job.cell, d));
+                    }
+                    self.status(format!("! CDS: {e}"));
+                }
+                self.req_done += 1;
+                self.on_download_complete();
             }
         }
     }
@@ -2645,6 +3125,47 @@ impl WingApp {
                             self.tracks.iter_mut().for_each(|t| t.visible = !t.visible);
                         }
                     });
+                    let mut cut = false;
+                    let mut restore = false;
+                    ui.horizontal(|ui| {
+                        cut = ui
+                            .button("✂ Remove fallen tags")
+                            .on_hover_text(
+                                "For every visible track, cut the end where the tag kept transmitting after falling off: \
+                                 after the last active message, ≥ N messages with flat activity (TinyFox 24 h activity %, \
+                                 NanoFox VeDBA; distance moved for other tags) up to the end. Same rule as \
+                                 detect_tag_fell_off() in SigfoxTagPrep; a tag_fell_off column in the file is used directly. \
+                                 Undo with 📅 → clear, or 'restore'.",
+                            )
+                            .clicked();
+                        let p = &mut self.falloff;
+                        ui.menu_button("⚙", |ui| {
+                            ui.add(egui::Slider::new(&mut p.min_inactive_run, 1..=12).text("min. inactive messages"));
+                            ui.add(egui::Slider::new(&mut p.activity_threshold, 0.0..=10.0).text("TinyFox activity % >"));
+                            ui.add(egui::Slider::new(&mut p.vedba_threshold, 0.0..=500.0).text("NanoFox VeDBA >"));
+                            ui.add(egui::Slider::new(&mut p.dist_threshold_km, 0.1..=10.0).text("other tags: moved > km"));
+                            ui.checkbox(&mut p.keep_first_inactive, "keep the first inactive message");
+                            ui.checkbox(&mut p.use_file_flag, "use the file's tag_fell_off column when present")
+                                .on_hover_text("Movebank exports from SigfoxTagPrep carry detect_tag_fell_off() results");
+                            if ui.button("defaults").clicked() {
+                                *p = crate::falloff::Params::default();
+                            }
+                        });
+                        if self.tracks.iter().any(|t| t.date_filter.is_some()) {
+                            restore = ui
+                                .small_button("restore")
+                                .on_hover_text("Clear every date filter / fall-off cut")
+                                .clicked();
+                        }
+                    });
+                    if cut {
+                        self.remove_fallen_tags();
+                    }
+                    if restore {
+                        let all: Vec<usize> = (0..self.tracks.len()).collect();
+                        self.set_date_filter(&all, None);
+                        self.status("Restored all fixes (date filters cleared)".to_string());
+                    }
                     ui.separator();
                 }
                 let mut zoom_to = None;
@@ -2846,7 +3367,9 @@ impl WingApp {
                         ui.weak(txt);
                     }
                 }
-                let busy = !self.queue.is_empty() || !self.in_flight.is_empty();
+                ui.separator();
+                self.era5_source_ui(ui);
+                let busy = !self.downloads_idle();
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.tracks.is_empty() && !busy, egui::Button::new("Annotate with ERA5")).clicked() {
                         self.start_weather();
@@ -2860,6 +3383,20 @@ impl WingApp {
                     let frac = if self.req_total > 0 { self.req_done as f32 / self.req_total as f32 } else { 0.0 };
                     ui.add(egui::ProgressBar::new(frac).text(format!("{}/{} requests", self.req_done, self.req_total)));
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                    if !self.cds_running.is_empty() || !self.cds_pending.is_empty() {
+                        let waiting = self.cds_running.iter().filter(|r| matches!(r.stage, CdsStage::Poll(_))).count();
+                        ui.weak(format!(
+                            "Copernicus CDS: {} running ({waiting} queued at CDS), {} waiting here",
+                            self.cds_running.len(),
+                            self.cds_pending.len()
+                        ));
+                    }
+                    if let Some(n) = &self.wait_note {
+                        ui.colored_label(Color32::from_rgb(255, 190, 90), n);
+                    }
+                    if self.req_failed > 0 {
+                        ui.weak(format!("{} failed - see the log", self.req_failed));
+                    }
                 }
                 if !self.store.is_empty() {
                     ui.weak(format!("cache: {} cells · {} hours", self.store.cells.len(), self.store.hours()));
@@ -3983,6 +4520,7 @@ impl eframe::App for WingApp {
             ViewTab::Map => self.maybe_request_surface_field(),
         }
         self.pump_weather(ctx);
+        self.pump_cds(ctx);
         self.record_tick(ctx);
         if self.playing {
             let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
@@ -4528,6 +5066,29 @@ fn parse_date_range(from: &str, to: &str) -> Result<(i64, i64), String> {
 #[cfg(test)]
 mod share_tests {
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn fallen_tags_on_real_file() {
+        // WT_FILE=moths.csv cargo test fallen_tags_on_real_file -- --ignored --nocapture
+        let Ok(p) = std::env::var("WT_FILE") else {
+            return;
+        };
+        let mut a = WingApp::blank();
+        a.add_file_from(
+            "m.csv".into(),
+            std::fs::read(p).unwrap(),
+            None,
+            Some(FileOrigin::Local),
+        );
+        let before: usize = a.tracks.iter().map(|t| t.fixes.len()).sum();
+        a.remove_fallen_tags();
+        let after: usize = a.tracks.iter().map(|t| t.fixes.len()).sum();
+        println!("fixes {before} -> {after}; {}", a.log.last().unwrap());
+        a.remove_fallen_tags();
+        println!("again: {}", a.log.last().unwrap());
+        assert!(after < before);
+    }
 
     #[test]
     fn date_range_editor_parsing() {
