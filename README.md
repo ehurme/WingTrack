@@ -40,6 +40,11 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
   UTC date range, e.g. to drop the days a tag sat on the bench or after it fell off. *Apply to all visible*
   sets one season for every animal; *clear* brings everything back (filtered data is set aside, not deleted).
   Steps, speeds and the time slider are recomputed, and the range is kept in share links.
+- **Remove fallen tags** — *✂ Remove fallen tags* (Tracks panel) cuts the end of each visible track where the tag
+  kept transmitting after it fell off: after the last active message, at least 3 (⚙) messages with flat activity up to
+  the end. Same rule as `detect_tag_fell_off()` in SigfoxTagPrep — TinyFox 24 h activity % (else the reset-safe
+  VeDBA counter rate), NanoFox VeDBA per message, distance moved for other tags — and a `tag_fell_off` column in the
+  file is used directly. The cut is a date filter, so *restore* or 📅 → *clear* undoes it.
 - **Satellite layers** — Esri World Imagery / OSM / topo / dark basemaps, plus **NASA GIBS daily imagery
   (MODIS Terra, MODIS Aqua, VIIRS)** that switches date with the time cursor, so you can see the fronts the animals crossed.
 - **ERA5 wind & weather** (via the [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api)):
@@ -54,6 +59,16 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
     week at a time as you move through time, optionally night cells only. The arrow palette has a default per basemap
     (bright on satellite imagery, viridis on street/topo maps) and can be changed per basemap. Requests are throttled to
     Open-Meteo's free limits (600 calls/min, 5 000/h) and retried after a rate-limit response.
+  - **Data source and quotas.** Requests go from your browser straight to the data provider. Open-Meteo's free tier
+    is limited **per IP address** (600 calls/min, 5 000/h, 10 000/day) — not shared by all WingTrack users, but shared
+    by everyone behind the same network address (an institute, a VPN). The ERA5 panel shows why downloads are
+    waiting (pacing, hourly budget, rate limit), times out hung requests, and stops with a clear message at the daily
+    limit. Two ways around it, both stored only on your device and never put in share links:
+    - **Copernicus CDS** (*ERA5 source → Copernicus CDS*): your own [CDS](https://cds.climate.copernicus.eu)
+      personal access token and quota. Fixes are annotated from the *ERA5 hourly time-series* dataset (one job per
+      0.25° cell for the whole deployment; accept its licence once on the dataset page). It has no 100 m wind or
+      cloud cover, so wind support uses 10 m wind; wind-field arrows and 3D wind still use Open-Meteo.
+    - **Open-Meteo API key** (paid plans) switches to Open-Meteo's customer servers.
 - **3D winds at multiple altitudes** (*3D winds* tab) — a tilted map with the wind-speed field for one level,
   flowing particles on stacked pressure-level planes (labelled with their geopotential height), tracks drawn at
   flight altitude with drop lines and ground shadows, dotted segments where the animal was not detected,
