@@ -5378,6 +5378,7 @@ dependencies = [
  "gif",
  "js-sys",
  "log",
+ "png 0.18.1",
  "rfd",
  "serde_json",
  "walkers",

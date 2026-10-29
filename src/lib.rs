@@ -16,6 +16,7 @@ pub mod geo;
 pub mod model;
 pub mod share;
 pub mod table;
+pub mod terrain;
 pub mod tiles;
 pub mod video;
 pub mod view3d;

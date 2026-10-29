@@ -35,6 +35,7 @@ This file is written for AI coding agents. Assume the reader knows nothing about
 │   ├── app.rs              # egui application: map, timeline, charts, export, video
 │   ├── model.rs            # Core data model: Track, Fix, SensorSample, WeatherAnno
 │   ├── table.rs            # Tolerant CSV reader (delimiter sniffing, header normalisation, timestamp parsing)
+│   ├── terrain.rs          # AWS Terrarium elevation tiles for the 3D view: fetch, decode, bilinear sampling
 │   ├── firmware/           # One module per data source
 │   │   ├── mod.rs          # Firmware trait, registry, shared helpers
 │   │   ├── wildcloud.rs    # TinyFox / NanoFox 30Days / NanoFox FineScalePressure
@@ -221,3 +222,5 @@ Enable GitHub Pages via *Settings → Pages → Source: GitHub Actions*.
 - walkers: https://github.com/podusowski/walkers
 
 - `table::Table` repairs R `write.csv` rows where an unquoted `c(...)`/`list(...)` vector split across fields (only when a row has more fields than headers).
+- `Track::set_date_filter` moves fixes/sensors outside the range into `excluded_fixes`/`excluded_sensors` (restored on change) and recomputes steps; the app wrapper `WingApp::set_date_filter` also fixes the time range, selection and caches. Shared as `dr=key:from-to;…`.
+- 3D terrain (`View3D::terrain`, share `v3` field 11): `terrain::Terrain::sampler()` borrows loaded tiles for one frame and records missing ones; `finish()` downloads them. The CPU painter has no depth buffer, so ground cells/tiles are drawn far-to-near (`ground_grid`).

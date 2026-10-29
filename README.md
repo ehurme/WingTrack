@@ -36,6 +36,10 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
   (comma/semicolon/tab delimiters, BOMs, `14.06.2025, 17:56:24` timestamps, `7000 (2/1)` radius strings, strongest RSSI from the base-station field).
 - **Sigfox-aware display** — location-error circles from the Atlas radius (km scale) or the CTT Bluetooth `conf` (tens of metres), a max-radius filter,
   dashed steps where the movement is smaller than the combined location error, and an option to hide them.
+- **Per-tag date range** — the 📅 button next to each track keeps only fixes (and sensor samples) inside a
+  UTC date range, e.g. to drop the days a tag sat on the bench or after it fell off. *Apply to all visible*
+  sets one season for every animal; *clear* brings everything back (filtered data is set aside, not deleted).
+  Steps, speeds and the time slider are recomputed, and the range is kept in share links.
 - **Satellite layers** — Esri World Imagery / OSM / topo / dark basemaps, plus **NASA GIBS daily imagery
   (MODIS Terra, MODIS Aqua, VIIRS)** that switches date with the time cursor, so you can see the fronts the animals crossed.
 - **ERA5 wind & weather** (via the [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api)):
@@ -55,6 +59,11 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
   flight altitude with drop lines and ground shadows, dotted segments where the animal was not detected,
   named position markers, a big date caption and a "km from where each was tagged" bar. Drag to orbit,
   shift/right-drag to pan, scroll to zoom; *Follow* keeps the selected animal centred.
+  - **3D terrain** — the *Terrain* button (also *⛰ 3D terrain* in the side panel) drapes the basemap, satellite
+    layer and wind colours over real topography from [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/)
+    (SRTM / GMTED2010 / ETOPO1), hill-shaded. It uses the same vertical exaggeration as the flight altitudes, so an
+    animal's height above the ground is to scale; drop lines and shadows land on the terrain, and fixes without
+    altitude sit at ground level + *altitude if unknown*. Sea and below is flat at 0 m.
   - **Two data sources** in one store:
     [Open-Meteo Historical Forecast API](https://open-meteo.com/en/docs/historical-forecast-api) — 1000–700 hPa
     (≈ 110 m – 3 km) wind, geopotential height and temperature from archived GFS / ICON / IFS analyses,
