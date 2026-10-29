@@ -26,15 +26,15 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
   | Wildcloud · TinyFox                   | `Total VeDBA` (cumulative → per-message difference), 24 h activity %, 24 h min/max temperature, 24 h min pressure → max altitude                                                    |
   | Wildcloud · NanoFox 30Days            | 5 × 36-min VeDBA and temperature bins (placed at their window centres), 3 h min pressure → max altitude                                                                               |
   | Wildcloud · NanoFox FineScalePressure | 5 × VeDBA bins + 5 instantaneous pressure readings → barometric altitude at transmission                                                                                              |
-  | Movebank · Sigfox                     | `wildcloud_to_movebank()` uploads: Atlas locations + radius, separate VeDBA / pressure / temperature rows (3 h min pressure joined to fixes like `add_min_pressure_to_locations()`) |
+  | Movebank · Sigfox                     | `wildcloud_to_movebank()` uploads: Atlas locations + radius (`location_lat/long` or `lat/lon`), separate VeDBA / pressure / temperature rows (3 h min pressure joined to fixes like `add_min_pressure_to_locations()`); R `write.csv` exports with unquoted `c(lon, lat)` geometry are repaired |
   | Movebank · GPS                        | `height-above-msl/ellipsoid`, `ground-speed`, `heading`, `gps:hdop`; drops rows flagged invisible/outlier                                                                       |
   | CTT · cellular GPS                    | CTT portal exports (Time of Fix, Lat/Lng, Altitude, Speed in knots, COG, HDOP, satellites, Nav Type/Error codes) and legacy `GPS_YYYY-MM-DD_HH:MM:SS` files                           |
-| CTT · detections | CTT detection exports (`source, receiver_id, tag_id, time_utc, lat, lon, conf, rssi, payload`) from nodes / SensorStations and crowd-sourced phones: receiver positions as station fixes, same-second detections merged, `conf`/`rssi`/`source`/`receiver_id` kept |
+  | CTT · Bluetooth detections            | CTT detection exports (`source, receiver_id, tag_id, time_utc, lat, lon, conf, rssi, payload`) from nodes / SensorStations and crowd-sourced phones: Bluetooth fixes with `conf` as the error radius in metres, same-second detections merged (mean position, mean conf), `rssi`/`source`/`receiver_id` kept |
   | Generic                                | any lat/lon/time CSV, e.g. `flatten_movedata()` output; `era5_*` / `wind_support_flight` columns from `annotate_era5()` are shown as *imported* weather                       |
 
   Column matching mirrors `harmonize_wc_columns()` in [SigfoxTagPrep](https://github.com/ehurme/SigfoxTagPrep)
   (comma/semicolon/tab delimiters, BOMs, `14.06.2025, 17:56:24` timestamps, `7000 (2/1)` radius strings, strongest RSSI from the base-station field).
-- **Sigfox-aware display** — location-error circles from the Atlas radius, a max-radius filter,
+- **Sigfox-aware display** — location-error circles from the Atlas radius (km scale) or the CTT Bluetooth `conf` (tens of metres), a max-radius filter,
   dashed steps where the movement is smaller than the combined location error, and an option to hide them.
 - **Satellite layers** — Esri World Imagery / OSM / topo / dark basemaps, plus **NASA GIBS daily imagery
   (MODIS Terra, MODIS Aqua, VIIRS)** that switches date with the time cursor, so you can see the fronts the animals crossed.

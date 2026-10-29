@@ -236,14 +236,16 @@ node,V30B01,573B8D0E,2026-09-28T21:26:25.000Z,,,62,-95,\n";
     assert_eq!(a.tag, "CTT detections");
     assert_eq!(a.fixes.len(), 3, "same-second detections merged");
     let m = &a.fixes[1];
-    assert_eq!(m.source, LocationSource::Station);
+    assert_eq!(m.source, LocationSource::Bluetooth);
+    assert_eq!(m.error_m, Some(67.0), "mean conf of the merged detections");
+    assert_eq!(a.fixes[0].error_m, Some(74.0));
     assert!((m.lat - 47.689635).abs() < 1e-9 && (m.lon - 9.186387).abs() < 1e-9);
     assert!(
         m.extra
             .iter()
             .any(|(k, v)| k == "detections_merged" && v == "2")
     );
-    assert!(m.extra.iter().any(|(k, v)| k == "conf" && v == "74"));
+    assert!(m.extra.iter().any(|(k, v)| k == "conf_m" && v == "74 60"));
     assert!(
         m.extra
             .iter()

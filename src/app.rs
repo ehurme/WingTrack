@@ -4154,8 +4154,9 @@ impl Plugin for TrackLayer<'_> {
                     continue;
                 }
                 let c = self.app.color(tr, f);
+                // error radius for every non-GPS fix (Sigfox km-scale, Bluetooth tens of metres)
                 if self.show_error
-                    && f.source == LocationSource::SigfoxAtlas
+                    && f.source != LocationSource::Gps
                     && let Some(e) = f.error_m
                 {
                     let r = e * projector.scale_pixel_per_meter(lon_lat(f.lon, f.lat));

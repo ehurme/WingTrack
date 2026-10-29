@@ -180,10 +180,11 @@ impl Firmware for CttGps {
 /// phone (`source = crowd_sourced`). Columns: `source, receiver_id, tag_id, time_utc, lat, lon,
 /// conf, rssi, payload`.
 ///
-/// The positions are where the *receiver* was, so fixes are marked as station locations.
+/// The positions are where the *receiver* was; fixes are marked as Bluetooth locations and
+/// `conf` is the error radius in metres (tens to a few hundred m, unlike Sigfox's kilometres).
 /// Detections of the same tag in the same second (heard by several receivers) are merged into
-/// one fix at their mean position. `conf`, `rssi`, `source`, `receiver_id` and `payload` are kept
-/// as extra columns; `conf` is not interpreted as a location error.
+/// one fix at their mean position with the mean radius. `conf`, `rssi`, `source`, `receiver_id`
+/// and `payload` are also kept as extra columns.
 pub struct CttDetections;
 
 impl Firmware for CttDetections {
@@ -191,10 +192,10 @@ impl Firmware for CttDetections {
         "ctt-detections"
     }
     fn label(&self) -> &'static str {
-        "CTT · detections (receivers / crowd-sourced)"
+        "CTT · Bluetooth detections (receivers / crowd-sourced)"
     }
     fn description(&self) -> &'static str {
-        "CTT detection export: tag_id, time_utc, receiver/phone lat & lon, conf, rssi, source, receiver_id"
+        "CTT detection export: tag_id, time_utc, receiver/phone lat & lon, conf (error radius, m), rssi, source, receiver_id"
     }
     fn detect(&self, t: &Table) -> f32 {
         let core = t.has(&["tag_id"])
@@ -294,7 +295,15 @@ impl Firmware for CttDetections {
             merged += n - 1;
             let lat = dets.iter().map(|d| d.lat).sum::<f64>() / n as f64;
             let lon = dets.iter().map(|d| d.lon).sum::<f64>() / n as f64;
-            let mut f = Fix::new(ts, lat, lon, LocationSource::Station);
+            let mut f = Fix::new(ts, lat, lon, LocationSource::Bluetooth);
+            let confs: Vec<f64> = dets
+                .iter()
+                .filter_map(|d| d.conf)
+                .filter(|c| *c > 0.0)
+                .collect();
+            if !confs.is_empty() {
+                f.error_m = Some((confs.iter().sum::<f64>() / confs.len() as f64) as f32);
+            }
             let join = |v: Vec<String>| {
                 let mut v: Vec<String> = v.into_iter().filter(|s| !s.is_empty()).collect();
                 v.sort();
@@ -310,8 +319,9 @@ impl Firmware for CttDetections {
             if !rec.is_empty() {
                 f.extra.push(("receiver_id".into(), rec));
             }
-            if let Some(c) = dets.iter().filter_map(|d| d.conf).reduce(f64::max) {
-                f.extra.push(("conf".into(), format!("{c}")));
+            if !confs.is_empty() {
+                let c: Vec<String> = confs.iter().map(|c| format!("{c}")).collect();
+                f.extra.push(("conf_m".into(), c.join(" ")));
             }
             if let Some(r) = dets.iter().filter_map(|d| d.rssi).reduce(f64::max) {
                 f.extra.push(("rssi_max".into(), format!("{r}")));
