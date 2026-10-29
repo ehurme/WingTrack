@@ -354,6 +354,10 @@ pub struct WingApp {
     hide_insignificant: bool,
     selected: Option<(usize, usize)>,
     selected_track: Option<usize>,
+    /// Track whose date-range editor is open, with the From / To text.
+    date_edit: Option<usize>,
+    date_from: String,
+    date_to: String,
     chart_var: ChartVar,
 
     // weather
@@ -491,6 +495,9 @@ impl WingApp {
             hide_insignificant: false,
             selected: None,
             selected_track: None,
+            date_edit: None,
+            date_from: String::new(),
+            date_to: String::new(),
             chart_var: ChartVar::Altitude,
             store: WeatherStore::default(),
             opts: AnnotateOptions::default(),
@@ -863,7 +870,7 @@ impl WingApp {
         m.set(
             "v3",
             format!(
-                "{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{}",
                 v.particles_on as u8,
                 v.particles_per_level,
                 r(v.flow_hours_per_s as f64, 2),
@@ -873,7 +880,8 @@ impl WingApp {
                 v.show_shadows as u8,
                 r(v.ground_dim as f64, 2),
                 r(v.default_alt_m as f64, 0),
-                r(v.gap_factor as f64, 2)
+                r(v.gap_factor as f64, 2),
+                v.terrain as u8
             ),
         );
         // ---- tracks
@@ -882,6 +890,13 @@ impl WingApp {
             .map(|i| self.track_key(i))
             .collect();
         m.set_if(!hidden.is_empty(), "hide", hidden.join(","));
+        let ranges: Vec<String> = (0..self.tracks.len())
+            .filter_map(|i| {
+                let (a, b) = self.tracks[i].date_filter?;
+                Some(format!("{}:{a}-{b}", self.track_key(i)))
+            })
+            .collect();
+        m.set_if(!ranges.is_empty(), "dr", ranges.join(";"));
         let cols: Vec<String> = (0..self.tracks.len())
             .map(|i| {
                 let c = self.tracks[i].color;
@@ -1061,6 +1076,7 @@ impl WingApp {
         if let Some(x) = g(9) {
             v.gap_factor = x as f32;
         }
+        v.terrain = g(10).is_some_and(|x| x != 0.0);
         if let Some(x) = m.f64("rl") {
             v.raster_level = x as usize;
         }
@@ -1068,6 +1084,31 @@ impl WingApp {
 
     /// Track-dependent state, applied once the link's data has loaded.
     fn apply_share_view(&mut self, m: &ShareMap) {
+        // Date filters first: the selected fix below is looked up in the filtered fixes.
+        let mut changed = Vec::new();
+        let wanted: HashMap<usize, (i64, i64)> = m
+            .get("dr")
+            .map(|d| {
+                d.split(';')
+                    .filter_map(|kv| {
+                        let (key, r) = kv.rsplit_once(':')?;
+                        let (a, b) = r.split_once('-')?;
+                        Some((self.track_by_key(key)?, (a.parse().ok()?, b.parse().ok()?)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for i in 0..self.tracks.len() {
+            let want = wanted.get(&i).copied();
+            if self.tracks[i].date_filter != want {
+                self.tracks[i].set_date_filter(want);
+                changed.push(i);
+            }
+        }
+        if !changed.is_empty() {
+            self.recompute_time_range();
+            self.curtain_cache = None;
+        }
         if let Some(h) = m.get("hide") {
             let hidden: Vec<&str> = h.split(',').collect();
             for i in 0..self.tracks.len() {
@@ -1384,6 +1425,18 @@ impl WingApp {
             open = false;
         }
         self.url_dialog = open;
+    }
+
+    /// Restrict tracks `idxs` to `range` (or restore all data), keeping the time cursor.
+    fn set_date_filter(&mut self, idxs: &[usize], range: Option<(i64, i64)>) {
+        for &i in idxs {
+            self.tracks[i].set_date_filter(range);
+        }
+        let t = self.t_now;
+        self.recompute_time_range();
+        self.t_now = t.clamp(self.t_min, self.t_max);
+        self.selected = None; // fix indices changed
+        self.curtain_cache = None;
     }
 
     fn recompute_time_range(&mut self) {
@@ -2595,6 +2648,8 @@ impl WingApp {
                     ui.separator();
                 }
                 let mut zoom_to = None;
+                let mut date_click = None;
+                let mut date_action: Option<DateAction> = None;
                 for (i, tr) in self.tracks.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut tr.visible, "");
@@ -2606,15 +2661,79 @@ impl WingApp {
                         if ui.small_button("zoom").on_hover_text("Zoom to track").clicked() {
                             zoom_to = Some(i);
                         }
+                        let filtered = tr.date_filter.is_some();
+                        let btn = egui::Button::new(if filtered { "📅 filtered" } else { "📅" })
+                            .small()
+                            .selected(filtered || self.date_edit == Some(i));
+                        if ui.add(btn).on_hover_text("Keep only fixes inside a date range").clicked() {
+                            date_click = Some(i);
+                        }
                     });
                     let range = tr.time_range().map(|(a, b)| format!("{} to {}", fmt_date(a), fmt_date(b))).unwrap_or_default();
+                    let hidden = if tr.excluded_fixes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({} outside the date range)", tr.excluded_fixes.len())
+                    };
                     ui.weak(format!(
-                        "   {} · {} fixes · {}{}",
+                        "   {} · {} fixes{hidden} · {}{}",
                         tr.tag,
                         tr.fixes.len(),
                         range,
                         tr.species.as_ref().map(|s| format!(" · {s}")).unwrap_or_default()
                     ));
+                    if self.date_edit == Some(i) {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("from");
+                                ui.add(egui::TextEdit::singleline(&mut self.date_from).desired_width(130.0).hint_text("YYYY-MM-DD [HH:MM]"));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("to   ");
+                                ui.add(egui::TextEdit::singleline(&mut self.date_to).desired_width(130.0).hint_text("YYYY-MM-DD [HH:MM]"));
+                            });
+                            let range = parse_date_range(&self.date_from, &self.date_to);
+                            if let Err(e) = &range {
+                                ui.colored_label(egui::Color32::from_rgb(230, 120, 100), e);
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(range.is_ok(), egui::Button::new("apply")).clicked() {
+                                    date_action = Some((vec![i], range.clone().ok()));
+                                }
+                                if ui
+                                    .add_enabled(range.is_ok(), egui::Button::new("apply to all visible"))
+                                    .on_hover_text("Use this range for every visible track (e.g. one season)")
+                                    .clicked()
+                                {
+                                    date_action = Some((Vec::new(), range.clone().ok()));
+                                }
+                                if ui.add_enabled(tr.date_filter.is_some(), egui::Button::new("clear")).clicked() {
+                                    date_action = Some((vec![i], None));
+                                }
+                            });
+                            ui.weak("Dates are UTC; a bare date covers the whole day. Fixes and sensor data outside the range are set aside, not deleted.");
+                        });
+                    }
+                }
+                if let Some(i) = date_click {
+                    if self.date_edit == Some(i) {
+                        self.date_edit = None;
+                    } else {
+                        let tr = &self.tracks[i];
+                        let (a, b) = tr.date_filter.or(tr.full_time_range()).unwrap_or((0, 0));
+                        self.date_from = fmt_minute(a);
+                        self.date_to = fmt_minute(b);
+                        self.date_edit = Some(i);
+                    }
+                }
+                if let Some((idxs, range)) = date_action {
+                    let idxs = if idxs.is_empty() {
+                        (0..self.tracks.len()).filter(|&j| self.tracks[j].visible).collect()
+                    } else {
+                        idxs
+                    };
+                    self.set_date_filter(&idxs, range);
+                    self.date_edit = None;
                 }
                 if let Some(i) = zoom_to {
                     self.selected_track = Some(i);
@@ -3416,6 +3535,10 @@ impl WingApp {
             ui.checkbox(&mut v.show_drop_lines, "drop lines");
             ui.checkbox(&mut v.show_shadows, "ground shadows");
         });
+        ui.toggle_value(&mut v.terrain, "⛰ 3D terrain").on_hover_text(
+            "Drape the basemap over real topography (AWS Terrain Tiles), hill-shaded. Uses the same \
+             vertical exaggeration as the flight altitudes, so heights above ground stay true.",
+        );
         ui.add(egui::Slider::new(&mut v.ground_dim, 0.0..=0.9).text("dim basemap"));
         ui.add(
             egui::Slider::new(&mut v.default_alt_m, 0.0..=2000.0).text("altitude if unknown (m)"),
@@ -4368,9 +4491,56 @@ fn web_download(name: &str, bytes: &[u8], mime: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Tracks to (re)filter (empty = all visible) and the range, `None` to clear.
+type DateAction = (Vec<usize>, Option<(i64, i64)>);
+
+/// `YYYY-MM-DD HH:MM` (UTC), the format the date-range editor shows.
+fn fmt_minute(t: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// Parse the date-range editor. A bare date means the start (from) or end (to) of that day;
+/// anything [`crate::table::parse_time`] understands is accepted too. The "to" bound is
+/// inclusive to the end of its minute.
+fn parse_date_range(from: &str, to: &str) -> Result<(i64, i64), String> {
+    fn bound(s: &str, end: bool) -> Option<i64> {
+        let s = s.trim();
+        for f in ["%Y-%m-%d", "%d.%m.%Y"] {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(s, f) {
+                let (h, m, sec) = if end { (23, 59, 59) } else { (0, 0, 0) };
+                return d.and_hms_opt(h, m, sec).map(|dt| dt.and_utc().timestamp());
+            }
+        }
+        let t = crate::table::parse_time(s)?;
+        // "HH:MM" without seconds: include the whole minute at the end bound
+        Some(if end && t % 60 == 0 { t + 59 } else { t })
+    }
+    let a = bound(from, false).ok_or("can't read the 'from' date")?;
+    let b = bound(to, true).ok_or("can't read the 'to' date")?;
+    if b < a {
+        return Err("'to' is before 'from'".into());
+    }
+    Ok((a, b))
+}
+
 #[cfg(test)]
 mod share_tests {
     use super::*;
+
+    #[test]
+    fn date_range_editor_parsing() {
+        let (a, b) = parse_date_range("2024-09-20", "2024-09-21").unwrap();
+        assert_eq!(fmt_time(a), "2024-09-20 00:00:00");
+        assert_eq!(fmt_time(b), "2024-09-21 23:59:59");
+        let (a, b) = parse_date_range("2024-09-20 19:10", " 2024-09-20 22:00 ").unwrap();
+        assert_eq!(fmt_time(a), "2024-09-20 19:10:00");
+        assert_eq!(fmt_time(b), "2024-09-20 22:00:59");
+        assert_eq!(fmt_minute(a), "2024-09-20 19:10");
+        assert!(parse_date_range("2024-09-22", "2024-09-21").is_err());
+        assert!(parse_date_range("soon", "2024-09-21").is_err());
+    }
 
     fn without(m: &ShareMap, keys: &[&str]) -> Vec<(String, String)> {
         m.pairs
@@ -4421,6 +4591,11 @@ mod share_tests {
         a.view3d.exag = 400.0;
         a.tracks[1].visible = false;
         a.tracks[0].color = [1, 2, 3];
+        let (lo, hi) = a.tracks[2].time_range().unwrap();
+        let dr = (lo + (hi - lo) / 4, hi - (hi - lo) / 4);
+        a.set_date_filter(&[2], Some(dr));
+        assert!(!a.tracks[2].excluded_fixes.is_empty());
+        a.view3d.terrain = true;
         a.selected_track = Some(2);
         a.selected = Some((0, 5));
         a.map_center = Some((45.5, 7.25));
@@ -4448,6 +4623,9 @@ mod share_tests {
             "ctt-gps"
         );
         assert!(!b.tracks[1].visible && b.tracks[0].color == [1, 2, 3]);
+        assert_eq!(b.tracks[2].date_filter, Some(dr));
+        assert_eq!(b.tracks[2].fixes.len(), a.tracks[2].fixes.len());
+        assert!(b.view3d.terrain);
         assert_eq!(b.selected, Some((0, 5)));
         assert_eq!(b.selected_track, Some(2));
         assert_eq!(b.t_now, a.t_now.round());

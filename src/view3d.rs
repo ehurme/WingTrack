@@ -88,6 +88,9 @@ pub struct View3D {
     /// A step is "not detected" (dotted) when longer than this × the track's median interval.
     pub gap_factor: f32,
     pub follow: bool,
+    /// Drape the basemap over real terrain (AWS Terrain Tiles), hill-shaded.
+    pub terrain: bool,
+    terrain_src: crate::terrain::Terrain,
     /// Camera from a shared link, applied right after the first fit (which sets the origin).
     pending_cam: Option<PendingCam>,
     origin: Option<(f64, f64)>,
@@ -115,6 +118,8 @@ impl Default for View3D {
             default_alt_m: 0.0,
             gap_factor: 2.5,
             follow: false,
+            terrain: false,
+            terrain_src: crate::terrain::Terrain::default(),
             pending_cam: None,
             origin: None,
             needs_fit: true,
@@ -504,8 +509,10 @@ impl View3D {
             (s.max(-84.0), n.min(84.0), w.max(-179.9), e.min(179.9))
         };
         let tint = Color32::from_gray(((1.0 - self.ground_dim) * 255.0) as u8);
+        let terr = self.terrain_src.clone();
+        let mut elev = self.terrain.then(|| terr.sampler(tile_zoom(view_bbox) + 1));
         if let Some(base) = scene.base.as_deref_mut() {
-            draw_tiles(&painter, &pr, base, view_bbox, tint);
+            draw_tiles(&painter, &pr, base, view_bbox, tint, &mut elev);
         }
         if let Some((sat, op)) = scene.sat.as_mut() {
             let a = (*op * (1.0 - self.ground_dim * 0.5) * 255.0) as u8;
@@ -515,6 +522,7 @@ impl View3D {
                 &mut **sat,
                 view_bbox,
                 Color32::from_rgba_premultiplied(a, a, a, a),
+                &mut elev,
             );
         }
 
@@ -540,7 +548,7 @@ impl View3D {
                             slice.lat0 + i as f64 * slice.step_deg,
                             slice.lon0 + j as f64 * slice.step_deg,
                         );
-                        if let Some(p) = pr.geo(la, lo, 0.0) {
+                        if let Some(p) = pr.geo(la, lo, ground(&mut elev, la, lo)) {
                             idx[i * nl + j] = mesh.vertices.len() as u32;
                             mesh.colored_vertex(p, wind_color((u * u + v * v).sqrt(), 120));
                         }
@@ -664,11 +672,17 @@ impl View3D {
                 continue;
             }
             let col = Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]);
+            // Ground under each fix: sea level, or the terrain when it is shown.
+            let gr: Vec<f32> = tr
+                .fixes
+                .iter()
+                .map(|f| ground(&mut elev, f.lat, f.lon))
+                .collect();
             let alt = |i: usize| {
                 tr.fixes[i]
                     .best_alt()
                     .map(|a| a.max(0.0))
-                    .unwrap_or(self.default_alt_m)
+                    .unwrap_or(gr[i] + self.default_alt_m)
             };
             let gap = gap_threshold(tr) * self.gap_factor as f64;
             let keep: Vec<usize> = (0..tr.fixes.len())
@@ -679,7 +693,7 @@ impl View3D {
                 let f = &tr.fixes[i];
                 let future = scene.trail_to_cursor && f.t as f64 > scene.t_now;
                 let a = alt(i);
-                let (Some(p), Some(g)) = (pr.geo(f.lat, f.lon, a), pr.geo(f.lat, f.lon, 0.0))
+                let (Some(p), Some(g)) = (pr.geo(f.lat, f.lon, a), pr.geo(f.lat, f.lon, gr[i]))
                 else {
                     prev = None;
                     continue;
@@ -762,6 +776,10 @@ impl View3D {
             if resp.clicked() {
                 out.clicked = Some((ti, fi));
             }
+        }
+
+        if let Some(el) = elev.take() {
+            terr.finish(el, ui.ctx());
         }
 
         // ---------------------------------------------------------------- HUD
@@ -937,8 +955,20 @@ impl View3D {
             rect.right_bottom() - vec2(8.0, 6.0),
             Align2::RIGHT_BOTTOM,
             format!(
-                "3D winds: {} · {}",
-                scene.source_label, scene.basemap_attribution
+                "3D winds: {} · {}{}",
+                scene.source_label,
+                scene.basemap_attribution,
+                if self.terrain {
+                    let n = self.terrain_src.loading();
+                    let busy = if n > 0 {
+                        format!(" (loading {n} tiles)")
+                    } else {
+                        String::new()
+                    };
+                    format!(" · {}{busy}", crate::terrain::ATTRIBUTION)
+                } else {
+                    String::new()
+                }
             ),
             FontId::proportional(10.0),
             Color32::from_gray(170),
@@ -946,18 +976,28 @@ impl View3D {
 
         // camera buttons
         let mut y = rect.top() + 12.0;
-        for (label, act) in [("Fit", 0), ("Top", 1), ("Tilt", 2), ("Follow", 3)] {
+        for (label, act) in [
+            ("Fit", 0),
+            ("Top", 1),
+            ("Tilt", 2),
+            ("Follow", 3),
+            ("Terrain", 4),
+        ] {
             let r = Rect::from_min_size(pos2(rect.right() - 74.0, y), vec2(62.0, 22.0));
-            let selected = act == 3 && self.follow;
-            if ui
-                .put(r, egui::Button::new(label).selected(selected))
-                .clicked()
-            {
+            let selected = (act == 3 && self.follow) || (act == 4 && self.terrain);
+            let mut b = ui.put(r, egui::Button::new(label).selected(selected));
+            if act == 4 {
+                b = b.on_hover_text(
+                    "3D topography: drape the map over real terrain (same vertical exaggeration as the flight altitudes)",
+                );
+            }
+            if b.clicked() {
                 match act {
                     0 => self.needs_fit = true,
                     1 => self.cam.pitch = 89.9,
                     2 => self.cam.pitch = 35.0,
-                    _ => self.follow = !self.follow,
+                    3 => self.follow = !self.follow,
+                    _ => self.terrain = !self.terrain,
                 }
             }
             y += 26.0;
@@ -989,25 +1029,132 @@ fn gap_threshold(tr: &Track) -> f64 {
     (d[d.len() / 2] as f64).max(3600.0)
 }
 
+/// Ground height (m) at a point: the terrain when it is on, else sea level.
+fn ground(elev: &mut Option<crate::terrain::Sampler<'_>>, lat: f64, lon: f64) -> f32 {
+    elev.as_mut().map_or(0.0, |s| s.elev(lat, lon))
+}
+
+/// Web-Mercator zoom for the visible ground: about six tiles across, at most 144 tiles.
+fn tile_zoom(bbox: (f64, f64, f64, f64)) -> u8 {
+    let (s, n, w, e) = bbox;
+    let span = (e - w).max(1e-3);
+    let mut z = ((360.0 / (span / 6.0)).log2().floor() as i32).clamp(2, 12) as u8;
+    loop {
+        let nx = lon_to_tile(e, z).floor() - lon_to_tile(w, z).floor() + 1.0;
+        let ny = lat_to_tile(s, z).floor() - lat_to_tile(n, z).floor() + 1.0;
+        if nx * ny <= 144.0 || z <= 2 {
+            return z;
+        }
+        z -= 1;
+    }
+}
+
+/// Lambert hill-shading factor for a surface normal, 1.0 on flat ground (light from the NW).
+fn hillshade(n: [f32; 3]) -> f32 {
+    let l = norm([-1.0, 1.0, 1.4]);
+    let flat = 0.35 + 0.65 * l[2];
+    ((0.35 + 0.65 * dot(n, l).max(0.0)) / flat).clamp(0.3, 1.35)
+}
+
+/// Scale a (premultiplied) vertex colour by a shade factor without breaking premultiplication.
+fn shade(c: Color32, k: f32) -> Color32 {
+    let cap = c.a() as f32;
+    let f = |v: u8| ((v as f32 * k).min(cap)) as u8;
+    Color32::from_rgba_premultiplied(f(c.r()), f(c.g()), f(c.b()), c.a())
+}
+
+/// A tile-shaped grid of ground vertices: world positions (with terrain heights when `elev`
+/// is set), hill-shade factors, and the cells in far-to-near order for painter's-algorithm
+/// drawing (there is no depth buffer).
+struct GroundGrid {
+    pos: Vec<Option<Pos2>>,
+    shade: Vec<f32>,
+    cells: Vec<(usize, usize)>,
+    depth: f32,
+}
+
+fn ground_grid(
+    pr: &Proj,
+    res: usize,
+    corner: impl Fn(f64, f64) -> (f64, f64),
+    elev: &mut Option<crate::terrain::Sampler<'_>>,
+) -> GroundGrid {
+    let n = res + 1;
+    let mut w = Vec::with_capacity(n * n);
+    for a in 0..n {
+        for b in 0..n {
+            let (la, lo) = corner(b as f64 / res as f64, a as f64 / res as f64);
+            w.push(pr.enu(la, lo, ground(elev, la, lo)));
+        }
+    }
+    let mut shade = vec![1.0; n * n];
+    if elev.is_some() {
+        for a in 0..n {
+            for b in 0..n {
+                let (b0, b1) = (b.saturating_sub(1), (b + 1).min(res));
+                let (a0, a1) = (a.saturating_sub(1), (a + 1).min(res));
+                let dx = sub(w[a * n + b1], w[a * n + b0]);
+                let dy = sub(w[a0 * n + b], w[a1 * n + b]); // rows run north → south
+                let mut nv = norm(cross(dx, dy));
+                if nv[2] < 0.0 {
+                    nv = [-nv[0], -nv[1], -nv[2]];
+                }
+                shade[a * n + b] = hillshade(nv);
+            }
+        }
+    }
+    let pos: Vec<Option<Pos2>> = w.iter().map(|&p| pr.project(p)).collect();
+    let dist = |p: [f32; 3]| dot(sub(p, pr.eye), pr.f);
+    let mut cells: Vec<(usize, usize, f32)> = (0..res)
+        .flat_map(|a| (0..res).map(move |b| (a, b)))
+        .map(|(a, b)| {
+            let c = w[a * n + b];
+            let d = w[(a + 1) * n + b + 1];
+            (
+                a,
+                b,
+                dist([
+                    (c[0] + d[0]) / 2.0,
+                    (c[1] + d[1]) / 2.0,
+                    (c[2] + d[2]) / 2.0,
+                ]),
+            )
+        })
+        .collect();
+    cells.sort_by(|x, y| y.2.total_cmp(&x.2));
+    let depth = cells.first().map_or(0.0, |c| c.2);
+    GroundGrid {
+        pos,
+        shade,
+        cells: cells.into_iter().map(|(a, b, _)| (a, b)).collect(),
+        depth,
+    }
+}
+
+/// Emit a grid's cells as triangles (far first) into `mesh`, whose vertices follow the grid.
+fn add_grid_triangles(mesh: &mut Mesh, g: &GroundGrid, res: usize) {
+    let n = res + 1;
+    for &(a, b) in &g.cells {
+        let i = a * n + b;
+        let (i1, i2, i3) = (i + 1, i + n, i + n + 1);
+        if [i, i1, i2, i3].iter().all(|&k| g.pos[k].is_some()) {
+            let (i, i1, i2, i3) = (i as u32, i1 as u32, i2 as u32, i3 as u32);
+            mesh.add_triangle(i, i1, i3);
+            mesh.add_triangle(i, i3, i2);
+        }
+    }
+}
+
 fn draw_tiles(
     painter: &egui::Painter,
     pr: &Proj,
     tiles: &mut dyn Tiles,
     bbox: (f64, f64, f64, f64),
     tint: Color32,
+    elev: &mut Option<crate::terrain::Sampler<'_>>,
 ) {
     let (s, n, w, e) = bbox;
-    let span = (e - w).max(1e-3);
-    let mut z = ((360.0 / (span / 6.0)).log2().floor() as i32).clamp(2, 12) as u8;
-    // keep the tile count reasonable
-    loop {
-        let nx = lon_to_tile(e, z).floor() - lon_to_tile(w, z).floor() + 1.0;
-        let ny = lat_to_tile(s, z).floor() - lat_to_tile(n, z).floor() + 1.0;
-        if nx * ny <= 144.0 || z <= 2 {
-            break;
-        }
-        z -= 1;
-    }
+    let z = tile_zoom(bbox);
     let max = (1u32 << z) - 1;
     let (x0, x1) = (
         lon_to_tile(w, z).floor() as u32,
@@ -1017,7 +1164,9 @@ fn draw_tiles(
         lat_to_tile(n, z).floor() as u32,
         (lat_to_tile(s, z).floor() as u32).min(max),
     );
-    const SUB: usize = 6;
+    // finer grid when the ground has relief
+    let sub: usize = if elev.is_some() { 16 } else { 6 };
+    let mut meshes: Vec<(f32, Mesh)> = Vec::new();
     for ty in y0..=y1 {
         for tx in x0..=x1 {
             let Some(piece) = tiles.at(TileId {
@@ -1031,42 +1180,112 @@ fn draw_tiles(
             let Tile::Raster(tex) = &piece.tile else {
                 continue;
             };
+            let g = ground_grid(
+                pr,
+                sub,
+                |fx, fy| (tile_lat(ty as f64 + fy, z), tile_lon(tx as f64 + fx, z)),
+                elev,
+            );
             let mut mesh = Mesh::with_texture(tex.id());
-            let mut ok = [true; (SUB + 1) * (SUB + 1)];
-            for a in 0..=SUB {
-                for b in 0..=SUB {
-                    let (fx, fy) = (b as f64 / SUB as f64, a as f64 / SUB as f64);
-                    let la = tile_lat(ty as f64 + fy, z);
-                    let lo = tile_lon(tx as f64 + fx, z);
-                    let p = pr.geo(la, lo, 0.0);
-                    ok[a * (SUB + 1) + b] = p.is_some();
-                    let uv = piece.uv.min
-                        + vec2(piece.uv.width() * fx as f32, piece.uv.height() * fy as f32);
+            for a in 0..=sub {
+                for b in 0..=sub {
+                    let (fx, fy) = (b as f32 / sub as f32, a as f32 / sub as f32);
+                    let k = a * (sub + 1) + b;
                     mesh.vertices.push(egui::epaint::Vertex {
-                        pos: p.unwrap_or(Pos2::ZERO),
-                        uv,
-                        color: tint,
+                        pos: g.pos[k].unwrap_or(Pos2::ZERO),
+                        uv: piece.uv.min + vec2(piece.uv.width() * fx, piece.uv.height() * fy),
+                        color: shade(tint, g.shade[k]),
                     });
                 }
             }
-            for a in 0..SUB {
-                for b in 0..SUB {
-                    let i = (a * (SUB + 1) + b) as u32;
-                    let (i1, i2, i3) = (i + 1, i + (SUB + 1) as u32, i + (SUB + 2) as u32);
-                    if ok[i as usize] && ok[i1 as usize] && ok[i2 as usize] && ok[i3 as usize] {
-                        mesh.add_triangle(i, i1, i3);
-                        mesh.add_triangle(i, i3, i2);
-                    }
-                }
-            }
-            painter.add(Shape::mesh(mesh));
+            add_grid_triangles(&mut mesh, &g, sub);
+            meshes.push((g.depth, mesh));
         }
+    }
+    // far tiles first, so nearer relief paints over them
+    meshes.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (_, m) in meshes {
+        painter.add(Shape::mesh(m));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Render the draped ground of a synthetic mountain to JSON (screen polygons + shade),
+    /// for eyeballing relief, hill-shading and far-to-near order:
+    /// `WT_DUMP=out.json cargo test terrain_render_dump -- --ignored`.
+    #[test]
+    #[ignore]
+    fn terrain_render_dump() {
+        use crate::terrain::{SIZE, Terrain, tile_xy};
+        let t = Terrain::default();
+        let z = 7u8;
+        let (cx, cy) = tile_xy(46.5, 8.0, z);
+        for dx in -2i32..=2 {
+            for dy in -2i32..=2 {
+                let (tx, ty) = ((cx as i32 + dx) as u32, (cy as i32 + dy) as u32);
+                let g: Vec<f32> = (0..SIZE * SIZE)
+                    .map(|k| {
+                        let x = tx as f64 + (k % SIZE) as f64 / SIZE as f64 - cx;
+                        let y = ty as f64 + (k / SIZE) as f64 / SIZE as f64 - cy;
+                        let r2 = x * x + y * y;
+                        (3500.0 * (-r2 / 0.6).exp()
+                            + 900.0 * (-((x - 1.2).powi(2) + (y + 0.8).powi(2)) / 0.15).exp())
+                            as f32
+                    })
+                    .collect();
+                t.insert((z, tx, ty), g);
+            }
+        }
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0));
+        let cam = Camera {
+            yaw: 20.0,
+            pitch: 28.0,
+            dist: 900.0,
+            target: [0.0, 0.0, 0.0],
+            ..Camera::default()
+        };
+        let pr = Proj::new(&cam, (46.5, 8.0), 60.0, rect);
+        let mut elev = Some(t.sampler(z));
+        let sub = 16;
+        let mut out = Vec::new();
+        for tyy in (cy as u32 - 2)..=(cy as u32 + 2) {
+            for txx in (cx as u32 - 2)..=(cx as u32 + 2) {
+                let g = ground_grid(
+                    &pr,
+                    sub,
+                    |fx, fy| (tile_lat(tyy as f64 + fy, z), tile_lon(txx as f64 + fx, z)),
+                    &mut elev,
+                );
+                let n = sub + 1;
+                for &(a, b) in &g.cells {
+                    let ks = [
+                        a * n + b,
+                        a * n + b + 1,
+                        (a + 1) * n + b + 1,
+                        (a + 1) * n + b,
+                    ];
+                    if ks.iter().all(|&k| g.pos[k].is_some()) {
+                        let pts: Vec<[f32; 2]> = ks
+                            .iter()
+                            .map(|&k| {
+                                let p = g.pos[k].unwrap();
+                                [p.x, p.y]
+                            })
+                            .collect();
+                        out.push(format!(
+                            "{{\"d\":{},\"s\":{},\"p\":{:?}}}",
+                            g.depth, g.shade[ks[0]], pts
+                        ));
+                    }
+                }
+            }
+        }
+        let path = std::env::var("WT_DUMP").unwrap_or("terrain.json".into());
+        std::fs::write(path, format!("[{}]", out.join(","))).unwrap();
+    }
 
     #[test]
     fn projection_basics() {

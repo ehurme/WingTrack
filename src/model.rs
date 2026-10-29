@@ -219,6 +219,11 @@ pub struct Track {
     pub color: [u8; 3],
     /// Source file name (set by the app; used to re-parse with a different firmware profile).
     pub file: String,
+    /// Inclusive time window (unix s) the user restricted this track to; `None` = all data.
+    pub date_filter: Option<(i64, i64)>,
+    /// Fixes / sensor samples set aside by [`Track::set_date_filter`], restored when it changes.
+    pub excluded_fixes: Vec<Fix>,
+    pub excluded_sensors: Vec<SensorSample>,
 }
 
 impl Track {
@@ -233,6 +238,9 @@ impl Track {
             visible: true,
             color: [200, 200, 200],
             file: String::new(),
+            date_filter: None,
+            excluded_fixes: Vec::new(),
+            excluded_sensors: Vec::new(),
         }
     }
 
@@ -240,6 +248,44 @@ impl Track {
         let first = self.fixes.first()?.t;
         let last = self.fixes.last()?.t;
         Some((first, last))
+    }
+
+    /// Time range of all data, including fixes hidden by the date filter.
+    pub fn full_time_range(&self) -> Option<(i64, i64)> {
+        self.fixes
+            .iter()
+            .chain(&self.excluded_fixes)
+            .map(|f| f.t)
+            .fold(None, |r, t| match r {
+                None => Some((t, t)),
+                Some((a, b)) => Some((a.min(t), b.max(t))),
+            })
+    }
+
+    /// Keep only fixes and sensor samples inside `range` (inclusive); `None` restores all.
+    /// Set-aside data keeps its annotations, and step metrics are recomputed so speeds and
+    /// bearings never span a removed stretch.
+    pub fn set_date_filter(&mut self, range: Option<(i64, i64)>) {
+        self.fixes.append(&mut self.excluded_fixes);
+        self.fixes.sort_by_key(|f| f.t);
+        self.sensors.append(&mut self.excluded_sensors);
+        self.sensors.sort_by_key(|s| (s.kind, s.t));
+        self.date_filter = range;
+        if let Some((a, b)) = range {
+            let inside = |t: i64| t >= a && t <= b;
+            let (keep, out): (Vec<Fix>, Vec<Fix>) = std::mem::take(&mut self.fixes)
+                .into_iter()
+                .partition(|f| inside(f.t));
+            self.fixes = keep;
+            self.excluded_fixes = out;
+            let (keep, out): (Vec<SensorSample>, Vec<SensorSample>) =
+                std::mem::take(&mut self.sensors)
+                    .into_iter()
+                    .partition(|s| inside(s.t));
+            self.sensors = keep;
+            self.excluded_sensors = out;
+        }
+        self.compute_steps();
     }
 
     /// Sort fixes/sensors by time, drop exact duplicates, and compute step metrics.
@@ -318,4 +364,46 @@ impl Track {
 pub struct ParseOutput {
     pub tracks: Vec<Track>,
     pub warnings: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_filter_sets_aside_and_restores() {
+        let mut tr = Track::new("a", "TinyFox", "test");
+        for (i, t) in [0, 100, 200, 300, 400].into_iter().enumerate() {
+            let mut f = Fix::new(t, 47.0 + i as f64 * 0.1, 9.0, LocationSource::SigfoxAtlas);
+            f.extra.push(("n".into(), i.to_string()));
+            tr.fixes.push(f);
+            tr.sensors.push(SensorSample {
+                t,
+                kind: SensorKind::Vedba,
+                value: i as f32,
+            });
+        }
+        tr.finalize();
+        tr.set_date_filter(Some((100, 300)));
+        assert_eq!(
+            tr.fixes.iter().map(|f| f.t).collect::<Vec<_>>(),
+            vec![100, 200, 300]
+        );
+        assert_eq!(tr.sensors.len(), 3);
+        assert_eq!(tr.excluded_fixes.len(), 2);
+        // first kept fix starts a fresh step (no speed across the removed stretch)
+        assert!(tr.fixes[0].step_m.is_none());
+        assert_eq!(tr.full_time_range(), Some((0, 400)));
+        // narrowing again starts from all data, not the current subset
+        tr.set_date_filter(Some((0, 150)));
+        assert_eq!(
+            tr.fixes.iter().map(|f| f.t).collect::<Vec<_>>(),
+            vec![0, 100]
+        );
+        tr.set_date_filter(None);
+        assert_eq!(tr.fixes.len(), 5);
+        assert!(tr.excluded_fixes.is_empty() && tr.excluded_sensors.is_empty());
+        assert_eq!(tr.fixes[3].extra[0].1, "3");
+        assert!(tr.fixes[1].step_m.is_some());
+    }
 }
