@@ -29,6 +29,7 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
   | Movebank · Sigfox                     | `wildcloud_to_movebank()` uploads: Atlas locations + radius, separate VeDBA / pressure / temperature rows (3 h min pressure joined to fixes like `add_min_pressure_to_locations()`) |
   | Movebank · GPS                        | `height-above-msl/ellipsoid`, `ground-speed`, `heading`, `gps:hdop`; drops rows flagged invisible/outlier                                                                       |
   | CTT · cellular GPS                    | CTT portal exports (Time of Fix, Lat/Lng, Altitude, Speed in knots, COG, HDOP, satellites, Nav Type/Error codes) and legacy `GPS_YYYY-MM-DD_HH:MM:SS` files                           |
+| CTT · detections | CTT detection exports (`source, receiver_id, tag_id, time_utc, lat, lon, conf, rssi, payload`) from nodes / SensorStations and crowd-sourced phones: receiver positions as station fixes, same-second detections merged, `conf`/`rssi`/`source`/`receiver_id` kept |
   | Generic                                | any lat/lon/time CSV, e.g. `flatten_movedata()` output; `era5_*` / `wind_support_flight` columns from `annotate_era5()` are shown as *imported* weather                       |
 
   Column matching mirrors `harmonize_wc_columns()` in [SigfoxTagPrep](https://github.com/ehurme/SigfoxTagPrep)

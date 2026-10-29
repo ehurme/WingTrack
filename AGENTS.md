@@ -39,7 +39,7 @@ This file is written for AI coding agents. Assume the reader knows nothing about
 │   │   ├── mod.rs          # Firmware trait, registry, shared helpers
 │   │   ├── wildcloud.rs    # TinyFox / NanoFox 30Days / NanoFox FineScalePressure
 │   │   ├── movebank.rs     # Movebank Sigfox and GPS
-│   │   ├── ctt.rs          # CTT cellular GPS
+│   │   ├── ctt.rs          # CTT cellular GPS and CTT detection exports
 │   │   ├── generic.rs      # Any lat/lon/time CSV
 │   │   └── tests.rs        # Parser unit tests
 │   ├── weather.rs          # Open-Meteo request planning, cache, ERA5 annotation
