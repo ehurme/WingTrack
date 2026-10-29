@@ -78,6 +78,32 @@ fn merge_split_headers(raw: Vec<String>) -> Vec<String> {
     out
 }
 
+/// R's `write.csv` writes list/geometry columns unquoted, e.g. `c(8.99, 47.76)` or `c(NA, NA)`,
+/// so the comma inside splits one value into two fields and shifts every later column.
+/// Re-join such pieces (only called when a row has more fields than the header).
+fn merge_r_vectors(raw: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    let mut open = 0i32;
+    for f in raw {
+        if open > 0 {
+            if let Some(last) = out.last_mut() {
+                last.push_str(", ");
+                last.push_str(&f);
+            }
+        } else {
+            let t = f.trim_start();
+            if !(t.starts_with("c(") || t.starts_with("list(")) {
+                out.push(f);
+                continue;
+            }
+            out.push(f.clone());
+        }
+        open += f.matches('(').count() as i32 - f.matches(')').count() as i32;
+        open = open.max(0);
+    }
+    out
+}
+
 impl Table {
     pub fn from_bytes(name: &str, bytes: &[u8]) -> Result<Table, String> {
         let text = match std::str::from_utf8(bytes) {
@@ -114,7 +140,11 @@ impl Table {
             if rec.iter().all(|f| f.is_empty()) {
                 continue;
             }
-            rows.push(rec.iter().map(|s| s.to_string()).collect());
+            let mut fields: Vec<String> = rec.iter().map(|s| s.to_string()).collect();
+            if fields.len() > headers.len() {
+                fields = merge_r_vectors(fields);
+            }
+            rows.push(fields);
         }
         Ok(Table {
             name: name.to_string(),
@@ -288,5 +318,14 @@ mod tests {
             vec!["Device", "Base Stations (ID, RSSI, Reps)", "LQI"]
         );
         assert_eq!(t.rows[0][2], "GOOD");
+        // R list column written unquoted: c(lon, lat) / c(NA, NA)
+        let t = Table::from_str(
+            "x",
+            "a,geometry,alt,z\n1,c(8.99, 47.76),389.3,ok\n2,c(NA, NA),NA,ok\n",
+        )
+        .unwrap();
+        assert_eq!(t.rows[0], vec!["1", "c(8.99, 47.76)", "389.3", "ok"]);
+        assert_eq!(t.rows[1][2], "NA");
+        assert_eq!(t.rows[1][3], "ok");
     }
 }

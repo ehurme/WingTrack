@@ -13,6 +13,9 @@ pub enum LocationSource {
     SigfoxAtlas,
     /// Position of a receiving station (e.g. a single Sigfox base station or radio node).
     Station,
+    /// Bluetooth detection (CTT): the receiver or phone that heard the tag, with an error
+    /// radius of tens to a few hundred metres — far more precise than a Sigfox Atlas fix.
+    Bluetooth,
     /// Anything else (e.g. capture site, manually entered).
     Other,
 }
@@ -23,6 +26,7 @@ impl LocationSource {
             LocationSource::Gps => "GPS",
             LocationSource::SigfoxAtlas => "Sigfox Atlas",
             LocationSource::Station => "Station",
+            LocationSource::Bluetooth => "Bluetooth (CTT)",
             LocationSource::Other => "Other",
         }
     }

@@ -17,6 +17,13 @@ fn is_sigfox(t: &Table) -> bool {
         .any(|n| n.starts_with("sigfox_") || n.starts_with("tinyfox_") || n.starts_with("nanofox_"))
 }
 
+/// Movebank Sigfox data as exported from R (`move2` → `write.csv`) uses `lat`/`lon`.
+fn has_sigfox_core(t: &Table) -> bool {
+    t.has(&["location_lat", "lat"])
+        && t.has(&["location_long", "location_lon", "lon"])
+        && t.has(&["timestamp"])
+}
+
 fn has_movebank_core(t: &Table) -> bool {
     t.has(&["location_lat"]) && t.has(&["location_long", "location_lon"]) && t.has(&["timestamp"])
 }
@@ -66,7 +73,7 @@ impl Firmware for MovebankSigfox {
         "Movebank export of ICARUS Sigfox tags: Atlas locations with radius, separate VeDBA/pressure/temperature rows"
     }
     fn detect(&self, t: &Table) -> f32 {
-        if has_movebank_core(t) && is_sigfox(t) {
+        if has_sigfox_core(t) && is_sigfox(t) {
             0.92
         } else {
             0.0
@@ -77,11 +84,15 @@ impl Firmware for MovebankSigfox {
         let c_ts = t.col(&["timestamp"]);
         let c_start = t.col(&["start_timestamp"]);
         let c_end = t.col(&["end_timestamp"]);
-        let c_lat = t.col(&["location_lat"]);
-        let c_lon = t.col(&["location_long", "location_lon"]);
+        let c_lat = t.col(&["location_lat", "lat"]);
+        let c_lon = t.col(&["location_long", "location_lon", "lon"]);
         let c_ind = t.col(&["individual_local_identifier"]);
         let c_tag = t.col(&["tag_local_identifier"]);
-        let c_sp = t.col(&["individual_taxon_canonical_name", "taxon_canonical_name"]);
+        let c_sp = t.col(&[
+            "individual_taxon_canonical_name",
+            "taxon_canonical_name",
+            "species",
+        ]);
         let c_rad = t.col(&[
             "sigfox_computed_location_radius",
             "location_error_numerical",
@@ -141,13 +152,21 @@ impl Firmware for MovebankSigfox {
             let lat = t.num(row, c_lat);
             let lon = t.num(row, c_lon);
 
-            // Sensor values on any row.
+            // Sensor values on any row; windowed sensors (VeDBA, min pressure / temperature)
+            // are placed at the middle of their start/end window when it is given.
+            let ts_sensor = match (
+                parse_time(t.get(row, c_start)),
+                parse_time(t.get(row, c_end)),
+            ) {
+                (Some(s), Some(e)) if lat.is_none() && e >= s => (s + e) / 2,
+                _ => ts,
+            };
             let baro = t.num(row, c_baro);
             let temp = t.num(row, c_temp);
             let vedba = t.num(row, c_vedba);
-            push_sensor(tr, ts, SensorKind::Pressure, baro);
-            push_sensor(tr, ts, SensorKind::Temperature, temp);
-            push_sensor(tr, ts, SensorKind::Vedba, vedba);
+            push_sensor(tr, ts_sensor, SensorKind::Pressure, baro);
+            push_sensor(tr, ts_sensor, SensorKind::Temperature, temp);
+            push_sensor(tr, ts_sensor, SensorKind::Vedba, vedba);
             push_sensor(tr, ts, SensorKind::Activity, t.num(row, c_tf_act));
 
             match (lat, lon) {

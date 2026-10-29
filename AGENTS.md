@@ -120,7 +120,7 @@ MP4 export needs `ffmpeg` on PATH. GIF export works everywhere. On Windows the a
 ### Key abstractions
 
 - `firmware::Firmware` trait (`src/firmware/mod.rs:26`): the extension point for new tag types. Implement `id`, `label`, `description`, `detect` and `parse`, then add the struct to `registry()`.
-- `model::Fix`: one location fix. Carries source (`Gps`, `SigfoxAtlas`, `Station`, `Other`), error radius, altitude source, pressure, reported speed/heading, activity, step metrics and a `WeatherAnno`.
+- `model::Fix`: one location fix. Carries source (`Gps`, `SigfoxAtlas`, `Bluetooth`, `Station`, `Other`; every non-GPS source draws its `error_m` circle), error radius, altitude source, pressure, reported speed/heading, activity, step metrics and a `WeatherAnno`.
 - `model::SensorSample`: non-location measurement (VeDBA, temperature, pressure, activity) with a timestamp so it can be plotted.
 - `weather::WeatherStore`: cell → hour → values cache. Bins points into 0.25° ERA5 grid cells; requests are grouped by calendar month, up to 25 cells per call.
 - `wind3d::ProfileStore`: pressure-level cache shared by both 3D-wind sources. `sample()` tries the exact 0.25° cell,
@@ -219,3 +219,5 @@ Enable GitHub Pages via *Settings → Pages → Source: GitHub Actions*.
 - NASA GIBS: https://earthdata.nasa.gov/gibs
 - egui: https://github.com/emilk/egui
 - walkers: https://github.com/podusowski/walkers
+
+- `table::Table` repairs R `write.csv` rows where an unquoted `c(...)`/`list(...)` vector split across fields (only when a row has more fields than headers).
