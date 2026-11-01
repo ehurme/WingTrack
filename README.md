@@ -45,6 +45,22 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
   the end. Same rule as `detect_tag_fell_off()` in SigfoxTagPrep — TinyFox 24 h activity % (else the reset-safe
   VeDBA counter rate), NanoFox VeDBA per message, distance moved for other tags — and a `tag_fell_off` column in the
   file is used directly. The cut is a date filter, so *restore* or 📅 → *clear* undoes it.
+- **Wind turbines & tall structures** (*Wind turbines & tall structures* panel) — turbines and masts / towers /
+  chimneys from **OpenStreetMap** (Overpass API), downloaded only for a corridor of 0.5° tiles along the tracks, with
+  hub height, rotor diameter and total height from OSM tags (a typical 100 m hub / 100 m rotor is assumed and flagged
+  when missing). National registers with better metadata — Germany's Marktstammdatenregister export, the
+  [US Wind Turbine Database](https://eerscmap.usgs.gov/uswtdb/), any CSV with lat/lon (+ heights) — can be imported.
+  - 2D map: turbines (orange when within the encounter radius of a track, hover for dimensions) and a halo on the
+    steps that passed within the radius; 3D view: mast and **rotor-swept height band** at true scale, next to the
+    flight altitude.
+  - **Encounters**: each step (straight line between fixes) is checked against every structure; per track ×
+    structure the closest approach, its time, the interpolated altitude and — with tag pressure + ERA5 surface
+    pressure (after *Annotate*) — the height above ground and whether it was inside the rotor-swept zone.
+  - Exports: **encounters CSV** (one row per track × structure, with step duration and location error so Sigfox
+    uncertainty can be filtered on), **per-track summary** (turbines within the radius, per 100 km of path,
+    nearest turbine, rotor-zone encounters) and the **structures** themselves; the annotated CSV gains
+    `turbines_within_radius`, `other_structures_within_radius` and `nearest_turbine_m` per fix. Coordinates are
+    included throughout, so encounters can be joined to regions (e.g. country / département mortality estimates) in R.
 - **Satellite layers** — Esri World Imagery / OSM / topo / dark basemaps, plus **NASA GIBS daily imagery
   (MODIS Terra, MODIS Aqua, VIIRS)** that switches date with the time cursor, so you can see the fronts the animals crossed.
 - **ERA5 wind & weather** (via the [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api)):

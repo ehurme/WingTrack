@@ -145,6 +145,8 @@ pub struct Scene<'a> {
     pub source_label: String,
     pub basemap_attribution: String,
     pub max_error_m: f32,
+    /// Wind turbines & tall structures to draw at their heights.
+    pub structures: Option<crate::structures::Draw<'a>>,
 }
 
 #[derive(Default)]
@@ -661,6 +663,62 @@ impl View3D {
                     level_color(k, 255),
                 );
                 painter.circle_filled(lr.left_center() - vec2(7.0, 0.0), 4.0, level_color(k, 255));
+            }
+        }
+
+        // ---------------------------------------------------------------- structures
+        // Turbines as a mast to the bottom of the rotor plus the rotor-swept height band,
+        // so flight altitudes can be read against it (same vertical exaggeration).
+        if let Some(sd) = &scene.structures {
+            let (s, n, w, e) = view_bbox;
+            let tgt = self.cam.target;
+            let mut vis: Vec<(f32, usize)> = sd
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| {
+                    sd.params.counts(x) && x.lat >= s && x.lat <= n && x.lon >= w && x.lon <= e
+                })
+                .map(|(i, x)| {
+                    let p = pr.enu(x.lat, x.lon, 0.0);
+                    ((p[0] - tgt[0]).powi(2) + (p[1] - tgt[1]).powi(2), i)
+                })
+                .collect();
+            // the nearest few thousand, drawn far to near
+            vis.sort_by(|a, b| a.0.total_cmp(&b.0));
+            vis.truncate(4000);
+            for &(_, i) in vis.iter().rev() {
+                let x = &sd.items[i];
+                let hit = sd.hits.contains(&i);
+                let g = ground(&mut elev, x.lat, x.lon);
+                let (hub, rotor, total, _) = x.dims();
+                let Some(p0) = pr.geo(x.lat, x.lon, g) else {
+                    continue;
+                };
+                let col = if hit {
+                    Color32::from_rgb(255, 140, 30)
+                } else {
+                    Color32::from_gray(225)
+                };
+                if x.kind == crate::structures::Kind::WindTurbine {
+                    let (Some(lo), Some(hi)) = (
+                        pr.geo(x.lat, x.lon, g + hub - rotor / 2.0),
+                        pr.geo(x.lat, x.lon, g + hub + rotor / 2.0),
+                    ) else {
+                        continue;
+                    };
+                    painter.line_segment(
+                        [p0, lo],
+                        Stroke::new(1.0, Color32::from_gray(200).gamma_multiply(0.8)),
+                    );
+                    painter.line_segment([lo, hi], Stroke::new(if hit { 3.0 } else { 2.2 }, col));
+                    if let Some(h) = pr.geo(x.lat, x.lon, g + hub) {
+                        painter.circle_filled(h, if hit { 2.5 } else { 1.6 }, col);
+                    }
+                } else if let Some(top) = pr.geo(x.lat, x.lon, g + total) {
+                    painter.line_segment([p0, top], Stroke::new(1.2, col.gamma_multiply(0.75)));
+                    painter.circle_filled(top, 1.5, col);
+                }
             }
         }
 

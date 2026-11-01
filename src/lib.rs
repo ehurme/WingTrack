@@ -18,6 +18,7 @@ pub mod geo;
 pub mod model;
 pub mod prefs;
 pub mod share;
+pub mod structures;
 pub mod table;
 pub mod terrain;
 pub mod tiles;

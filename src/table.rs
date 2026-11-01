@@ -20,6 +20,12 @@ pub fn normalize_header(h: &str) -> String {
         .replace('\u{a0}', " ");
     let mut out = String::with_capacity(h.len());
     let mut last_us = true;
+    // German exports (Marktstammdatenregister, ...): "Nabenhöhe" → "nabenhoehe"
+    let h = h
+        .replace(['ä', 'Ä'], "ae")
+        .replace(['ö', 'Ö'], "oe")
+        .replace(['ü', 'Ü'], "ue")
+        .replace('ß', "ss");
     for ch in h.chars().flat_map(|c| c.to_lowercase()) {
         if ch.is_ascii_alphanumeric() {
             out.push(ch);

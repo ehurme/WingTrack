@@ -50,6 +50,16 @@ enum Msg {
         run: u64,
         result: Result<(u16, Vec<u8>), String>,
     },
+    /// An Overpass (OpenStreetMap) answer for a batch of structure tiles.
+    Overpass {
+        tiles: Vec<crate::structures::Tile>,
+        result: Result<String, String>,
+    },
+    /// A wind-turbine / structure register CSV picked by the user.
+    StructFile {
+        name: String,
+        bytes: Vec<u8>,
+    },
     /// An ERA5 wind-cube file picked by the user.
     Cube {
         name: String,
@@ -118,6 +128,22 @@ struct CdsRun {
     /// Don't poll again before this time (app clock, s).
     next_at: f64,
     polls: u32,
+}
+
+/// Structures to draw on the map, and the steps to highlight (if on).
+type StructLayer<'a> = (
+    crate::structures::Draw<'a>,
+    Option<&'a HashSet<(usize, usize)>>,
+);
+
+/// Structures analysis for the current tracks, store and parameters.
+struct StCache {
+    key: u64,
+    a: crate::structures::Analysis,
+    /// Structures within the radius of any visible track.
+    hits: HashSet<usize>,
+    /// (track, fix) whose arriving step passed within the radius of a turbine.
+    near: HashSet<(usize, usize)>,
 }
 
 /// Parallel CDS jobs (the CDS also queues per user, so more doesn't help).
@@ -419,6 +445,19 @@ pub struct WingApp {
     /// Track whose date-range editor is open, with the From / To text.
     date_edit: Option<usize>,
     falloff: crate::falloff::Params,
+    // wind turbines & tall structures
+    st_on: bool,
+    st_params: crate::structures::Params,
+    st_highlight: bool,
+    st_store: crate::structures::StructureStore,
+    st_queue: VecDeque<Vec<crate::structures::Tile>>,
+    st_busy: bool,
+    st_server: usize,
+    st_retry: HashMap<Vec<crate::structures::Tile>, u8>,
+    st_next_at: f64,
+    st_planned: Option<u64>,
+    st_failed: usize,
+    st_cache: Option<StCache>,
     date_from: String,
     date_to: String,
     chart_var: ChartVar,
@@ -575,6 +614,18 @@ impl WingApp {
             selected_track: None,
             date_edit: None,
             falloff: crate::falloff::Params::default(),
+            st_on: false,
+            st_params: crate::structures::Params::default(),
+            st_highlight: true,
+            st_store: Default::default(),
+            st_queue: VecDeque::new(),
+            st_busy: false,
+            st_server: 0,
+            st_retry: HashMap::new(),
+            st_next_at: 0.0,
+            st_planned: None,
+            st_failed: 0,
+            st_cache: None,
             date_from: String::new(),
             date_to: String::new(),
             chart_var: ChartVar::Altitude,
@@ -989,6 +1040,18 @@ impl WingApp {
             })
             .collect();
         m.set_if(!ranges.is_empty(), "dr", ranges.join(";"));
+        let sp = &self.st_params;
+        m.set_if(
+            self.st_on,
+            "st",
+            format!(
+                "{},{},{},{}",
+                r(sp.radius_m as f64, 0),
+                sp.include_other as u8,
+                r(sp.min_other_height_m as f64, 0),
+                self.st_highlight as u8
+            ),
+        );
         let cols: Vec<String> = (0..self.tracks.len())
             .map(|i| {
                 let c = self.tracks[i].color;
@@ -1028,6 +1091,14 @@ impl WingApp {
 
     /// Settings that don't depend on the data.
     fn apply_share_settings(&mut self, m: &ShareMap) {
+        let stv = m.nums("st");
+        self.st_on = m.get("st").is_some();
+        if let [radius, other, minh, hl, ..] = stv[..] {
+            self.st_params.radius_m = (radius as f32).clamp(10.0, 50_000.0);
+            self.st_params.include_other = other != 0.0;
+            self.st_params.min_other_height_m = minh as f32;
+            self.st_highlight = hl != 0.0;
+        }
         use share::from_name;
         if let Some(t) = m.get("tab") {
             self.view_tab = if t == "3d" {
@@ -1673,8 +1744,34 @@ impl WingApp {
     }
 
     fn export(&mut self) {
-        let csv = crate::export::to_csv(self.tracks.iter().filter(|t| t.visible));
-        let name = "wingtrack_annotated.csv";
+        let mut tracks: Vec<Track> = Vec::new();
+        for (ti, tr) in self.tracks.iter().enumerate().filter(|(_, t)| t.visible) {
+            let mut tr = tr.clone();
+            if let Some(c) = self.st_cache.as_ref().filter(|_| self.st_on) {
+                let r = format!("{:.0}", c.a.params.radius_m);
+                for (fi, f) in tr.fixes.iter_mut().enumerate() {
+                    let (nt, no, near) =
+                        c.a.per_fix.get(&(ti, fi)).copied().unwrap_or((0, 0, None));
+                    f.extra.push(("structure_radius_m".into(), r.clone()));
+                    f.extra
+                        .push(("turbines_within_radius".into(), nt.to_string()));
+                    f.extra
+                        .push(("other_structures_within_radius".into(), no.to_string()));
+                    f.extra.push((
+                        "nearest_turbine_m".into(),
+                        near.map(|d| format!("{d:.0}")).unwrap_or_default(),
+                    ));
+                }
+            }
+            tracks.push(tr);
+        }
+        let csv = crate::export::to_csv(tracks.iter());
+        self.save_csv("wingtrack_annotated.csv", csv);
+    }
+
+    /// Save a CSV (file dialog on desktop, download in the browser).
+    fn save_csv(&mut self, name: &str, csv: String) {
+        let name = name.to_string();
         #[cfg(not(target_arch = "wasm32"))]
         {
             let tx = self.tx.clone();
@@ -1694,11 +1791,324 @@ impl WingApp {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let msg = match web_download(name, csv.as_bytes(), "text/csv") {
+            let msg = match web_download(&name, csv.as_bytes(), "text/csv") {
                 Ok(()) => format!("Downloaded {name}"),
                 Err(e) => format!("! download failed: {e}"),
             };
             self.status(msg);
+        }
+    }
+
+    // ------------------------------------------------------------------ structures
+
+    /// Queue OpenStreetMap downloads for the corridor around the visible tracks.
+    fn plan_structures(&mut self) {
+        if !self.st_on || self.tracks.is_empty() {
+            return;
+        }
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (self.visible_key(), self.st_params.radius_m.to_bits()).hash(&mut h);
+            h.finish()
+        };
+        if self.st_planned == Some(key) {
+            return;
+        }
+        self.st_planned = Some(key);
+        let buffer = (self.st_params.radius_m as f64).max(2000.0);
+        let queued: HashSet<crate::structures::Tile> =
+            self.st_queue.iter().flatten().copied().collect();
+        let tiles: Vec<crate::structures::Tile> =
+            crate::structures::corridor_tiles(&self.tracks, buffer)
+                .into_iter()
+                .filter(|t| !self.st_store.tiles.contains(t) && !queued.contains(t))
+                .collect();
+        if tiles.is_empty() {
+            return;
+        }
+        let n = tiles.len();
+        for c in tiles.chunks(crate::structures::TILES_PER_QUERY) {
+            self.st_queue.push_back(c.to_vec());
+        }
+        self.status(format!(
+            "OpenStreetMap: wind turbines & tall structures for {n} tile(s) of {}° along the tracks",
+            crate::structures::TILE_DEG
+        ));
+    }
+
+    /// One Overpass request at a time (the public servers allow very few per IP).
+    fn pump_structures(&mut self, ctx: &egui::Context) {
+        if self.st_busy || self.st_queue.is_empty() {
+            return;
+        }
+        if self.now < self.st_next_at {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
+        let Some(tiles) = self.st_queue.pop_front() else {
+            return;
+        };
+        let server =
+            crate::structures::OVERPASS[self.st_server % crate::structures::OVERPASS.len()];
+        let mut req = crate::structures::overpass_request(server, &tiles, true);
+        req.timeout = Some(std::time::Duration::from_secs(200));
+        self.st_busy = true;
+        let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+        ehttp::fetch(req, move |res| {
+            let result = match res {
+                Ok(r) if r.ok => r
+                    .text()
+                    .map(str::to_string)
+                    .ok_or_else(|| "non-UTF8 body".into()),
+                Ok(r) => Err(format!(
+                    "HTTP {} {}",
+                    r.status,
+                    r.text()
+                        .map(|t| t.chars().take(300).collect::<String>())
+                        .unwrap_or_default()
+                )),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(Msg::Overpass { tiles, result });
+            ctx2.request_repaint();
+        });
+    }
+
+    fn on_overpass(&mut self, tiles: Vec<crate::structures::Tile>, result: Result<String, String>) {
+        self.st_busy = false;
+        match result.and_then(|b| crate::structures::parse_overpass(&b)) {
+            Ok(v) => {
+                let n = self.st_store.add(v);
+                self.st_store.tiles.extend(tiles.iter().copied());
+                if self.st_queue.is_empty() {
+                    self.status(format!(
+                        "OpenStreetMap structures loaded: {} in total (+{n})",
+                        self.st_store.items.len()
+                    ));
+                }
+            }
+            Err(e) => {
+                let tries = self.st_retry.entry(tiles.clone()).or_insert(0);
+                *tries += 1;
+                if *tries <= 2 {
+                    // busy / timed out: other server, short pause, retry
+                    self.st_server += 1;
+                    self.st_next_at = self.now + 10.0 * *tries as f64;
+                    self.st_queue.push_front(tiles);
+                    self.status(format!("Overpass: {e} - retrying"));
+                } else {
+                    self.st_failed += tiles.len();
+                    self.st_store.tiles.extend(tiles.iter().copied());
+                    self.status(format!(
+                        "! Overpass failed for {} tile(s): {e}",
+                        tiles.len()
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Recompute encounters when tracks, structures, annotations or parameters change.
+    fn ensure_st_cache(&mut self) {
+        if !self.st_on || self.st_store.is_empty() {
+            self.st_cache = None;
+            return;
+        }
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let p = &self.st_params;
+            (
+                self.visible_key(),
+                self.st_store.version,
+                p.radius_m.to_bits(),
+                p.min_other_height_m.to_bits(),
+                p.include_other,
+            )
+                .hash(&mut h);
+            // annotations (surface pressure → height above ground)
+            let annotated: usize = self
+                .tracks
+                .iter()
+                .map(|t| {
+                    t.fixes
+                        .iter()
+                        .filter(|f| f.weather.surface_pressure_hpa.is_some())
+                        .count()
+                })
+                .sum();
+            annotated.hash(&mut h);
+            h.finish()
+        };
+        if self.st_cache.as_ref().is_some_and(|c| c.key == key) {
+            return;
+        }
+        let a = crate::structures::analyse(&self.tracks, &self.st_store, &self.st_params);
+        let hits = a.encounters.iter().map(|e| e.structure).collect();
+        let near = a
+            .per_fix
+            .iter()
+            .filter(|(_, v)| v.0 > 0)
+            .map(|(k, _)| *k)
+            .collect();
+        self.st_cache = Some(StCache { key, a, hits, near });
+    }
+
+    fn open_structures_dialog(&self, ctx: &egui::Context) {
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("Structure / turbine table", &["csv", "txt", "gz"])
+                .pick_file()
+            {
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                match std::fs::read(&p) {
+                    Ok(bytes) => {
+                        let _ = tx.send(Msg::StructFile { name, bytes });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Status(format!("! {}: {e}", p.display())));
+                    }
+                }
+                ctx.request_repaint();
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(f) = rfd::AsyncFileDialog::new()
+                .add_filter("Structure / turbine table", &["csv", "txt", "gz"])
+                .pick_file()
+                .await
+            {
+                let bytes = f.read().await;
+                let _ = tx.send(Msg::StructFile {
+                    name: f.file_name(),
+                    bytes,
+                });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn structures_panel(&mut self, ui: &mut egui::Ui) {
+        use crate::structures::{self as st, Kind};
+        ui.checkbox(&mut self.st_on, "show & analyse")
+            .on_hover_text("Download wind turbines and tall structures along the tracks from OpenStreetMap and count encounters");
+        if !self.st_on {
+            ui.weak("Wind turbines and masts / towers / chimneys from OpenStreetMap, or a turbine register you import.");
+            return;
+        }
+        let items = &self.st_store.items;
+        let turb = items.iter().filter(|s| s.kind == Kind::WindTurbine).count();
+        let with_dims = items
+            .iter()
+            .filter(|s| s.kind == Kind::WindTurbine && !s.dims().3)
+            .count();
+        ui.label(format!(
+            "{turb} wind turbines ({with_dims} with hub height & rotor size) · {} other structures",
+            items.len() - turb
+        ));
+        if !self.st_queue.is_empty() || self.st_busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak(format!(
+                    "OpenStreetMap: {} request(s) to go",
+                    self.st_queue.len() + self.st_busy as usize
+                ));
+            });
+        }
+        if self.st_failed > 0 {
+            ui.colored_label(
+                Color32::from_rgb(255, 180, 80),
+                format!(
+                    "{} tile(s) failed to download - 'reload' retries",
+                    self.st_failed
+                ),
+            );
+        }
+        let p = &mut self.st_params;
+        ui.add(
+            egui::Slider::new(&mut p.radius_m, 100.0..=20_000.0)
+                .logarithmic(true)
+                .suffix(" m")
+                .text("encounter radius"),
+        )
+        .on_hover_text("A structure counts as encountered when a step (straight line between fixes) passes within this distance. Sigfox location errors are km-scale: see location_error_m in the export.");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut p.include_other, "masts, towers, chimneys");
+            ui.add_enabled(
+                p.include_other,
+                egui::Slider::new(&mut p.min_other_height_m, 0.0..=300.0)
+                    .suffix(" m")
+                    .text("min. height"),
+            );
+        });
+        ui.checkbox(&mut self.st_highlight, "highlight steps near turbines");
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("Import register CSV…")
+                .on_hover_text("Any table with latitude/longitude (+ height, hub_height, rotor_diameter): Marktstammdatenregister export, US Wind Turbine Database, a structures CSV from WingTrack…")
+                .clicked()
+            {
+                self.open_structures_dialog(ui.ctx());
+            }
+            if ui.button("reload").on_hover_text("Forget downloaded tiles and fetch again").clicked() {
+                self.st_store.clear();
+                self.st_failed = 0;
+                self.st_retry.clear();
+                self.st_planned = None;
+                self.st_queue.clear();
+            }
+        });
+        let Some(c) = &self.st_cache else {
+            return;
+        };
+        let sums = st::summaries(&self.tracks, &self.st_store, &c.a);
+        let total: usize = c.hits.len();
+        ui.label(format!(
+            "{total} structure(s) within {:.0} m of the tracks",
+            c.a.params.radius_m
+        ));
+        egui::ScrollArea::vertical().max_height(180.0).id_salt("st_sum").show(ui, |ui| {
+            egui::Grid::new("st_grid").striped(true).show(ui, |ui| {
+                ui.strong("track");
+                ui.strong("turbines");
+                ui.strong("/100 km");
+                ui.strong("nearest");
+                ui.strong("rotor zone").on_hover_text("Encounters with height above ground (tag pressure vs ERA5 surface pressure, needs Annotate) inside the rotor-swept band");
+                ui.end_row();
+                for sm in &sums {
+                    ui.label(&self.tracks[sm.track].id);
+                    ui.label(format!("{}{}", sm.turbines, if sm.other > 0 { format!(" (+{} other)", sm.other) } else { String::new() }));
+                    ui.label(format!("{:.1}", sm.per_100km));
+                    ui.label(sm.nearest_turbine_m.map(|d| format!("{d:.0} m")).unwrap_or("-".into()));
+                    ui.label(if sm.with_agl > 0 { format!("{}/{}", sm.in_rotor_zone, sm.with_agl) } else { "-".into() });
+                    ui.end_row();
+                }
+            });
+        });
+        let mut save: Option<(&str, String)> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("export:");
+            if ui.button("encounters").on_hover_text("One row per track × structure within the radius: distance, time, altitude, rotor zone, structure metadata").clicked() {
+                save = Some(("wingtrack_encounters.csv", st::encounters_csv(&self.tracks, &self.st_store, &c.a)));
+            }
+            if ui.button("per-track summary").clicked() {
+                save = Some(("wingtrack_structure_summary.csv", st::summary_csv(&self.tracks, &self.st_store, &c.a)));
+            }
+            if ui.button("structures").on_hover_text("All loaded turbines / structures (re-importable)").clicked() {
+                save = Some(("wingtrack_structures.csv", st::structures_csv(&self.st_store)));
+            }
+        });
+        ui.weak("Per-fix counts (turbines_within_radius, nearest_turbine_m) are added to the annotated CSV export. Structures © OpenStreetMap contributors (ODbL).");
+        if let Some((name, csv)) = save {
+            self.save_csv(name, csv);
         }
     }
 
@@ -2565,6 +2975,22 @@ impl WingApp {
                     self.on_download_complete();
                 }
                 Msg::Cds { run, result } => self.on_cds_response(run, result),
+                Msg::Overpass { tiles, result } => self.on_overpass(tiles, result),
+                Msg::StructFile { name, bytes } => {
+                    match crate::table::Table::from_bytes(&name, &bytes)
+                        .and_then(|t| crate::structures::from_table(&t))
+                    {
+                        Ok(v) => {
+                            let n = v.len();
+                            let new = self.st_store.add(v);
+                            self.st_on = true;
+                            self.status(format!(
+                                "{name}: imported {n} structures ({new} new) - kept alongside OpenStreetMap"
+                            ));
+                        }
+                        Err(e) => self.status(format!("! {name}: {e}")),
+                    }
+                }
             }
         }
     }
@@ -3266,6 +3692,11 @@ impl WingApp {
                 }
             });
 
+            // ---- wind turbines & structures
+            egui::CollapsingHeader::new("Wind turbines & tall structures").default_open(false).show(ui, |ui| {
+                self.structures_panel(ui);
+            });
+
             // ---- display
             egui::CollapsingHeader::new("Display").default_open(true).show(ui, |ui| {
                 egui::ComboBox::from_label("colour by").selected_text(self.color_by.label()).show_ui(ui, |ui| {
@@ -3662,6 +4093,16 @@ impl WingApp {
                 hide_insignificant: self.hide_insignificant,
                 color_by: self.color_by,
             },
+            structs: self.st_cache.as_ref().filter(|_| self.st_on).map(|c| {
+                (
+                    crate::structures::Draw {
+                        items: &self.st_store.items,
+                        hits: &c.hits,
+                        params: self.st_params,
+                    },
+                    self.st_highlight.then_some(&c.near),
+                )
+            }),
             out: &mut interaction,
         };
 
@@ -3866,6 +4307,13 @@ impl WingApp {
             source_label: self.profiles.source.label(),
             basemap_attribution: attribution,
             max_error_m: self.max_error_km * 1000.0,
+            structures: self.st_cache.as_ref().filter(|_| self.st_on).map(|c| {
+                crate::structures::Draw {
+                    items: &self.st_store.items,
+                    hits: &c.hits,
+                    params: self.st_params,
+                }
+            }),
         };
         let out = self.view3d.show(ui, scene);
         if let Some(sel) = out.clicked {
@@ -4521,6 +4969,9 @@ impl eframe::App for WingApp {
         }
         self.pump_weather(ctx);
         self.pump_cds(ctx);
+        self.plan_structures();
+        self.pump_structures(ctx);
+        self.ensure_st_cache();
         self.record_tick(ctx);
         if self.playing {
             let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
@@ -4672,6 +5123,8 @@ struct TrackLayer<'a> {
     store: &'a WeatherStore,
     selected: Option<(usize, usize)>,
     app: ViewCfg,
+    /// Wind turbines & structures, plus steps to highlight.
+    structs: Option<StructLayer<'a>>,
     out: &'a mut Interaction,
 }
 
@@ -4766,6 +5219,115 @@ impl Plugin for TrackLayer<'_> {
                 }
                 let c = pal.color(ws / 20.0).gamma_multiply(0.9);
                 painter.arrow(p - dir * 0.5, dir, Stroke::new(1.6, c));
+            }
+        }
+
+        // Wind turbines & tall structures, and the steps that passed close to turbines.
+        if let Some((sd, near)) = &self.structs {
+            if let Some(near) = near {
+                let halo = Color32::from_rgba_unmultiplied(255, 120, 20, 110);
+                for &(ti, fi) in near.iter() {
+                    let Some(tr) = self.tracks.get(ti).filter(|t| t.visible) else {
+                        continue;
+                    };
+                    if fi == 0 || fi >= tr.fixes.len() {
+                        continue;
+                    }
+                    let (a, b) = (&tr.fixes[fi - 1], &tr.fixes[fi]);
+                    painter.line_segment(
+                        [to_screen(a.lat, a.lon), to_screen(b.lat, b.lon)],
+                        Stroke::new(8.0, halo),
+                    );
+                }
+            }
+            let ppm = projector.scale_pixel_per_meter(projector.unproject(clip.center().to_vec2()));
+            let mut hovered: Option<(f32, usize, Pos2)> = None;
+            for (i, s) in sd.items.iter().enumerate() {
+                if !sd.params.counts(s) {
+                    continue;
+                }
+                let p = to_screen(s.lat, s.lon);
+                if !clip.expand(10.0).contains(p) {
+                    continue;
+                }
+                let hit = sd.hits.contains(&i);
+                let fill = if hit {
+                    Color32::from_rgb(255, 140, 30)
+                } else {
+                    Color32::from_gray(235)
+                };
+                let (_, rotor, _, _) = s.dims();
+                if s.kind == crate::structures::Kind::WindTurbine {
+                    let r = (rotor / 2.0 * ppm).clamp(2.0, 12.0);
+                    if r < 4.0 {
+                        painter.circle(
+                            p,
+                            2.2,
+                            fill,
+                            Stroke::new(0.6, Color32::from_black_alpha(200)),
+                        );
+                    } else {
+                        // three blades
+                        for k in 0..3 {
+                            let a = std::f32::consts::TAU * k as f32 / 3.0
+                                - std::f32::consts::FRAC_PI_2;
+                            painter.line_segment(
+                                [p, p + vec2(a.cos(), a.sin()) * r],
+                                Stroke::new(1.8, Color32::from_black_alpha(170)),
+                            );
+                            painter.line_segment(
+                                [p, p + vec2(a.cos(), a.sin()) * r],
+                                Stroke::new(1.0, fill),
+                            );
+                        }
+                        painter.circle_filled(p, 1.8, fill);
+                    }
+                } else {
+                    let r = 3.2;
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![p + vec2(0.0, -r * 1.3), p + vec2(r, r), p + vec2(-r, r)],
+                        if hit { fill } else { Color32::from_gray(170) },
+                        Stroke::new(0.6, Color32::from_black_alpha(200)),
+                    ));
+                }
+                if let Some(h) = hover_pos {
+                    let d = h.distance(p);
+                    if d < 7.0 && hovered.is_none_or(|x| d < x.0) {
+                        hovered = Some((d, i, p));
+                    }
+                }
+            }
+            if let Some((_, i, p)) = hovered {
+                let s = &sd.items[i];
+                let (hub, rotor, total, est) = s.dims();
+                let dims = if s.kind == crate::structures::Kind::WindTurbine {
+                    format!("hub {hub:.0} m · rotor {rotor:.0} m · tip {total:.0} m")
+                } else {
+                    format!("{total:.0} m")
+                };
+                let txt = format!(
+                    "{}{} - {dims}{}\n{} {}",
+                    s.kind.label(),
+                    s.name.as_ref().map(|n| format!(" {n}")).unwrap_or_default(),
+                    if est { " (estimated)" } else { "" },
+                    s.source,
+                    s.id
+                );
+                let r = painter.text(
+                    p + vec2(10.0, 10.0),
+                    Align2::LEFT_TOP,
+                    &txt,
+                    FontId::proportional(12.0),
+                    Color32::WHITE,
+                );
+                painter.rect_filled(r.expand(3.0), 3.0, Color32::from_black_alpha(170));
+                painter.text(
+                    p + vec2(10.0, 10.0),
+                    Align2::LEFT_TOP,
+                    &txt,
+                    FontId::proportional(12.0),
+                    Color32::WHITE,
+                );
             }
         }
 
@@ -5157,6 +5719,10 @@ mod share_tests {
         a.set_date_filter(&[2], Some(dr));
         assert!(!a.tracks[2].excluded_fixes.is_empty());
         a.view3d.terrain = true;
+        a.st_on = true;
+        a.st_params.radius_m = 2500.0;
+        a.st_params.include_other = false;
+        a.st_highlight = false;
         a.selected_track = Some(2);
         a.selected = Some((0, 5));
         a.map_center = Some((45.5, 7.25));
@@ -5187,6 +5753,12 @@ mod share_tests {
         assert_eq!(b.tracks[2].date_filter, Some(dr));
         assert_eq!(b.tracks[2].fixes.len(), a.tracks[2].fixes.len());
         assert!(b.view3d.terrain);
+        assert!(
+            b.st_on
+                && b.st_params.radius_m == 2500.0
+                && !b.st_params.include_other
+                && !b.st_highlight
+        );
         assert_eq!(b.selected, Some((0, 5)));
         assert_eq!(b.selected_track, Some(2));
         assert_eq!(b.t_now, a.t_now.round());
