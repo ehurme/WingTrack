@@ -23,7 +23,8 @@ pub const OM_API: &str = "https://historical-forecast-api.open-meteo.com/v1/fore
 /// Pressure levels requested from Open-Meteo (≈ 110 m … 3 km).
 pub const OM_LEVELS: [u16; 8] = [1000, 975, 950, 925, 900, 850, 800, 700];
 /// Locations per request: each location asks for 33 variables, so keep requests modest.
-const CELLS_PER_REQUEST: usize = 10;
+/// Locations per pressure-level request (many variables per location).
+const CELLS_PER_REQUEST: usize = 20;
 const G0: f32 = 9.80665;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

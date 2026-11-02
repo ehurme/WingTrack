@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # weekly rebuild: refreshes the IBTrACS cyclone files served with the web app
+  schedule:
+    - cron: "17 4 * * 1"
 
 permissions:
   contents: read
@@ -54,6 +57,12 @@ jobs:
           version: latest
       # Relative public URL so the site works under https://<user>.github.io/<repo>/
       - run: trunk build --release --public-url ./
+      # Tropical-cyclone best tracks (NOAA IBTrACS) as small per-year CSVs next to the app:
+      # NOAA's servers don't allow browser requests, GitHub Pages does. Best effort.
+      - name: IBTrACS cyclone files
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: python3 tools/ibtracs_years.py dist/data/ibtracs
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

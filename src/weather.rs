@@ -41,7 +41,8 @@ const PRECIP: usize = 7;
 const CLOUD: usize = 8;
 
 /// Locations per request (keeps URLs short and responses small).
-const CELLS_PER_REQUEST: usize = 25;
+/// Locations per Open-Meteo request: fewer, larger requests ride out overloads better.
+const CELLS_PER_REQUEST: usize = 50;
 
 pub type CellKey = (i32, i32);
 pub type Values = [f32; NV];

@@ -93,8 +93,9 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
     **isobars** every 4 hPa and **L / H pressure centres**; a low is flagged as a **storm** (red ring) when it is
     ≤ 995 hPa or has gale-force (≥ 17.2 m/s) 10 m wind nearby.
   - **Tropical cyclones** from [IBTrACS](https://www.ncei.noaa.gov/products/international-best-track-archive)
-    (NOAA NCEI best tracks: hurricanes, typhoons, cyclones): *Load for the tracks* asks NOAA AOML's ERDDAP for
-    storms within ±25° of the tracks during their time span; *Import IBTrACS CSV…* takes any NCEI IBTrACS file.
+    (NOAA NCEI best tracks: hurricanes, typhoons, cyclones): *Load for the tracks* reads per-year files that CI
+    builds weekly from NCEI and publishes with the web app (`tools/ibtracs_years.py`; NOAA's servers don't allow
+    browser requests), falling back to NOAA AOML's ERDDAP (desktop), for storms within ±25° of the tracks; *Import IBTrACS CSV…* takes any NCEI IBTrACS file.
     Tracks are coloured by Saffir–Simpson category, the storm at the cursor is labelled with category and wind,
     the panel lists each storm's closest approach to an animal, and the annotated CSV gains `tc_name`,
     `tc_distance_km`, `tc_wind_kt` and `tc_category` (nearest cyclone within 1500 km of each fix).
@@ -114,6 +115,11 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
     week at a time as you move through time, optionally night cells only. The arrow palette has a default per basemap
     (bright on satellite imagery, viridis on street/topo maps) and can be changed per basemap. Requests are throttled to
     Open-Meteo's free limits (600 calls/min, 5 000/h) and retried after a rate-limit response.
+  - **When Open-Meteo is busy** ("The service is overloaded", HTTP 5xx, timeouts, network errors) requests are
+    retried with exponential back-off (20 s → 10 min, 6 attempts) while the queue drops to one request at a
+    time, and the cells are only marked as downloaded on success. Requests that still fail are kept:
+    *Retry failed (n)* queues them again, *Cancel downloads* stops the queue (resume with *Retry failed*).
+    Along-track annotation goes ahead of the wind fields around the animals, which are most of the requests.
   - **Data source and quotas.** Requests go from your browser straight to the data provider. Open-Meteo's free tier
     is limited **per IP address** (600 calls/min, 5 000/h, 10 000/day) — not shared by all WingTrack users, but shared
     by everyone behind the same network address (an institute, a VPN). The ERA5 panel shows why downloads are
