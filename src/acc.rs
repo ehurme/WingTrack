@@ -36,6 +36,8 @@ pub struct Burst {
     /// Sampling rate per axis (Hz).
     pub sr: f32,
     pub xyz: Vec<[f32; 3]>,
+    /// Behaviour annotated in the file (Firetail / Movebank `annotation-layer-*`).
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,20 +182,89 @@ pub fn eobs_slope(tag: &str) -> f64 {
     }
 }
 
+/// Known e-obs slopes (g per count) to snap an estimate to.
+const EOBS_SLOPES: [f64; 4] = [0.001, 0.0022, 0.0027, 1.0 / 512.0];
+
+/// Identifier from a file name: `tag_1940-annotated-bursts-gps.csv` → `tag_1940`.
+pub fn id_from_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let stem = base.split('.').next().unwrap_or(base);
+    for cut in [
+        "-annotated",
+        "_annotated",
+        "-bursts",
+        "_bursts",
+        "-acc",
+        "_acc",
+    ] {
+        if let Some(i) = stem.find(cut)
+            && i > 0
+        {
+            return stem[..i].to_string();
+        }
+    }
+    stem.to_string()
+}
+
+/// Behaviour label of a row from `annotation-layer-<behaviour>` columns (non-empty cell).
+fn row_label(t: &Table, row: &[String], cols: &[(usize, String)]) -> Option<String> {
+    let v: Vec<&str> = cols
+        .iter()
+        .filter(|(c, _)| !t.get(row, Some(*c)).trim().is_empty())
+        .map(|(_, n)| n.as_str())
+        .collect();
+    // one behaviour per burst; overlapping annotations are ambiguous
+    (v.len() == 1).then(|| v[0].to_string())
+}
+
+/// `annotation-layer-*` columns as (index, behaviour name).
+pub fn label_columns(t: &Table) -> Vec<(usize, String)> {
+    t.headers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, h)| {
+            let h = h.trim().trim_matches('"');
+            let lower = h.to_lowercase();
+            ["annotation-layer-", "annotation_layer_", "annotation:"]
+                .iter()
+                .find_map(|p| lower.starts_with(p).then(|| h[p.len()..].to_string()))
+                .map(|n| (i, n))
+        })
+        .collect()
+}
+
+/// One e-obs burst row before calibration.
+struct RawBurst {
+    ts: i64,
+    sr: f32,
+    axes: Vec<usize>,
+    raw: Vec<f64>,
+    label: Option<String>,
+}
+
 fn read_eobs(t: &Table, c_raw: usize, opt: &ReadOptions) -> Result<Vec<AccSet>, String> {
     let c_id = t.col(&[
         "individual_local_identifier",
         "individual_id",
         "tag_local_identifier",
+        "tag_serial_number",
     ]);
-    let c_tag = t.col(&["tag_local_identifier", "tag_id"]);
+    let c_tag = t.col(&["tag_local_identifier", "tag_id", "tag_serial_number"]);
     let c_sr = t.col(&[
         "eobs_acceleration_sampling_frequency_per_axis",
         "acceleration_sampling_frequency_per_axis",
     ]);
     let c_axes = t.col(&["eobs_acceleration_axes", "acceleration_axes"]);
-    let c_t = t.col(&["eobs_start_timestamp", "start_timestamp", "timestamp"]);
-    let mut sets: HashMap<String, AccSet> = HashMap::new();
+    let c_t = t.col(&[
+        "eobs_start_timestamp",
+        "burst_start_timestamp",
+        "start_timestamp",
+        "timestamp",
+    ]);
+    let labels = label_columns(t);
+    let fallback_id = id_from_name(&t.name);
+    // id → (tag, bursts)
+    let mut by: HashMap<String, (String, Vec<RawBurst>)> = HashMap::new();
     for row in &t.rows {
         let Some(ts) = crate::table::parse_time_ms(t.get(row, c_t)) else {
             continue;
@@ -215,30 +286,90 @@ fn read_eobs(t: &Table, c_raw: usize, opt: &ReadOptions) -> Result<Vec<AccSet>, 
                 .collect();
             if v.is_empty() { vec![0, 1, 2] } else { v }
         };
-        let tag = t.get(row, c_tag).to_string();
-        let slope = opt.eobs_slope.unwrap_or_else(|| eobs_slope(&tag));
         let raw: Vec<f64> = row[c_raw]
             .split_whitespace()
             .filter_map(|s| s.parse::<f64>().ok())
             .collect();
-        let xyz: Vec<[f32; 3]> = raw
-            .chunks_exact(axes.len())
-            .map(|c| {
-                let mut v = [0.0f32; 3];
-                for (k, &a) in axes.iter().enumerate() {
-                    v[a] = ((c[k] - 2048.0) * slope) as f32;
-                }
-                v
-            })
-            .collect();
-        if xyz.len() < 4 {
+        if raw.len() < 4 * axes.len() {
             continue;
         }
-        let id = Some(t.get(row, c_id).to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| tag.clone());
-        let set = sets.entry(id.clone()).or_insert_with(|| AccSet {
-            id,
+        let tag = t.get(row, c_tag).trim().to_string();
+        // serial "0" / empty: name the animal after the file
+        let id = Some(t.get(row, c_id).trim().to_string())
+            .filter(|s| !s.is_empty() && s != "0")
+            .unwrap_or_else(|| fallback_id.clone());
+        by.entry(id)
+            .or_insert_with(|| (tag, Vec::new()))
+            .1
+            .push(RawBurst {
+                ts,
+                sr,
+                axes,
+                raw,
+                label: row_label(t, row, &labels),
+            });
+    }
+    let mut sets: HashMap<String, AccSet> = HashMap::new();
+    for (id, (tag, rows)) in by {
+        // Units: e-obs counts (0–4095 integers, centred on 2048) or values already in a
+        // physical unit (signed / fractional). Without a known tag generation the scale
+        // is set so calm bursts read 1 g (counts: snapped to a known e-obs slope).
+        let counts = rows.iter().all(|r| {
+            r.raw
+                .iter()
+                .all(|&v| (0.0..=4095.0).contains(&v) && v.fract() == 0.0)
+        });
+        let off = if counts { 2048.0 } else { 0.0 };
+        let known = tag.parse::<u32>().is_ok_and(|n| n > 0);
+        let (slope, how) = if let Some(s) = opt.eobs_slope {
+            (s, "set by hand".to_string())
+        } else if counts && known {
+            (eobs_slope(&tag), format!("e-obs tag {tag} generation"))
+        } else {
+            let mut calm: Vec<(f64, f64)> = rows
+                .iter()
+                .map(|r| {
+                    let k = r.axes.len();
+                    let n = (r.raw.len() / k) as f64;
+                    let mut m = [0.0f64; 3];
+                    let mut v = [0.0f64; 3];
+                    for (i, &x) in r.raw.iter().enumerate() {
+                        m[i % k] += (x - off) / n;
+                    }
+                    for (i, &x) in r.raw.iter().enumerate() {
+                        v[i % k] += (x - off - m[i % k]).powi(2) / n;
+                    }
+                    let sd = (v[0] + v[1] + v[2]).sqrt();
+                    (sd, (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt())
+                })
+                .collect();
+            calm.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let q = &calm[..(calm.len() / 4).max(1)];
+            let mut g: Vec<f64> = q.iter().map(|x| x.1).collect();
+            let units_per_g = median(&mut g);
+            let est = if units_per_g > 0.0 {
+                1.0 / units_per_g
+            } else {
+                1.0
+            };
+            let snap = EOBS_SLOPES
+                .iter()
+                .copied()
+                .min_by(|a, b| (a / est).ln().abs().total_cmp(&(b / est).ln().abs()))
+                .filter(|s| counts && (s / est).ln().abs() < 0.3);
+            match snap {
+                Some(s) => (
+                    s,
+                    format!("calm bursts ≈ 1 g ({:.4}), snapped to e-obs slope", est),
+                ),
+                None => (
+                    est,
+                    format!("calm bursts = 1 g ({units_per_g:.0} units per g)"),
+                ),
+            }
+        };
+        let mut set = AccSet {
+            id: id.clone(),
             file: t.name.clone(),
             format: Format::MovebankEobs,
             bursts: Vec::new(),
@@ -246,9 +377,28 @@ fn read_eobs(t: &Table, c_raw: usize, opt: &ReadOptions) -> Result<Vec<AccSet>, 
             start_ms: None,
             clock_rate: 0.0,
             track: None,
-            notes: vec![("g per count".into(), format!("{slope}"))],
-        });
-        push_windows(&mut set.bursts, ts, sr, xyz, opt.window_s);
+            notes: vec![
+                ("g per unit".into(), format!("{slope:.6}")),
+                ("scale".into(), how),
+                ("offset".into(), format!("{off}")),
+            ],
+        };
+        for r in rows {
+            let xyz: Vec<[f32; 3]> = r
+                .raw
+                .chunks_exact(r.axes.len())
+                .map(|c| {
+                    let mut v = [0.0f32; 3];
+                    for (k, &a) in r.axes.iter().enumerate() {
+                        v[a] = ((c[k] - off) * slope) as f32;
+                    }
+                    v
+                })
+                .collect();
+            // e-obs bursts are analysed whole (as annotated); only continuous data is windowed
+            push_windows(&mut set.bursts, r.ts, r.sr, xyz, f64::INFINITY, r.label);
+        }
+        sets.insert(id, set);
     }
     finish(sets)
 }
@@ -345,7 +495,14 @@ fn read_per_sample(t: &Table, opt: &ReadOptions) -> Result<Vec<AccSet>, String> 
         let mut prev = v[0].0;
         for &(ts, a) in &v {
             if ts - prev > (2.5 * dt) as i64 && !cur.is_empty() {
-                push_windows(&mut bursts, t0, sr, std::mem::take(&mut cur), opt.window_s);
+                push_windows(
+                    &mut bursts,
+                    t0,
+                    sr,
+                    std::mem::take(&mut cur),
+                    opt.window_s,
+                    None,
+                );
                 t0 = ts;
             }
             if cur.is_empty() {
@@ -358,7 +515,7 @@ fn read_per_sample(t: &Table, opt: &ReadOptions) -> Result<Vec<AccSet>, String> 
             ]);
             prev = ts;
         }
-        push_windows(&mut bursts, t0, sr, cur, opt.window_s);
+        push_windows(&mut bursts, t0, sr, cur, opt.window_s, None);
         sets.insert(
             id.clone(),
             AccSet {
@@ -453,7 +610,7 @@ fn read_fleatag(name: &str, text: &str, opt: &ReadOptions) -> Result<AccSet, Str
             .position(|r| r.0 != b)
             .map_or(rows.len(), |k| i + k);
         let xyz: Vec<[f32; 3]> = rows[i..j].iter().map(|r| r.2).collect();
-        push_windows(&mut bursts, rows[i].1, sr, xyz, opt.window_s);
+        push_windows(&mut bursts, rows[i].1, sr, xyz, opt.window_s, None);
         i = j;
     }
     if id.is_empty() {
@@ -507,14 +664,26 @@ pub fn start_from_name(name: &str) -> Option<i64> {
 }
 
 /// Append a burst, cut into windows of `window_s` when it is much longer (continuous data).
-fn push_windows(out: &mut Vec<Burst>, t_ms: i64, sr: f32, xyz: Vec<[f32; 3]>, window_s: f64) {
+fn push_windows(
+    out: &mut Vec<Burst>,
+    t_ms: i64,
+    sr: f32,
+    xyz: Vec<[f32; 3]>,
+    window_s: f64,
+    label: Option<String>,
+) {
     if xyz.len() < 4 {
         return;
     }
     // at least 8 samples per window (0.45 Hz FleaTag mode → ~18 s windows)
     let w = ((window_s * sr as f64).round() as usize).max(8);
-    if xyz.len() <= 2 * w {
-        out.push(Burst { t_ms, sr, xyz });
+    if !window_s.is_finite() || xyz.len() <= 2 * w {
+        out.push(Burst {
+            t_ms,
+            sr,
+            xyz,
+            label,
+        });
         return;
     }
     for (k, c) in xyz.chunks(w).enumerate() {
@@ -523,6 +692,7 @@ fn push_windows(out: &mut Vec<Burst>, t_ms: i64, sr: f32, xyz: Vec<[f32; 3]>, wi
                 t_ms: t_ms + (k as f64 * w as f64 * 1000.0 / sr as f64).round() as i64,
                 sr,
                 xyz: c.to_vec(),
+                label: label.clone(),
             });
         }
     }
@@ -677,23 +847,27 @@ pub struct Params {
     /// Behavioural clusters (0 = off).
     pub k: usize,
     pub window_s: f32,
+    /// Classify behaviour from annotated bursts (kNN) when the files carry labels.
+    pub use_labels: bool,
 }
 
 impl Default for Params {
     fn default() -> Self {
         Params {
-            band: (4.0, 20.0),
+            band: (2.0, 20.0),
             flight_g: 0.5,
             min_peak_frac: 0.0,
             clip_g: 7.9,
             k: 4,
             window_s: 1.0,
+            use_labels: true,
         }
     }
 }
 
 /// Wingbeat bands used in the flea scripts and typical for e-obs bats.
-pub const BAND_PRESETS: [(&str, (f32, f32)); 5] = [
+pub const BAND_PRESETS: [(&str, (f32, f32)); 6] = [
+    ("bats & birds (2–20 Hz)", (2.0, 20.0)),
     ("bats (4–20 Hz)", (4.0, 20.0)),
     ("birds (2–15 Hz)", (2.0, 15.0)),
     ("butterflies (4–14 Hz)", (4.0, 14.0)),
@@ -857,6 +1031,25 @@ impl Features {
         self.dyn_sd > p.flight_g && (p.min_peak_frac <= 0.0 || self.peak_frac >= p.min_peak_frac)
     }
 
+    /// Vector for the behaviour classifier: the clustering features plus amplitude,
+    /// static magnitude, axis shares and wingbeat frequency.
+    fn vector_full(&self, band: (f32, f32)) -> Vec<f64> {
+        let mut v = self.vector().to_vec();
+        v.extend([
+            (self.vedba as f64 + 0.01).log10(),
+            (self.peak_g as f64).ln_1p(),
+            self.static_g as f64,
+            self.share[0] as f64,
+            self.share[1] as f64,
+            self.share[2] as f64,
+            // wingbeat only means something with a clear peak
+            self.wbf_hz
+                .filter(|_| self.peak_frac > 0.2)
+                .map_or(0.0, |w| ((w - band.0) / (band.1 - band.0).max(0.1)) as f64),
+        ]);
+        v
+    }
+
     /// Standardisable vector for clustering (activity, posture, rhythm, axis structure).
     fn vector(&self) -> [f64; 8] {
         let r = (self.roll_deg as f64).to_radians();
@@ -1007,14 +1200,28 @@ pub fn cluster(feats: &[&Features], k: usize) -> Vec<usize> {
 
 // ---------------------------------------------------------------- analysis
 
-/// Features of every burst of every set, with absolute times, flight flags and clusters.
+/// One analysed burst.
+#[derive(Clone, Debug)]
+pub struct Row {
+    /// Features, with `t_ms` in absolute unix ms.
+    pub f: Features,
+    pub flight: bool,
+    pub cluster: usize,
+    /// Annotated behaviour (index into `Analysis::classes`).
+    pub label: Option<usize>,
+    /// Predicted behaviour (kNN trained on the labelled bursts).
+    pub behaviour: Option<usize>,
+}
+
+/// Features of every burst of every set, with flight flags, clusters and behaviour.
 #[derive(Default)]
 pub struct Analysis {
-    /// Per set: (features with absolute t_ms, flight, cluster).
-    pub per_set: Vec<Vec<(Features, bool, usize)>>,
+    pub per_set: Vec<Vec<Row>>,
     pub params: Params,
-    /// Per cluster: (n, mean dyn SD, median wingbeat Hz, mean pitch, flight share).
     pub clusters: Vec<ClusterInfo>,
+    /// Behaviour classes from the files' annotations (sorted).
+    pub classes: Vec<String>,
+    pub classifier: Option<ClassifierReport>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1025,10 +1232,78 @@ pub struct ClusterInfo {
     pub pitch_deg: f32,
     pub flight_frac: f32,
     pub peak_frac: f32,
+    /// Share of each annotated behaviour among the labelled bursts of this cluster.
+    pub label_frac: Vec<f32>,
+}
+
+/// Cross-validated performance of the behaviour classifier.
+#[derive(Clone, Debug, Default)]
+pub struct ClassifierReport {
+    pub n_train: usize,
+    pub k: usize,
+    pub accuracy: f32,
+    /// Mean of the per-class recalls (robust to one dominant behaviour).
+    pub balanced_accuracy: f32,
+    /// confusion[true][predicted]
+    pub confusion: Vec<Vec<usize>>,
+    pub folds: usize,
+}
+
+const KNN_K: usize = 7;
+const MAX_TRAIN: usize = 4000;
+/// Annotated bursts a behaviour needs to become a class.
+const MIN_CLASS: usize = 10;
+
+fn standardise(x: &mut [Vec<f64>]) {
+    if x.is_empty() {
+        return;
+    }
+    let d = x[0].len();
+    let n = x.len() as f64;
+    for j in 0..d {
+        let mu = x.iter().map(|v| v[j]).sum::<f64>() / n;
+        let sd = (x.iter().map(|v| (v[j] - mu).powi(2)).sum::<f64>() / n).sqrt();
+        for v in x.iter_mut() {
+            v[j] = if sd > 1e-12 { (v[j] - mu) / sd } else { 0.0 };
+        }
+    }
+}
+
+/// Majority vote (distance-weighted) of the k nearest training points.
+fn knn(train: &[(Vec<f64>, usize)], q: &[f64], k: usize, n_cls: usize) -> usize {
+    let mut best: Vec<(f64, usize)> = Vec::with_capacity(k + 1);
+    for (x, c) in train {
+        let d: f64 = x.iter().zip(q).map(|(a, b)| (a - b).powi(2)).sum();
+        if best.len() < k || d < best[best.len() - 1].0 {
+            let pos = best.partition_point(|e| e.0 <= d);
+            best.insert(pos, (d, *c));
+            best.truncate(k);
+        }
+    }
+    let mut votes = vec![0.0f64; n_cls];
+    for (d, c) in best {
+        votes[c] += 1.0 / (d.sqrt() + 1e-6);
+    }
+    (0..n_cls)
+        .max_by(|&a, &b| votes[a].total_cmp(&votes[b]))
+        .unwrap_or(0)
 }
 
 pub fn analyse(sets: &[AccSet], p: &Params) -> Analysis {
-    let mut per_set: Vec<Vec<(Features, bool, usize)>> = sets
+    // behaviours with at least MIN_CLASS annotated bursts (stray layers are ignored)
+    let mut count: HashMap<&str, usize> = HashMap::new();
+    for b in sets.iter().flat_map(|s| s.bursts.iter()) {
+        if let Some(l) = &b.label {
+            *count.entry(l.as_str()).or_default() += 1;
+        }
+    }
+    let mut classes: Vec<String> = count
+        .into_iter()
+        .filter(|(_, n)| *n >= MIN_CLASS)
+        .map(|(l, _)| l.to_string())
+        .collect();
+    classes.sort();
+    let mut per_set: Vec<Vec<Row>> = sets
         .iter()
         .map(|s| {
             s.bursts
@@ -1037,48 +1312,142 @@ pub fn analyse(sets: &[AccSet], p: &Params) -> Analysis {
                     let t = s.abs_ms(b)?;
                     let mut f = features(b, p);
                     f.t_ms = t;
-                    let fl = f.is_flight(p);
-                    Some((f, fl, 0))
+                    let flight = f.is_flight(p);
+                    let label = b
+                        .label
+                        .as_ref()
+                        .and_then(|l| classes.iter().position(|c| c == l));
+                    Some(Row {
+                        f,
+                        flight,
+                        cluster: 0,
+                        label,
+                        behaviour: None,
+                    })
                 })
                 .collect()
         })
         .collect();
     // one clustering over all animals, so cluster numbers mean the same thing everywhere
-    let all: Vec<&Features> = per_set.iter().flatten().map(|x| &x.0).collect();
+    let all: Vec<&Features> = per_set.iter().flatten().map(|x| &x.f).collect();
     let labels = cluster(&all, p.k);
     let mut it = labels.into_iter();
     for v in &mut per_set {
         for x in v.iter_mut() {
-            x.2 = it.next().unwrap_or(0);
+            x.cluster = it.next().unwrap_or(0);
         }
     }
+    let classifier = if p.use_labels && classes.len() >= 2 {
+        classify(&mut per_set, &classes, p)
+    } else {
+        None
+    };
     let k = p.k.max(1);
     let mut clusters = vec![ClusterInfo::default(); k];
     let mut wbfs: Vec<Vec<f64>> = vec![Vec::new(); k];
-    for (f, fl, c) in per_set.iter().flatten() {
-        let ci = &mut clusters[(*c).min(k - 1)];
+    let mut lab: Vec<Vec<f32>> = vec![vec![0.0; classes.len()]; k];
+    for r in per_set.iter().flatten() {
+        let c = r.cluster.min(k - 1);
+        let ci = &mut clusters[c];
         ci.n += 1;
-        ci.dyn_sd += f.dyn_sd;
-        ci.pitch_deg += f.pitch_deg;
-        ci.peak_frac += f.peak_frac;
-        ci.flight_frac += *fl as u8 as f32;
-        if let Some(w) = f.wbf_hz.filter(|_| f.peak_frac > 0.2) {
-            wbfs[(*c).min(k - 1)].push(w as f64);
+        ci.dyn_sd += r.f.dyn_sd;
+        ci.pitch_deg += r.f.pitch_deg;
+        ci.peak_frac += r.f.peak_frac;
+        ci.flight_frac += r.flight as u8 as f32;
+        if let Some(w) = r.f.wbf_hz.filter(|_| r.f.peak_frac > 0.2) {
+            wbfs[c].push(w as f64);
+        }
+        if let Some(l) = r.label {
+            lab[c][l] += 1.0;
         }
     }
-    for (ci, w) in clusters.iter_mut().zip(wbfs.iter_mut()) {
+    for ((ci, w), l) in clusters.iter_mut().zip(wbfs.iter_mut()).zip(lab) {
         let n = ci.n.max(1) as f32;
         ci.dyn_sd /= n;
         ci.pitch_deg /= n;
         ci.peak_frac /= n;
         ci.flight_frac /= n;
         ci.wbf_hz = (!w.is_empty()).then(|| median(w) as f32);
+        let s: f32 = l.iter().sum();
+        ci.label_frac = l
+            .iter()
+            .map(|x| if s > 0.0 { x / s } else { 0.0 })
+            .collect();
     }
     Analysis {
         per_set,
         params: *p,
         clusters,
+        classes,
+        classifier,
     }
+}
+
+/// kNN behaviour classifier trained on labelled bursts (≤ 6000, evenly spaced), with
+/// 5-fold cross-validation over contiguous time blocks (neighbouring bursts are alike,
+/// so random folds would overstate accuracy); predicts every burst.
+fn classify(per_set: &mut [Vec<Row>], classes: &[String], p: &Params) -> Option<ClassifierReport> {
+    let mut x: Vec<Vec<f64>> = per_set
+        .iter()
+        .flatten()
+        .map(|r| r.f.vector_full(p.band))
+        .collect();
+    standardise(&mut x);
+    let rows: Vec<(usize, usize)> = per_set
+        .iter()
+        .enumerate()
+        .flat_map(|(s, v)| (0..v.len()).map(move |i| (s, i)))
+        .collect();
+    let mut lab: Vec<(i64, usize, usize)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(gi, &(s, i))| per_set[s][i].label.map(|l| (per_set[s][i].f.t_ms, gi, l)))
+        .collect();
+    if lab.len() < 20 {
+        return None;
+    }
+    lab.sort_by_key(|x| x.0);
+    let stride = lab.len().div_ceil(MAX_TRAIN).max(1);
+    let lab: Vec<(i64, usize, usize)> = lab.into_iter().step_by(stride).collect();
+    let n_cls = classes.len();
+    let k = KNN_K.min(lab.len() / 4).max(1);
+    let folds = 5usize.min(lab.len() / 10).max(2);
+    let mut confusion = vec![vec![0usize; n_cls]; n_cls];
+    let block = lab.len().div_ceil(folds);
+    for f in 0..folds {
+        let (a, b) = (f * block, ((f + 1) * block).min(lab.len()));
+        let train: Vec<(Vec<f64>, usize)> = lab
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i < a || *i >= b)
+            .map(|(_, &(_, gi, l))| (x[gi].clone(), l))
+            .collect();
+        for &(_, gi, l) in &lab[a..b] {
+            confusion[l][knn(&train, &x[gi], k, n_cls)] += 1;
+        }
+    }
+    let correct: usize = (0..n_cls).map(|i| confusion[i][i]).sum();
+    let total: usize = confusion.iter().flatten().sum();
+    let train: Vec<(Vec<f64>, usize)> = lab.iter().map(|&(_, gi, l)| (x[gi].clone(), l)).collect();
+    for (gi, &(s, i)) in rows.iter().enumerate() {
+        per_set[s][i].behaviour = Some(knn(&train, &x[gi], k, n_cls));
+    }
+    let recalls: Vec<f32> = confusion
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            let n: usize = row.iter().sum();
+            (n > 0).then(|| row[i] as f32 / n as f32)
+        })
+        .collect();
+    Some(ClassifierReport {
+        n_train: train.len(),
+        k,
+        accuracy: correct as f32 / total.max(1) as f32,
+        balanced_accuracy: recalls.iter().sum::<f32>() / recalls.len().max(1) as f32,
+        confusion,
+        folds,
+    })
 }
 
 /// Summary of the bursts during the step that arrived at a fix.
@@ -1094,6 +1463,9 @@ pub struct FixAcc {
     /// Most frequent cluster, and the share of bursts in each cluster.
     pub cluster: Option<usize>,
     pub cluster_frac: Vec<f32>,
+    /// Most frequent predicted behaviour, and the share of each (see `Analysis::classes`).
+    pub behaviour: Option<usize>,
+    pub behaviour_frac: Vec<f32>,
 }
 
 /// Per fix of `tr` (index → summary) from the sets assigned to it. The window of fix i is
@@ -1101,10 +1473,11 @@ pub struct FixAcc {
 pub fn summarise_track(tr: &Track, sets: &[usize], a: &Analysis) -> HashMap<usize, FixAcc> {
     let mut out = HashMap::new();
     let k = a.params.k.max(1);
-    let mut rows: Vec<&(Features, bool, usize)> =
-        sets.iter().flat_map(|&s| a.per_set[s].iter()).collect();
-    rows.sort_by_key(|r| r.0.t_ms);
+    let nb = a.classes.len();
+    let mut rows: Vec<&Row> = sets.iter().flat_map(|&s| a.per_set[s].iter()).collect();
+    rows.sort_by_key(|r| r.f.t_ms);
     let mut j = 0;
+    let mode = |v: &[f32]| (0..v.len()).max_by(|&x, &y| v[x].total_cmp(&v[y]));
     for (i, f) in tr.fixes.iter().enumerate() {
         let lo = if i == 0 {
             f.t * 1000 - 3_600_000
@@ -1112,11 +1485,11 @@ pub fn summarise_track(tr: &Track, sets: &[usize], a: &Analysis) -> HashMap<usiz
             tr.fixes[i - 1].t * 1000
         };
         let hi = f.t * 1000;
-        while j < rows.len() && rows[j].0.t_ms <= lo {
+        while j < rows.len() && rows[j].f.t_ms <= lo {
             j += 1;
         }
         let mut e = j;
-        while e < rows.len() && rows[e].0.t_ms <= hi {
+        while e < rows.len() && rows[e].f.t_ms <= hi {
             e += 1;
         }
         let w = &rows[j..e];
@@ -1125,27 +1498,36 @@ pub fn summarise_track(tr: &Track, sets: &[usize], a: &Analysis) -> HashMap<usiz
         }
         let n = w.len() as f32;
         let mut cf = vec![0.0f32; k];
+        let mut bf = vec![0.0f32; nb];
+        let mut nbh = 0.0f32;
         for r in w {
-            cf[r.2.min(k - 1)] += 1.0 / n;
+            cf[r.cluster.min(k - 1)] += 1.0 / n;
+            if let Some(b) = r.behaviour {
+                bf[b] += 1.0;
+                nbh += 1.0;
+            }
+        }
+        if nbh > 0.0 {
+            bf.iter_mut().for_each(|x| *x /= nbh);
         }
         let mut wbf: Vec<f64> = w
             .iter()
-            .filter(|r| r.1)
-            .filter_map(|r| r.0.wbf_hz.map(|x| x as f64))
+            .filter(|r| r.flight)
+            .filter_map(|r| r.f.wbf_hz.map(|x| x as f64))
             .collect();
         out.insert(
             i,
             FixAcc {
                 n: w.len(),
-                flight_frac: w.iter().filter(|r| r.1).count() as f32 / n,
-                dyn_sd: w.iter().map(|r| r.0.dyn_sd).sum::<f32>() / n,
-                vedba: w.iter().map(|r| r.0.vedba).sum::<f32>() / n,
+                flight_frac: w.iter().filter(|r| r.flight).count() as f32 / n,
+                dyn_sd: w.iter().map(|r| r.f.dyn_sd).sum::<f32>() / n,
+                vedba: w.iter().map(|r| r.f.vedba).sum::<f32>() / n,
                 wbf_hz: (!wbf.is_empty()).then(|| median(&mut wbf) as f32),
-                pitch_deg: w.iter().map(|r| r.0.pitch_deg).sum::<f32>() / n,
-                cluster: (a.params.k >= 2)
-                    .then(|| (0..k).max_by(|&x, &y| cf[x].total_cmp(&cf[y])))
-                    .flatten(),
+                pitch_deg: w.iter().map(|r| r.f.pitch_deg).sum::<f32>() / n,
+                cluster: if a.params.k >= 2 { mode(&cf) } else { None },
                 cluster_frac: if a.params.k >= 2 { cf } else { Vec::new() },
+                behaviour: if nbh > 0.0 { mode(&bf) } else { None },
+                behaviour_frac: if nbh > 0.0 { bf } else { Vec::new() },
             },
         );
         j = e;
@@ -1153,7 +1535,7 @@ pub fn summarise_track(tr: &Track, sets: &[usize], a: &Analysis) -> HashMap<usiz
     out
 }
 
-/// One row per burst with all features, flight flag and cluster.
+/// One row per burst with all features, flight flag, cluster, annotation and prediction.
 pub fn bursts_csv(sets: &[AccSet], a: &Analysis, track_of: impl Fn(usize) -> String) -> String {
     let mut w = csv::Writer::from_writer(Vec::new());
     let _ = w.write_record([
@@ -1186,10 +1568,17 @@ pub fn bursts_csv(sets: &[AccSet], a: &Analysis, track_of: impl Fn(usize) -> Str
         "pc1_frac",
         "flight",
         "cluster",
+        "behaviour_annotated",
+        "behaviour_predicted",
     ]);
+    let cls = |i: Option<usize>| {
+        i.and_then(|i| a.classes.get(i).cloned())
+            .unwrap_or_default()
+    };
     for (si, set) in sets.iter().enumerate() {
         let trk = track_of(si);
-        for (f, fl, c) in &a.per_set[si] {
+        for r in &a.per_set[si] {
+            let f = &r.f;
             let o = |v: Option<f32>| v.map(|x| format!("{x:.3}")).unwrap_or_default();
             let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(f.t_ms)
                 .map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
@@ -1222,12 +1611,14 @@ pub fn bursts_csv(sets: &[AccSet], a: &Analysis, track_of: impl Fn(usize) -> Str
                 format!("{:.3}", f.spec_entropy),
                 o(f.harm_ratio),
                 format!("{:.3}", f.pc1_frac),
-                fl.to_string(),
+                r.flight.to_string(),
                 if a.params.k >= 2 {
-                    format!("C{}", c + 1)
+                    format!("C{}", r.cluster + 1)
                 } else {
                     String::new()
                 },
+                cls(r.label),
+                cls(r.behaviour),
             ]);
         }
     }
@@ -1254,7 +1645,12 @@ mod tests {
                 ]
             })
             .collect();
-        Burst { t_ms, sr, xyz }
+        Burst {
+            t_ms,
+            sr,
+            xyz,
+            label: None,
+        }
     }
 
     #[test]
@@ -1309,7 +1705,7 @@ mod tests {
             notes: vec![],
         };
         let a = analyse(&[set], &p);
-        let lab: Vec<usize> = a.per_set[0].iter().map(|x| x.2).collect();
+        let lab: Vec<usize> = a.per_set[0].iter().map(|x| x.cluster).collect();
         // every flight burst in the most dynamic cluster (C3), postures split in C1/C2
         for i in 0..30 {
             assert_eq!(lab[3 * i], 2);
@@ -1410,6 +1806,70 @@ mod tests {
         assert!((v[0].bursts[0].sr - 25.0).abs() < 0.5);
         // a GPS file is not ACC
         assert!(!sniff("gps.csv", b"timestamp,location-lat,location-long\n"));
+    }
+
+    #[test]
+    fn firetail_annotated_bursts() {
+        // Firetail / Movebank export: gps + acc rows, tag serial 0, behaviour layers,
+        // counts with no known tag generation → scale from calm bursts, snapped to 0.0027
+        let burst = |fly: bool| -> String {
+            (0..60)
+                .map(|i| {
+                    let ph = std::f64::consts::TAU * 3.2 * i as f64 / 18.74;
+                    let z = 2048.0
+                        + 370.0
+                        + if fly {
+                            250.0 * ph.sin()
+                        } else {
+                            (i % 2) as f64
+                        };
+                    format!("2048 2048 {}", z.round())
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut csv = String::from(
+            "type,tag-serial-number,timestamp,eobs_acceleration_axes,eobs_acceleration_sampling_frequency_per_axis,eobs_accelerations_raw,location_lat,location_long,annotation-layer-commuting,annotation-layer-resting\n",
+        );
+        for i in 0..30 {
+            let fly = i % 3 == 0;
+            csv.push_str(&format!(
+                "acc,0,2012-04-24 12:{:02}:00.000,\"XYZ\",18.74,\"{}\",,,{},{}\n",
+                i,
+                burst(fly),
+                if fly { "l1-31" } else { "" },
+                if fly { "" } else { "l1-11" }
+            ));
+        }
+        csv.push_str("gps,0,2012-04-24 12:31:32.001,,,,13.505,101.166,,l1-01\n");
+        let v = read(
+            "tag_1940-annotated-bursts-gps.csv",
+            csv.as_bytes(),
+            &ReadOptions::default(),
+        )
+        .unwrap();
+        let s = &v[0];
+        assert_eq!(s.id, "tag_1940", "serial 0 → file name");
+        assert_eq!(s.bursts.len(), 30, "e-obs bursts stay whole");
+        assert_eq!(s.notes[0].1, "0.002700");
+        assert_eq!(s.bursts[0].label.as_deref(), Some("commuting"));
+        assert_eq!(s.bursts[1].label.as_deref(), Some("resting"));
+        let a = analyse(
+            &v,
+            &Params {
+                k: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(a.classes, vec!["commuting", "resting"]);
+        let rep = a.classifier.unwrap();
+        assert!(rep.balanced_accuracy > 0.95, "{rep:?}");
+        let f = &a.per_set[0][0].f;
+        assert!((f.wbf_hz.unwrap() - 3.2).abs() < 0.3);
+        assert_eq!(
+            id_from_name("individual_Mviv17_29-annotated-bursts.csv"),
+            "individual_Mviv17_29"
+        );
     }
 
     #[test]

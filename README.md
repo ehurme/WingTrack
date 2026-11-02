@@ -57,6 +57,15 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
     entropy, 2nd-harmonic ratio, PC1 share; **flight** = dynamic SD above a threshold (optionally with a clear
     wingbeat peak); **behaviour clusters** = k-means on standardised activity, posture, rhythm and axis features,
     one clustering across all animals, numbered from calmest (C1) to most dynamic, with a profile table.
+  - **Firetail / Movebank annotated bursts** (`type`, `tag-serial-number`, `eobs_accelerations_raw`,
+    `annotation-layer-<behaviour>`): `gps` rows become a track named after the file, `acc` rows its bursts (kept
+    whole), and each annotation layer a behaviour. Without a known e-obs tag the scale is set so calm bursts read
+    1 g (count data snapped to the nearest e-obs slope; data already in another unit are rescaled the same way).
+  - **Behaviour classification**: with annotations, a 7-nearest-neighbour classifier on the burst features is
+    trained on the annotated bursts and labels every burst; the panel shows 5-fold **time-blocked**
+    cross-validation (accuracy, balanced accuracy and the confusion matrix) and which behaviours each k-means
+    cluster contains. Colour fixes by predicted behaviour; the annotated CSV gains `acc_behaviour` and
+    `acc_frac_<behaviour>`.
   - Each fix is annotated with the bursts of the step that arrived at it (flight share, dynamic SD, VeDBA, median
     wingbeat frequency of flight bursts, pitch, dominant cluster and cluster shares): colour tracks by flight share,
     wingbeat frequency or cluster; chart any per-burst metric over time; view the burst at the cursor (x/y/z

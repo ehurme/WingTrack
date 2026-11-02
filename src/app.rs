@@ -198,10 +198,11 @@ enum ColorBy {
     AccFlight,
     AccWbf,
     AccCluster,
+    AccBehaviour,
 }
 
 impl ColorBy {
-    const ALL: [ColorBy; 9] = [
+    const ALL: [ColorBy; 10] = [
         ColorBy::Individual,
         ColorBy::WindSupport,
         ColorBy::SegmentWind,
@@ -211,6 +212,7 @@ impl ColorBy {
         ColorBy::AccFlight,
         ColorBy::AccWbf,
         ColorBy::AccCluster,
+        ColorBy::AccBehaviour,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -223,6 +225,7 @@ impl ColorBy {
             ColorBy::AccFlight => "ACC: flight share of the step",
             ColorBy::AccWbf => "ACC: wingbeat frequency",
             ColorBy::AccCluster => "ACC: behaviour cluster",
+            ColorBy::AccBehaviour => "ACC: behaviour (from annotations)",
         }
     }
 }
@@ -339,6 +342,7 @@ enum AccMetric {
     Wbf,
     Pitch,
     Cluster,
+    Behaviour,
 }
 
 impl AccMetric {
@@ -349,15 +353,18 @@ impl AccMetric {
             AccMetric::Wbf => "ACC: wingbeat frequency of flight bursts (Hz)",
             AccMetric::Pitch => "ACC: pitch (posture, °)",
             AccMetric::Cluster => "ACC: behaviour cluster per burst",
+            AccMetric::Behaviour => "ACC: predicted behaviour per burst (from annotations)",
         }
     }
-    fn of(self, f: &crate::acc::Features, flight: bool, cluster: usize) -> Option<f64> {
+    fn of(self, r: &crate::acc::Row) -> Option<f64> {
+        let f = &r.f;
         match self {
             AccMetric::DynSd => Some(f.dyn_sd as f64),
             AccMetric::Vedba => Some(f.vedba as f64),
-            AccMetric::Wbf => f.wbf_hz.filter(|_| flight).map(|x| x as f64),
+            AccMetric::Wbf => f.wbf_hz.filter(|_| r.flight).map(|x| x as f64),
             AccMetric::Pitch => Some(f.pitch_deg as f64),
-            AccMetric::Cluster => Some(cluster as f64 + 1.0),
+            AccMetric::Cluster => Some(r.cluster as f64 + 1.0),
+            AccMetric::Behaviour => r.behaviour.map(|b| b as f64 + 1.0),
         }
     }
 }
@@ -372,6 +379,18 @@ const CLUSTER_COLORS: [Color32; 8] = [
     Color32::from_rgb(215, 48, 39),
     Color32::from_rgb(118, 42, 131),
     Color32::from_rgb(165, 0, 38),
+];
+
+/// Behaviour colours (Okabe–Ito), in the order of the annotated classes.
+const BEHAVIOUR_COLORS: [Color32; 8] = [
+    Color32::from_rgb(0, 114, 178),
+    Color32::from_rgb(230, 159, 0),
+    Color32::from_rgb(0, 158, 115),
+    Color32::from_rgb(204, 121, 167),
+    Color32::from_rgb(86, 180, 233),
+    Color32::from_rgb(213, 94, 0),
+    Color32::from_rgb(240, 228, 66),
+    Color32::from_rgb(160, 160, 160),
 ];
 
 /// An acceleration file as loaded (kept to re-read with other settings / share by URL).
@@ -391,7 +410,7 @@ struct AccCache {
 }
 
 impl ChartVar {
-    const ALL: [ChartVar; 25] = [
+    const ALL: [ChartVar; 26] = [
         ChartVar::Curtain,
         ChartVar::Profile,
         ChartVar::FlightSupport,
@@ -416,6 +435,7 @@ impl ChartVar {
         ChartVar::Acc(AccMetric::Wbf),
         ChartVar::Acc(AccMetric::Pitch),
         ChartVar::Acc(AccMetric::Cluster),
+        ChartVar::Acc(AccMetric::Behaviour),
         ChartVar::AccBurst,
     ];
     fn label(self) -> &'static str {
@@ -1922,8 +1942,9 @@ impl WingApp {
         let mut tracks: Vec<Track> = Vec::new();
         for (ti, tr) in self.tracks.iter().enumerate().filter(|(_, t)| t.visible) {
             let mut tr = tr.clone();
-            if self.acc_cache.is_some() {
+            if let Some(ac) = &self.acc_cache {
                 let k = self.acc_params.k;
+                let classes = ac.a.classes.clone();
                 for f in tr.fixes.iter_mut() {
                     let a = f.acc.as_deref();
                     let o = |v: Option<f32>, d: usize| {
@@ -1943,6 +1964,20 @@ impl WingApp {
                         .push(("acc_wbf_hz".into(), o(a.and_then(|a| a.wbf_hz), 2)));
                     f.extra
                         .push(("acc_pitch_deg".into(), o(a.map(|a| a.pitch_deg), 1)));
+                    if !classes.is_empty() {
+                        f.extra.push((
+                            "acc_behaviour".into(),
+                            a.and_then(|a| a.behaviour)
+                                .and_then(|b| classes.get(b).cloned())
+                                .unwrap_or_default(),
+                        ));
+                        for (bi, name) in classes.iter().enumerate() {
+                            f.extra.push((
+                                format!("acc_frac_{name}"),
+                                o(a.and_then(|a| a.behaviour_frac.get(bi).copied()), 3),
+                            ));
+                        }
+                    }
                     if k >= 2 {
                         f.extra.push((
                             "acc_cluster".into(),
@@ -2033,6 +2068,7 @@ impl WingApp {
                 self.acc_sets.retain(|s| s.file != name);
                 self.acc_sets.extend(sets);
                 self.acc_files.retain(|f| f.name != name);
+                self.add_acc_locations(&name, &bytes);
                 self.acc_files.push(AccFile {
                     name: name.clone(),
                     bytes,
@@ -2047,6 +2083,48 @@ impl WingApp {
             }
             Err(e) => self.status(format!("! {name}: {e}")),
         }
+    }
+
+    /// Location rows inside an ACC file (Firetail / Movebank exports mix `gps` and `acc`
+    /// rows) become a track named like the ACC set, so the two match.
+    fn add_acc_locations(&mut self, name: &str, bytes: &[u8]) {
+        let Ok(mut t) = Table::from_bytes(name, bytes) else {
+            return;
+        };
+        let (Some(cla), Some(clo)) = (
+            t.col(&["location_lat", "lat", "latitude"]),
+            t.col(&["location_long", "location_lon", "lon", "longitude"]),
+        ) else {
+            return;
+        };
+        t.rows.retain(|r| {
+            crate::table::parse_num(t_get(r, cla)).is_some()
+                && crate::table::parse_num(t_get(r, clo)).is_some()
+        });
+        if t.rows.len() < 2 {
+            return;
+        }
+        let Ok((out, fw)) = firmware::parse(&t, Some("generic")) else {
+            return;
+        };
+        self.tracks.retain(|tr| tr.file != name);
+        let single = out.tracks.len() == 1;
+        let n: usize = out.tracks.iter().map(|t| t.fixes.len()).sum();
+        for mut tr in out.tracks {
+            if single || tr.id.trim().is_empty() || tr.id == "0" {
+                tr.id = crate::acc::id_from_name(name);
+            }
+            tr.file = name.to_string();
+            tr.color = PALETTE[self.tracks.len() % PALETTE.len()];
+            self.tracks.push(tr);
+        }
+        self.recompute_time_range();
+        self.fit_pending = true;
+        self.view3d.request_fit();
+        self.status(format!(
+            "  {name}: {n} location fixes in the ACC file → track ({})",
+            firmware::label_for(fw)
+        ));
     }
 
     /// Re-read every ACC file (window length or e-obs slope changed), keeping each set's
@@ -2348,6 +2426,17 @@ impl WingApp {
                 self.reread_acc();
             }
         });
+        let has_labels = self
+            .acc_sets
+            .iter()
+            .any(|s| s.bursts.iter().any(|b| b.label.is_some()));
+        if has_labels {
+            ui.checkbox(
+                &mut self.acc_edit.use_labels,
+                "classify behaviour from the annotated bursts (kNN)",
+            )
+            .on_hover_text("The files carry behaviour annotations (annotation-layer-*): train a 7-nearest-neighbour classifier on them and label every burst");
+        }
         let changed = self.acc_edit != self.acc_params;
         if ui
             .add_enabled(changed, egui::Button::new("Apply"))
@@ -2362,7 +2451,7 @@ impl WingApp {
         // ---- clusters
         let Some(c) = &self.acc_cache else { return };
         let total: usize = c.a.per_set.iter().map(|v| v.len()).sum();
-        let flight: usize = c.a.per_set.iter().flatten().filter(|x| x.1).count();
+        let flight: usize = c.a.per_set.iter().flatten().filter(|x| x.flight).count();
         ui.label(format!(
             "{total} bursts · {:.0} % flight",
             100.0 * flight as f32 / total.max(1) as f32
@@ -2373,6 +2462,9 @@ impl WingApp {
                 .show(ui, |ui| {
                     for h in ["cluster", "bursts", "dyn SD", "wingbeat", "pitch", "flight"] {
                         ui.strong(h);
+                    }
+                    if !c.a.classes.is_empty() {
+                        ui.strong("annotated as");
                     }
                     ui.end_row();
                     for (i, ci) in c.a.clusters.iter().enumerate() {
@@ -2395,10 +2487,60 @@ impl WingApp {
                         );
                         ui.label(format!("{:.0}°", ci.pitch_deg));
                         ui.label(format!("{:.0} %", ci.flight_frac * 100.0));
+                        if !c.a.classes.is_empty() {
+                            let mix: Vec<String> = ci
+                                .label_frac
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, x)| **x >= 0.05)
+                                .map(|(k, x)| format!("{} {:.0}%", c.a.classes[k], x * 100.0))
+                                .collect();
+                            ui.label(if mix.is_empty() {
+                                "-".into()
+                            } else {
+                                mix.join(", ")
+                            });
+                        }
                         ui.end_row();
                     }
                 });
             ui.weak("Clusters are numbered from calmest (C1) to most dynamic; name them from these profiles.");
+        }
+        if let Some(rep) = &c.a.classifier {
+            ui.separator();
+            ui.label(format!(
+                "Behaviour classifier ({}-NN on {} annotated bursts), {}-fold time-blocked cross-validation: {:.0} % correct, balanced accuracy {:.0} % (mean recall per behaviour)",
+                rep.k,
+                rep.n_train,
+                rep.folds,
+                rep.accuracy * 100.0,
+                rep.balanced_accuracy * 100.0
+            ));
+            egui::Grid::new("acc_confusion")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("annotated ↓ / predicted →");
+                    for (k, name) in c.a.classes.iter().enumerate() {
+                        ui.colored_label(BEHAVIOUR_COLORS[k % BEHAVIOUR_COLORS.len()], name);
+                    }
+                    ui.strong("recall");
+                    ui.end_row();
+                    for (i, name) in c.a.classes.iter().enumerate() {
+                        ui.label(name);
+                        let row = &rep.confusion[i];
+                        for v in row {
+                            ui.label(v.to_string());
+                        }
+                        let n: usize = row.iter().sum();
+                        ui.label(if n > 0 {
+                            format!("{:.0} %", 100.0 * row[i] as f32 / n as f32)
+                        } else {
+                            "-".into()
+                        });
+                        ui.end_row();
+                    }
+                });
+            ui.weak("Every burst gets a predicted behaviour; fixes get the shares over their step (colour by 'ACC: behaviour').");
         }
         if ui
             .button("export burst features CSV")
@@ -2440,8 +2582,8 @@ impl WingApp {
             if tk.is_some() && s.track != tk {
                 continue;
             }
-            for (bi, (f, _, _)) in c.a.per_set[si].iter().enumerate() {
-                let d = (f.t_ms - t_ms).abs();
+            for (bi, r) in c.a.per_set[si].iter().enumerate() {
+                let d = (r.f.t_ms - t_ms).abs();
                 if best.is_none_or(|b| d < b.0) {
                     best = Some((d, si, bi));
                 }
@@ -2452,13 +2594,15 @@ impl WingApp {
             return;
         };
         // per_set holds only bursts with absolute times, in order: map back by time
-        let (f, fl, cl) = &c.a.per_set[si][bi];
+        let row = &c.a.per_set[si][bi];
+        let (f, fl, cl) = (&row.f, &row.flight, &row.cluster);
+        let cls = |i: Option<usize>| i.and_then(|i| c.a.classes.get(i).cloned());
         let set = &self.acc_sets[si];
         let Some(b) = set.bursts.iter().find(|b| set.abs_ms(b) == Some(f.t_ms)) else {
             return;
         };
         ui.label(format!(
-            "{} · {} · {:.2} s · dyn SD {:.2} g · wingbeat {} · {}{}",
+            "{} · {} · {:.2} s · dyn SD {:.2} g · wingbeat {} · {}{}{}{}",
             set.id,
             chrono::DateTime::<chrono::Utc>::from_timestamp_millis(f.t_ms)
                 .map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
@@ -2473,7 +2617,13 @@ impl WingApp {
                 format!(" · C{}", cl + 1)
             } else {
                 String::new()
-            }
+            },
+            cls(row.label)
+                .map(|l| format!(" · annotated {l}"))
+                .unwrap_or_default(),
+            cls(row.behaviour)
+                .map(|l| format!(" · predicted {l}"))
+                .unwrap_or_default()
         ));
         let sr = b.sr as f64;
         let axes: Vec<Vec<[f64; 2]>> = (0..3)
@@ -4606,7 +4756,12 @@ impl WingApp {
                 && let Some(f) = self.tracks.get(ti).and_then(|t| t.fixes.get(fi)) {
                     let tr = &self.tracks[ti];
                     egui::CollapsingHeader::new(format!("Selected fix · {}", tr.id)).default_open(true).show(ui, |ui| {
-                        fix_details(ui, tr, f);
+                        let classes: Vec<String> = self
+                            .acc_cache
+                            .as_ref()
+                            .map(|c| c.a.classes.clone())
+                            .unwrap_or_default();
+                        fix_details(ui, tr, f, &classes);
                     });
                 }
 
@@ -4731,9 +4886,7 @@ impl WingApp {
                         .enumerate()
                         .filter(|(_, s)| s.track.as_deref() == Some(tk.as_str()))
                         .flat_map(|(si, _)| c.a.per_set[si].iter())
-                        .filter_map(|(f, fl, cl)| {
-                            m.of(f, *fl, *cl).map(|v| [f.t_ms as f64 / 86_400_000.0, v])
-                        })
+                        .filter_map(|r| m.of(r).map(|v| [r.f.t_ms as f64 / 86_400_000.0, v]))
                         .collect(),
                     None => Vec::new(),
                 },
@@ -4895,6 +5048,11 @@ impl WingApp {
             map = map.with_layer(st as &mut dyn Tiles, self.sat_opacity);
         }
         let color_by = self.color_by;
+        let acc_classes: Vec<String> = self
+            .acc_cache
+            .as_ref()
+            .map(|c| c.a.classes.clone())
+            .unwrap_or_default();
         let wind_legend = (self.show_wind_field && !self.store.is_empty()).then_some(wind_pal);
         let sat_on = self.sat_on;
         let sat_label = self.sat_layer.label();
@@ -4960,7 +5118,7 @@ impl WingApp {
                 FontId::proportional(14.0),
                 Color32::WHITE,
             );
-            legend(p, r, color_by, wind_legend);
+            legend(p, r, color_by, wind_legend, &acc_classes);
             (centre.y(), centre.x())
         });
         self.map_center = Some(shown.inner);
@@ -5621,7 +5779,7 @@ impl WingApp {
     }
 }
 
-fn fix_details(ui: &mut Ui, tr: &Track, f: &Fix) {
+fn fix_details(ui: &mut Ui, tr: &Track, f: &Fix, classes: &[String]) {
     let w = &f.weather;
     let row = |ui: &mut Ui, k: &str, v: String| {
         ui.label(k);
@@ -5717,6 +5875,30 @@ fn fix_details(ui: &mut Ui, tr: &Track, f: &Fix) {
                         .map(|(i, x)| format!("C{} {:.0}%", i + 1, x * 100.0))
                         .collect();
                     row(ui, "ACC cluster", format!("C{} ({})", c + 1, fr.join(", ")));
+                }
+                if let Some(b) = a.behaviour {
+                    let fr: Vec<String> = a
+                        .behaviour_frac
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, x)| **x > 0.0)
+                        .map(|(i, x)| {
+                            format!(
+                                "{} {:.0}%",
+                                classes.get(i).map(String::as_str).unwrap_or("?"),
+                                x * 100.0
+                            )
+                        })
+                        .collect();
+                    row(
+                        ui,
+                        "ACC behaviour",
+                        format!(
+                            "{} ({})",
+                            classes.get(b).map(String::as_str).unwrap_or("?"),
+                            fr.join(", ")
+                        ),
+                    );
                 }
             }
             if let Some(fw) = &w.flight {
@@ -5986,6 +6168,12 @@ impl ViewCfg {
                 .as_ref()
                 .and_then(|a| a.cluster)
                 .map(|c| CLUSTER_COLORS[c % CLUSTER_COLORS.len()])
+                .unwrap_or(none),
+            ColorBy::AccBehaviour => f
+                .acc
+                .as_ref()
+                .and_then(|a| a.behaviour)
+                .map(|c| BEHAVIOUR_COLORS[c % BEHAVIOUR_COLORS.len()])
                 .unwrap_or(none),
         }
     }
@@ -6279,9 +6467,42 @@ impl Plugin for TrackLayer<'_> {
 }
 
 /// Track colour legend, plus the wind-field speed scale stacked above it when shown.
-fn legend(p: &egui::Painter, r: Rect, by: ColorBy, wind: Option<WindPalette>) {
+fn legend(p: &egui::Painter, r: Rect, by: ColorBy, wind: Option<WindPalette>, classes: &[String]) {
     let mut origin = pos2(r.left() + 12.0, r.bottom() - 40.0);
-    if track_legend(p, origin, by) {
+    if by == ColorBy::AccBehaviour {
+        // one swatch per annotated behaviour
+        let n = classes.len().max(1);
+        let h = 16.0 * n as f32 + 18.0;
+        let top = origin + vec2(0.0, 30.0 - h);
+        p.rect_filled(
+            Rect::from_min_size(top - vec2(6.0, 4.0), vec2(170.0, h + 4.0)),
+            4.0,
+            Color32::from_black_alpha(160),
+        );
+        p.text(
+            top,
+            Align2::LEFT_TOP,
+            "ACC behaviour",
+            FontId::proportional(11.0),
+            Color32::WHITE,
+        );
+        for (i, c) in classes.iter().enumerate() {
+            let y = top.y + 16.0 + 16.0 * i as f32;
+            p.rect_filled(
+                Rect::from_min_size(pos2(top.x, y + 2.0), vec2(12.0, 10.0)),
+                2.0,
+                BEHAVIOUR_COLORS[i % BEHAVIOUR_COLORS.len()],
+            );
+            p.text(
+                pos2(top.x + 18.0, y),
+                Align2::LEFT_TOP,
+                c,
+                FontId::proportional(11.0),
+                Color32::WHITE,
+            );
+        }
+        origin.y -= h + 8.0;
+    } else if track_legend(p, origin, by) {
         origin.y -= 60.0;
     }
     if let Some(pal) = wind {
@@ -6306,6 +6527,7 @@ fn track_legend(p: &egui::Painter, origin: Pos2, by: ColorBy) -> bool {
         ColorBy::Time => ("time within track", "start", "end", false),
         ColorBy::AccFlight => ("ACC flight share of the step", "0 %", "100 %", false),
         ColorBy::AccWbf => ("ACC wingbeat frequency", "band low", "band high", false),
+        ColorBy::AccBehaviour => return false,
         ColorBy::AccCluster => {
             colorbar(
                 p,
@@ -6433,6 +6655,11 @@ fn web_download(name: &str, bytes: &[u8], mime: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Cell `c` of a table row ("" if missing).
+fn t_get(r: &[String], c: usize) -> &str {
+    r.get(c).map(String::as_str).unwrap_or("")
+}
+
 /// Tracks to (re)filter (empty = all visible) and the range, `None` to clear.
 type DateAction = (Vec<usize>, Option<(i64, i64)>);
 
@@ -6500,6 +6727,100 @@ mod share_tests {
             id += 1;
         }
         out
+    }
+
+    #[test]
+    #[ignore]
+    fn acc_real_files() {
+        // WT_ACC=a.csv:b.csv cargo test acc_real_files -- --ignored --nocapture
+        let Ok(list) = std::env::var("WT_ACC") else {
+            return;
+        };
+        let mut a = WingApp::blank();
+        for p in list.split(':') {
+            let name = p.rsplit('/').next().unwrap().to_string();
+            let t0 = std::time::Instant::now();
+            a.add_file_from(
+                name,
+                std::fs::read(p).unwrap(),
+                None,
+                Some(FileOrigin::Local),
+            );
+            println!("read {p} in {:?}", t0.elapsed());
+        }
+        for l in &a.log {
+            println!("log: {l}");
+        }
+        let t0 = std::time::Instant::now();
+        a.ensure_acc_cache();
+        println!("analysis {:?}", t0.elapsed());
+        for s in &a.acc_sets {
+            let labels = s.bursts.iter().filter(|b| b.label.is_some()).count();
+            println!(
+                "set {} file {} bursts {} labelled {} track {:?} notes {:?}",
+                s.id,
+                s.file,
+                s.bursts.len(),
+                labels,
+                s.track,
+                s.notes
+            );
+        }
+        let c = a.acc_cache.as_ref().unwrap();
+        println!("classes {:?}", c.a.classes);
+        if let Some(r) = &c.a.classifier {
+            println!(
+                "kNN k={} n={} acc={:.3} bal={:.3} confusion={:?}",
+                r.k, r.n_train, r.accuracy, r.balanced_accuracy, r.confusion
+            );
+        }
+        for (i, ci) in c.a.clusters.iter().enumerate() {
+            println!(
+                "C{} n={} dyn={:.2} wbf={:?} pitch={:.0} flight={:.2} labels={:?}",
+                i + 1,
+                ci.n,
+                ci.dyn_sd,
+                ci.wbf_hz,
+                ci.pitch_deg,
+                ci.flight_frac,
+                ci.label_frac
+            );
+        }
+        for (si, v) in c.a.per_set.iter().enumerate() {
+            let mut by: std::collections::BTreeMap<String, (usize, f32, Vec<f32>)> =
+                Default::default();
+            for r in v {
+                let l = r
+                    .label
+                    .map(|l| c.a.classes[l].clone())
+                    .unwrap_or("-".into());
+                let e = by.entry(l).or_default();
+                e.0 += 1;
+                e.1 += r.f.dyn_sd;
+                if let Some(w) = r.f.wbf_hz.filter(|_| r.flight && r.f.peak_frac > 0.2) {
+                    e.2.push(w);
+                }
+            }
+            for (l, (n, d, mut w)) in by {
+                w.sort_by(|a, b| a.total_cmp(b));
+                println!(
+                    "  set{si} {l:10} n={n:5} mean dynSD={:.3} g  median wbf(flight)={:?} (n={})",
+                    d / n as f32,
+                    w.get(w.len() / 2),
+                    w.len()
+                );
+            }
+        }
+        for tr in &a.tracks {
+            let ann = tr.fixes.iter().filter(|f| f.acc.is_some()).count();
+            println!(
+                "track {} fixes {} with acc {} first {:?}",
+                tr.id,
+                tr.fixes.len(),
+                ann,
+                tr.fixes.iter().find_map(|f| f.acc.as_deref())
+            );
+        }
     }
 
     #[test]
