@@ -49,6 +49,8 @@ This file is written for AI coding agents. Assume the reader knows nothing about
 │   │   ├── generic.rs      # Any lat/lon/time CSV
 │   │   └── tests.rs        # Parser unit tests
 │   ├── weather.rs          # Open-Meteo request planning, cache, ERA5 annotation
+│   ├── wxfield.rs          # ERA5 colour fields, isobars (marching squares), lows/highs + storm flag
+│   ├── cyclones.rs         # IBTrACS tropical cyclones: ERDDAP subset / CSV import, interpolation, categories
 │   ├── geo.rs              # Great-circle maths, solar elevation, barometric altitude, wind vectors
 │   ├── tiles.rs            # Basemap and NASA GIBS tile sources
 │   ├── video.rs            # Frame capture/cropping, MP4 (ffmpeg) and GIF encoding
@@ -245,3 +247,8 @@ Enable GitHub Pages via *Settings → Pages → Source: GitHub Actions*.
   firmware registry (`acc::sniff` first in `add_file_from`), live in `acc_files` / `acc_sets`, and `ensure_acc_cache`
   separates the expensive analysis (sets + params) from per-fix annotation (tracks). Share: `acc=` params, `accs=`
   per-set start / clock rate (ppm) / track; local ACC files are not embedded.
+- Weather layers: `wxfield::grid()` builds the lattice of ERA5 cells at the wind-field spacing for one hour; `WxDraw`
+  (app) is rebuilt per frame for the 2D map. Turning a layer on also drives `maybe_request_surface_field`. Cyclones
+  (`cyclones.rs`) come from ERDDAP `IBTrACS_since1980_1` (CSV with a units row) or an imported NCEI file; share keys
+  `wxl=` (field,isobars,centres) and `tc=1` (re-fetch). GIBS weather imagery (`SatLayer::ImergPrecip`, AIRS) uses WMS
+  GetMap per tile (`tiles.rs`); true colour stays on WMTS.
