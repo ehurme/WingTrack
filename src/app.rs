@@ -195,16 +195,24 @@ enum ColorBy {
     Altitude,
     GroundSpeed,
     Time,
+    AccFlight,
+    AccWbf,
+    AccCluster,
+    AccBehaviour,
 }
 
 impl ColorBy {
-    const ALL: [ColorBy; 6] = [
+    const ALL: [ColorBy; 10] = [
         ColorBy::Individual,
         ColorBy::WindSupport,
         ColorBy::SegmentWind,
         ColorBy::Altitude,
         ColorBy::GroundSpeed,
         ColorBy::Time,
+        ColorBy::AccFlight,
+        ColorBy::AccWbf,
+        ColorBy::AccCluster,
+        ColorBy::AccBehaviour,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -214,6 +222,10 @@ impl ColorBy {
             ColorBy::Altitude => "Altitude",
             ColorBy::GroundSpeed => "Ground speed",
             ColorBy::Time => "Time",
+            ColorBy::AccFlight => "ACC: flight share of the step",
+            ColorBy::AccWbf => "ACC: wingbeat frequency",
+            ColorBy::AccCluster => "ACC: behaviour cluster",
+            ColorBy::AccBehaviour => "ACC: behaviour (from annotations)",
         }
     }
 }
@@ -317,10 +329,88 @@ enum ChartVar {
     Curtain,
     /// Wind profile at the selected fix / cursor.
     Profile,
+    /// A per-burst acceleration metric over time.
+    Acc(AccMetric),
+    /// Waveform and spectrum of the burst nearest the cursor.
+    AccBurst,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AccMetric {
+    DynSd,
+    Vedba,
+    Wbf,
+    Pitch,
+    Cluster,
+    Behaviour,
+}
+
+impl AccMetric {
+    fn label(self) -> &'static str {
+        match self {
+            AccMetric::DynSd => "ACC: dynamic SD per burst (g)",
+            AccMetric::Vedba => "ACC: VeDBA per burst (g)",
+            AccMetric::Wbf => "ACC: wingbeat frequency of flight bursts (Hz)",
+            AccMetric::Pitch => "ACC: pitch (posture, °)",
+            AccMetric::Cluster => "ACC: behaviour cluster per burst",
+            AccMetric::Behaviour => "ACC: predicted behaviour per burst (from annotations)",
+        }
+    }
+    fn of(self, r: &crate::acc::Row) -> Option<f64> {
+        let f = &r.f;
+        match self {
+            AccMetric::DynSd => Some(f.dyn_sd as f64),
+            AccMetric::Vedba => Some(f.vedba as f64),
+            AccMetric::Wbf => f.wbf_hz.filter(|_| r.flight).map(|x| x as f64),
+            AccMetric::Pitch => Some(f.pitch_deg as f64),
+            AccMetric::Cluster => Some(r.cluster as f64 + 1.0),
+            AccMetric::Behaviour => r.behaviour.map(|b| b as f64 + 1.0),
+        }
+    }
+}
+
+/// Behaviour-cluster colours, calm (C1) → dynamic.
+const CLUSTER_COLORS: [Color32; 8] = [
+    Color32::from_rgb(69, 117, 180),
+    Color32::from_rgb(145, 191, 219),
+    Color32::from_rgb(171, 221, 164),
+    Color32::from_rgb(254, 224, 144),
+    Color32::from_rgb(252, 141, 89),
+    Color32::from_rgb(215, 48, 39),
+    Color32::from_rgb(118, 42, 131),
+    Color32::from_rgb(165, 0, 38),
+];
+
+/// Behaviour colours (Okabe–Ito), in the order of the annotated classes.
+const BEHAVIOUR_COLORS: [Color32; 8] = [
+    Color32::from_rgb(0, 114, 178),
+    Color32::from_rgb(230, 159, 0),
+    Color32::from_rgb(0, 158, 115),
+    Color32::from_rgb(204, 121, 167),
+    Color32::from_rgb(86, 180, 233),
+    Color32::from_rgb(213, 94, 0),
+    Color32::from_rgb(240, 228, 66),
+    Color32::from_rgb(160, 160, 160),
+];
+
+/// An acceleration file as loaded (kept to re-read with other settings / share by URL).
+struct AccFile {
+    name: String,
+    bytes: Vec<u8>,
+    origin: FileOrigin,
+}
+
+/// Burst features + per-fix summaries for the current sets, parameters and tracks.
+struct AccCache {
+    /// Sets + parameters (features and clusters).
+    key: u64,
+    a: crate::acc::Analysis,
+    /// … + tracks and assignments (per-fix summaries).
+    anno_key: u64,
 }
 
 impl ChartVar {
-    const ALL: [ChartVar; 19] = [
+    const ALL: [ChartVar; 26] = [
         ChartVar::Curtain,
         ChartVar::Profile,
         ChartVar::FlightSupport,
@@ -340,6 +430,13 @@ impl ChartVar {
         ChartVar::Sensor(SensorKind::Temperature),
         ChartVar::Sensor(SensorKind::Pressure),
         ChartVar::Sensor(SensorKind::Activity),
+        ChartVar::Acc(AccMetric::DynSd),
+        ChartVar::Acc(AccMetric::Vedba),
+        ChartVar::Acc(AccMetric::Wbf),
+        ChartVar::Acc(AccMetric::Pitch),
+        ChartVar::Acc(AccMetric::Cluster),
+        ChartVar::Acc(AccMetric::Behaviour),
+        ChartVar::AccBurst,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -359,6 +456,8 @@ impl ChartVar {
             ChartVar::FlightHeight => "3D: flight height from profile (m ASL)",
             ChartVar::Curtain => "3D: time × height wind curtain along track",
             ChartVar::Profile => "3D: wind profile at selected fix / cursor",
+            ChartVar::Acc(m) => m.label(),
+            ChartVar::AccBurst => "ACC: burst at the cursor (waveform + spectrum)",
         }
     }
     fn of_fix(self, f: &Fix) -> Option<f32> {
@@ -376,7 +475,11 @@ impl ChartVar {
             ChartVar::FlightSupport => f.weather.flight.as_ref().and_then(|w| w.wind_support),
             ChartVar::BestSupport => f.weather.flight.as_ref().and_then(|w| w.best_wind_support),
             ChartVar::FlightHeight => f.weather.flight.as_ref().and_then(|w| w.flight_height_m),
-            ChartVar::Sensor(_) | ChartVar::Curtain | ChartVar::Profile => None,
+            ChartVar::Sensor(_)
+            | ChartVar::Curtain
+            | ChartVar::Profile
+            | ChartVar::Acc(_)
+            | ChartVar::AccBurst => None,
         }
     }
 }
@@ -445,6 +548,17 @@ pub struct WingApp {
     /// Track whose date-range editor is open, with the From / To text.
     date_edit: Option<usize>,
     falloff: crate::falloff::Params,
+    // acceleration
+    acc_files: Vec<AccFile>,
+    acc_sets: Vec<crate::acc::AccSet>,
+    acc_params: crate::acc::Params,
+    /// Parameters being edited (applied with a button: analysis can take a moment).
+    acc_edit: crate::acc::Params,
+    acc_slope: Option<f64>,
+    acc_cache: Option<AccCache>,
+    /// FleaTag sets whose start was taken from the track's first fix.
+    acc_start_guessed: HashSet<String>,
+    acc_start_text: HashMap<String, String>,
     // wind turbines & tall structures
     st_on: bool,
     st_params: crate::structures::Params,
@@ -614,6 +728,14 @@ impl WingApp {
             selected_track: None,
             date_edit: None,
             falloff: crate::falloff::Params::default(),
+            acc_files: Vec::new(),
+            acc_sets: Vec::new(),
+            acc_params: crate::acc::Params::default(),
+            acc_edit: crate::acc::Params::default(),
+            acc_slope: None,
+            acc_cache: None,
+            acc_start_guessed: HashSet::new(),
+            acc_start_text: HashMap::new(),
             st_on: false,
             st_params: crate::structures::Params::default(),
             st_highlight: true,
@@ -767,6 +889,9 @@ impl WingApp {
                     .map(|f| f.origin.clone())
             })
             .unwrap_or(FileOrigin::Local);
+        if crate::acc::sniff(&name, &bytes) {
+            return self.add_acc_file(name, bytes, origin);
+        }
         let table = match Table::from_bytes(&name, &bytes) {
             Ok(t) => t,
             Err(e) => return self.status(format!("! {e}")),
@@ -882,6 +1007,13 @@ impl WingApp {
         }
         for fw in forced {
             m.set("fw", fw);
+        }
+        // acceleration files are re-fetched from their URL (local ones are not embedded:
+        // they can be hundreds of MB)
+        for f in &self.acc_files {
+            if let FileOrigin::Url(u) = &f.origin {
+                m.set("data", u);
+            }
         }
         if embed {
             let packed = self.packed_data();
@@ -1040,6 +1172,38 @@ impl WingApp {
             })
             .collect();
         m.set_if(!ranges.is_empty(), "dr", ranges.join(";"));
+        let ap = &self.acc_params;
+        if !self.acc_sets.is_empty() || *ap != crate::acc::Params::default() {
+            m.set(
+                "acc",
+                format!(
+                    "{},{},{},{},{},{},{}",
+                    r(ap.band.0 as f64, 2),
+                    r(ap.band.1 as f64, 2),
+                    r(ap.flight_g as f64, 3),
+                    r(ap.min_peak_frac as f64, 2),
+                    ap.k,
+                    r(ap.window_s as f64, 2),
+                    self.acc_slope
+                        .map(|x| format!("{x}"))
+                        .unwrap_or_else(|| "0".into())
+                ),
+            );
+        }
+        let accs: Vec<String> = self
+            .acc_sets
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}|{}|{}|{}",
+                    Self::acc_key(s),
+                    s.start_ms.map(|t| t.to_string()).unwrap_or_default(),
+                    r(s.clock_rate * 1e6, 0),
+                    s.track.clone().unwrap_or_default()
+                )
+            })
+            .collect();
+        m.set_if(!accs.is_empty(), "accs", accs.join(";"));
         let sp = &self.st_params;
         m.set_if(
             self.st_on,
@@ -1091,6 +1255,18 @@ impl WingApp {
 
     /// Settings that don't depend on the data.
     fn apply_share_settings(&mut self, m: &ShareMap) {
+        if let [lo, hi, fl, pk, k, win, slope, ..] = m.nums("acc")[..] {
+            self.acc_params = crate::acc::Params {
+                band: (lo as f32, hi as f32),
+                flight_g: fl as f32,
+                min_peak_frac: pk as f32,
+                k: (k as usize).min(8),
+                window_s: win as f32,
+                ..Default::default()
+            };
+            self.acc_edit = self.acc_params;
+            self.acc_slope = (slope > 0.0).then_some(slope);
+        }
         let stv = m.nums("st");
         self.st_on = m.get("st").is_some();
         if let [radius, other, minh, hl, ..] = stv[..] {
@@ -1247,6 +1423,25 @@ impl WingApp {
 
     /// Track-dependent state, applied once the link's data has loaded.
     fn apply_share_view(&mut self, m: &ShareMap) {
+        if let Some(v) = m.get("accs") {
+            for e in v.split(';') {
+                let p: Vec<&str> = e.split('|').collect();
+                if p.len() < 4 {
+                    continue;
+                }
+                if let Some(s) = self.acc_sets.iter_mut().find(|s| Self::acc_key(s) == p[0]) {
+                    s.start_ms = p[1].parse().ok();
+                    s.clock_rate = p[2].parse::<f64>().unwrap_or(0.0) / 1e6;
+                    s.track = Some(p[3].to_string()).filter(|t| !t.is_empty());
+                    if s.start_ms.is_some() {
+                        let k = Self::acc_key(s);
+                        self.acc_start_guessed.remove(&k);
+                        self.acc_start_text.remove(&k);
+                    }
+                }
+            }
+            self.acc_cache = None;
+        }
         // Date filters first: the selected fix below is looked up in the filtered fixes.
         let mut changed = Vec::new();
         let wanted: HashMap<usize, (i64, i64)> = m
@@ -1672,7 +1867,7 @@ impl WingApp {
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::spawn(move || {
             if let Some(paths) = rfd::FileDialog::new()
-                .add_filter("Tracking data", &["csv", "txt", "tsv"])
+                .add_filter("Tracking & acceleration data", &["csv", "txt", "tsv", "gz"])
                 .pick_files()
             {
                 for p in paths {
@@ -1695,7 +1890,7 @@ impl WingApp {
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
             if let Some(files) = rfd::AsyncFileDialog::new()
-                .add_filter("Tracking data", &["csv", "txt", "tsv"])
+                .add_filter("Tracking & acceleration data", &["csv", "txt", "tsv", "gz"])
                 .pick_files()
                 .await
             {
@@ -1747,6 +1942,58 @@ impl WingApp {
         let mut tracks: Vec<Track> = Vec::new();
         for (ti, tr) in self.tracks.iter().enumerate().filter(|(_, t)| t.visible) {
             let mut tr = tr.clone();
+            if let Some(ac) = &self.acc_cache {
+                let k = self.acc_params.k;
+                let classes = ac.a.classes.clone();
+                for f in tr.fixes.iter_mut() {
+                    let a = f.acc.as_deref();
+                    let o = |v: Option<f32>, d: usize| {
+                        v.map(|x| format!("{x:.d$}")).unwrap_or_default()
+                    };
+                    f.extra.push((
+                        "acc_n_bursts".into(),
+                        a.map(|a| a.n.to_string()).unwrap_or_default(),
+                    ));
+                    f.extra
+                        .push(("acc_flight_frac".into(), o(a.map(|a| a.flight_frac), 3)));
+                    f.extra
+                        .push(("acc_dyn_sd_g".into(), o(a.map(|a| a.dyn_sd), 4)));
+                    f.extra
+                        .push(("acc_vedba_g".into(), o(a.map(|a| a.vedba), 4)));
+                    f.extra
+                        .push(("acc_wbf_hz".into(), o(a.and_then(|a| a.wbf_hz), 2)));
+                    f.extra
+                        .push(("acc_pitch_deg".into(), o(a.map(|a| a.pitch_deg), 1)));
+                    if !classes.is_empty() {
+                        f.extra.push((
+                            "acc_behaviour".into(),
+                            a.and_then(|a| a.behaviour)
+                                .and_then(|b| classes.get(b).cloned())
+                                .unwrap_or_default(),
+                        ));
+                        for (bi, name) in classes.iter().enumerate() {
+                            f.extra.push((
+                                format!("acc_frac_{name}"),
+                                o(a.and_then(|a| a.behaviour_frac.get(bi).copied()), 3),
+                            ));
+                        }
+                    }
+                    if k >= 2 {
+                        f.extra.push((
+                            "acc_cluster".into(),
+                            a.and_then(|a| a.cluster)
+                                .map(|c| format!("C{}", c + 1))
+                                .unwrap_or_default(),
+                        ));
+                        for c in 0..k {
+                            f.extra.push((
+                                format!("acc_frac_C{}", c + 1),
+                                o(a.and_then(|a| a.cluster_frac.get(c).copied()), 3),
+                            ));
+                        }
+                    }
+                }
+            }
             if let Some(c) = self.st_cache.as_ref().filter(|_| self.st_on) {
                 let r = format!("{:.0}", c.a.params.radius_m);
                 for (fi, f) in tr.fixes.iter_mut().enumerate() {
@@ -1797,6 +2044,662 @@ impl WingApp {
             };
             self.status(msg);
         }
+    }
+
+    // ------------------------------------------------------------------ acceleration
+
+    fn acc_read_opts(&self) -> crate::acc::ReadOptions {
+        crate::acc::ReadOptions {
+            eobs_slope: self.acc_slope,
+            window_s: self.acc_params.window_s as f64,
+        }
+    }
+
+    fn acc_key(s: &crate::acc::AccSet) -> String {
+        format!("{}@{}", s.id, s.file)
+    }
+
+    fn add_acc_file(&mut self, name: String, bytes: Vec<u8>, origin: FileOrigin) {
+        match crate::acc::read(&name, &bytes, &self.acc_read_opts()) {
+            Ok(sets) => {
+                let n: usize = sets.iter().map(|s| s.bursts.len()).sum();
+                let ids: Vec<String> = sets.iter().map(|s| s.id.clone()).collect();
+                let fmt = sets[0].format.label();
+                self.acc_sets.retain(|s| s.file != name);
+                self.acc_sets.extend(sets);
+                self.acc_files.retain(|f| f.name != name);
+                self.add_acc_locations(&name, &bytes);
+                self.acc_files.push(AccFile {
+                    name: name.clone(),
+                    bytes,
+                    origin,
+                });
+                self.acc_cache = None;
+                self.status(format!(
+                    "Loaded acceleration {name} ({fmt}): {} animal(s) [{}], {n} bursts / windows",
+                    ids.len(),
+                    ids.join(", ")
+                ));
+            }
+            Err(e) => self.status(format!("! {name}: {e}")),
+        }
+    }
+
+    /// Location rows inside an ACC file (Firetail / Movebank exports mix `gps` and `acc`
+    /// rows) become a track named like the ACC set, so the two match.
+    fn add_acc_locations(&mut self, name: &str, bytes: &[u8]) {
+        let Ok(mut t) = Table::from_bytes(name, bytes) else {
+            return;
+        };
+        let (Some(cla), Some(clo)) = (
+            t.col(&["location_lat", "lat", "latitude"]),
+            t.col(&["location_long", "location_lon", "lon", "longitude"]),
+        ) else {
+            return;
+        };
+        t.rows.retain(|r| {
+            crate::table::parse_num(t_get(r, cla)).is_some()
+                && crate::table::parse_num(t_get(r, clo)).is_some()
+        });
+        if t.rows.len() < 2 {
+            return;
+        }
+        let Ok((out, fw)) = firmware::parse(&t, Some("generic")) else {
+            return;
+        };
+        self.tracks.retain(|tr| tr.file != name);
+        let single = out.tracks.len() == 1;
+        let n: usize = out.tracks.iter().map(|t| t.fixes.len()).sum();
+        for mut tr in out.tracks {
+            if single || tr.id.trim().is_empty() || tr.id == "0" {
+                tr.id = crate::acc::id_from_name(name);
+            }
+            tr.file = name.to_string();
+            tr.color = PALETTE[self.tracks.len() % PALETTE.len()];
+            self.tracks.push(tr);
+        }
+        self.recompute_time_range();
+        self.fit_pending = true;
+        self.view3d.request_fit();
+        self.status(format!(
+            "  {name}: {n} location fixes in the ACC file → track ({})",
+            firmware::label_for(fw)
+        ));
+    }
+
+    /// Re-read every ACC file (window length or e-obs slope changed), keeping each set's
+    /// track, start time and clock rate.
+    fn reread_acc(&mut self) {
+        let keep: HashMap<String, (Option<String>, Option<i64>, f64)> = self
+            .acc_sets
+            .iter()
+            .map(|s| {
+                (
+                    Self::acc_key(s),
+                    (s.track.clone(), s.start_ms, s.clock_rate),
+                )
+            })
+            .collect();
+        let opts = self.acc_read_opts();
+        let mut sets = Vec::new();
+        for f in &self.acc_files {
+            if let Ok(v) = crate::acc::read(&f.name, &f.bytes, &opts) {
+                sets.extend(v);
+            }
+        }
+        for s in &mut sets {
+            if let Some((t, st, cr)) = keep.get(&Self::acc_key(s)) {
+                s.track = t.clone();
+                s.start_ms = *st;
+                s.clock_rate = *cr;
+            }
+        }
+        self.acc_sets = sets;
+        self.acc_cache = None;
+    }
+
+    /// Track for an ACC id: exact match on the track id or tag, else one containing the other.
+    fn match_acc_track(&self, id: &str) -> Option<usize> {
+        let norm = |s: &str| {
+            s.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_lowercase()
+        };
+        let a = norm(id);
+        if a.is_empty() {
+            return None;
+        }
+        let ids: Vec<String> = self.tracks.iter().map(|t| norm(&t.id)).collect();
+        ids.iter().position(|t| *t == a).or_else(|| {
+            ids.iter().position(|t| {
+                (a.len() >= 4 && t.contains(&a)) || (t.len() >= 4 && a.contains(t.as_str()))
+            })
+        })
+    }
+
+    /// Match sets to tracks, anchor FleaTag clocks, compute features and annotate fixes.
+    fn ensure_acc_cache(&mut self) {
+        if self.acc_sets.is_empty() {
+            if self.acc_cache.take().is_some() {
+                for tr in &mut self.tracks {
+                    tr.fixes.iter_mut().for_each(|f| f.acc = None);
+                }
+            }
+            return;
+        }
+        // auto-match unassigned sets once tracks exist
+        for i in 0..self.acc_sets.len() {
+            if self.acc_sets[i].track.is_none()
+                && let Some(ti) = self.match_acc_track(&self.acc_sets[i].id)
+            {
+                self.acc_sets[i].track = Some(self.track_key(ti));
+            }
+            // FleaTag without a start: the track's first fix, flagged
+            let s = &self.acc_sets[i];
+            if s.relative
+                && s.start_ms.is_none()
+                && let Some(ti) = s.track.as_deref().and_then(|k| self.track_by_key(k))
+                && let Some((t0, _)) = self.tracks[ti].full_time_range()
+            {
+                let key = Self::acc_key(s);
+                self.acc_sets[i].start_ms = Some(t0 * 1000);
+                self.acc_start_guessed.insert(key);
+            }
+        }
+        use std::hash::{Hash, Hasher};
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let p = &self.acc_params;
+            (
+                p.band.0.to_bits(),
+                p.band.1.to_bits(),
+                p.flight_g.to_bits(),
+                p.min_peak_frac.to_bits(),
+                p.k,
+            )
+                .hash(&mut h);
+            for s in &self.acc_sets {
+                (
+                    &s.id,
+                    &s.file,
+                    s.bursts.len(),
+                    s.start_ms,
+                    s.clock_rate.to_bits(),
+                )
+                    .hash(&mut h);
+            }
+            h.finish()
+        };
+        let anno_key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (key, self.visible_key(), self.tracks.len()).hash(&mut h);
+            for s in &self.acc_sets {
+                s.track.hash(&mut h);
+            }
+            h.finish()
+        };
+        if self
+            .acc_cache
+            .as_ref()
+            .is_some_and(|c| c.anno_key == anno_key)
+        {
+            return;
+        }
+        let a = match self.acc_cache.take() {
+            Some(c) if c.key == key => c.a,
+            _ => crate::acc::analyse(&self.acc_sets, &self.acc_params),
+        };
+        let keys: Vec<String> = (0..self.tracks.len()).map(|i| self.track_key(i)).collect();
+        for (tr, tk) in self.tracks.iter_mut().zip(keys) {
+            tr.fixes.iter_mut().for_each(|f| f.acc = None);
+            let sets: Vec<usize> = (0..self.acc_sets.len())
+                .filter(|&i| self.acc_sets[i].track.as_deref() == Some(tk.as_str()))
+                .collect();
+            if sets.is_empty() {
+                continue;
+            }
+            for (fi, fa) in crate::acc::summarise_track(tr, &sets, &a) {
+                tr.fixes[fi].acc = Some(Box::new(fa));
+            }
+        }
+        self.acc_cache = Some(AccCache { key, a, anno_key });
+    }
+
+    fn acc_panel(&mut self, ui: &mut egui::Ui) {
+        use crate::acc::{BAND_PRESETS, Format};
+        if self.acc_sets.is_empty() {
+            ui.weak(
+                "Open acceleration files like any other: Movebank e-obs bursts (eobs:accelerations-raw), \
+                 Movebank / Technosmart / any per-sample x-y-z table, or FleaTag .txt / .csv exports. \
+                 They are matched to tracks by id and summarised per fix.",
+            );
+            return;
+        }
+        // ---- datasets
+        let tracks: Vec<(String, String)> = (0..self.tracks.len())
+            .map(|i| (self.track_key(i), self.tracks[i].id.clone()))
+            .collect();
+        let mut remove = None;
+        for i in 0..self.acc_sets.len() {
+            let key = Self::acc_key(&self.acc_sets[i]);
+            let guessed = self.acc_start_guessed.contains(&key);
+            let s = &mut self.acc_sets[i];
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&s.id);
+                let sr = s.bursts.first().map(|b| b.sr).unwrap_or(0.0);
+                ui.weak(format!(
+                    "{} · {} bursts · {sr:.0} Hz · {}",
+                    s.format.label(),
+                    s.bursts.len(),
+                    s.file
+                ));
+                if ui
+                    .small_button("✕")
+                    .on_hover_text("Remove this animal's ACC data")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("track");
+                let cur = s
+                    .track
+                    .as_ref()
+                    .and_then(|k| tracks.iter().find(|t| &t.0 == k))
+                    .map(|t| t.1.clone())
+                    .unwrap_or_else(|| "(none)".into());
+                egui::ComboBox::from_id_salt(("acc_trk", i))
+                    .selected_text(cur)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut s.track, None, "(none)");
+                        for (k, name) in &tracks {
+                            ui.selectable_value(&mut s.track, Some(k.clone()), name);
+                        }
+                    });
+            });
+            if s.format == Format::FleaTag {
+                let txt = self
+                    .acc_start_text
+                    .entry(key.clone())
+                    .or_insert_with(|| s.start_ms.map(|t| fmt_time(t / 1000)).unwrap_or_default());
+                ui.horizontal(|ui| {
+                    ui.label("tag start (UTC)");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(txt)
+                            .desired_width(150.0)
+                            .hint_text("YYYY-MM-DD HH:MM:SS"),
+                    );
+                    if r.lost_focus()
+                        && let Some(t) = crate::table::parse_time_ms(txt)
+                    {
+                        s.start_ms = Some(t);
+                        self.acc_start_guessed.remove(&key);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("clock rate");
+                    let mut pct = s.clock_rate * 100.0;
+                    if ui
+                        .add(egui::DragValue::new(&mut pct).speed(0.05).range(-10.0..=10.0).suffix(" %"))
+                        .on_hover_text("Real elapsed time = tag time × (1 + rate); FleaTags run ~1–2 % off (see hummingbird_activity_budget.R)")
+                        .changed()
+                    {
+                        s.clock_rate = pct / 100.0;
+                    }
+                });
+                if guessed {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 190, 90),
+                        "FleaTags have no clock - start set to the track's first fix; enter the real tag start",
+                    );
+                }
+            }
+        }
+        if let Some(i) = remove {
+            let s = self.acc_sets.remove(i);
+            if !self.acc_sets.iter().any(|x| x.file == s.file) {
+                self.acc_files.retain(|f| f.name != s.file);
+            }
+            self.acc_cache = None;
+        }
+        ui.separator();
+        // ---- settings (applied with a button)
+        let e = &mut self.acc_edit;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("wingbeat band");
+            egui::ComboBox::from_id_salt("acc_band")
+                .selected_text("preset")
+                .show_ui(ui, |ui| {
+                    for (n, b) in BAND_PRESETS {
+                        if ui.selectable_label(e.band == b, n).clicked() {
+                            e.band = b;
+                        }
+                    }
+                });
+            ui.add(
+                egui::DragValue::new(&mut e.band.0)
+                    .speed(0.2)
+                    .range(0.5..=200.0)
+                    .suffix(" Hz"),
+            );
+            ui.label("–");
+            ui.add(
+                egui::DragValue::new(&mut e.band.1)
+                    .speed(0.2)
+                    .range(1.0..=250.0)
+                    .suffix(" Hz"),
+            );
+        });
+        ui.add(egui::Slider::new(&mut e.flight_g, 0.05..=5.0).logarithmic(true).text("flight: dynamic SD > (g)"))
+            .on_hover_text("Bursts are flight above this (flea: 1 g for hummingbird bursts; bats on e-obs tags often 0.3–0.8 g)");
+        ui.add(
+            egui::Slider::new(&mut e.min_peak_frac, 0.0..=0.8).text("… and wingbeat peak share ≥"),
+        )
+        .on_hover_text("Also require a clear rhythmic peak in the band (0 = off)");
+        ui.add(egui::Slider::new(&mut e.k, 0..=8).text("behaviour clusters (k-means, 0 = off)"));
+        ui.add(
+            egui::Slider::new(&mut e.window_s, 0.3..=10.0)
+                .logarithmic(true)
+                .suffix(" s")
+                .text("window for continuous data"),
+        );
+        ui.horizontal(|ui| {
+            let mut ov = self.acc_slope.is_some();
+            if ui
+                .checkbox(&mut ov, "e-obs g per count")
+                .on_hover_text(
+                    "Default by tag generation: ≤2241 → 0.001, ≤4117 → 0.0022, newer → 1/512",
+                )
+                .changed()
+            {
+                self.acc_slope = if ov { Some(1.0 / 512.0) } else { None };
+                self.reread_acc();
+            }
+            if let Some(v) = self.acc_slope.as_mut()
+                && ui
+                    .add(egui::DragValue::new(v).speed(0.0001).range(0.0001..=0.05))
+                    .lost_focus()
+            {
+                self.reread_acc();
+            }
+        });
+        let has_labels = self
+            .acc_sets
+            .iter()
+            .any(|s| s.bursts.iter().any(|b| b.label.is_some()));
+        if has_labels {
+            ui.checkbox(
+                &mut self.acc_edit.use_labels,
+                "classify behaviour from the annotated bursts (kNN)",
+            )
+            .on_hover_text("The files carry behaviour annotations (annotation-layer-*): train a 7-nearest-neighbour classifier on them and label every burst");
+        }
+        let changed = self.acc_edit != self.acc_params;
+        if ui
+            .add_enabled(changed, egui::Button::new("Apply"))
+            .clicked()
+        {
+            let rewindow = self.acc_edit.window_s != self.acc_params.window_s;
+            self.acc_params = self.acc_edit;
+            if rewindow {
+                self.reread_acc();
+            }
+        }
+        // ---- clusters
+        let Some(c) = &self.acc_cache else { return };
+        let total: usize = c.a.per_set.iter().map(|v| v.len()).sum();
+        let flight: usize = c.a.per_set.iter().flatten().filter(|x| x.flight).count();
+        ui.label(format!(
+            "{total} bursts · {:.0} % flight",
+            100.0 * flight as f32 / total.max(1) as f32
+        ));
+        if c.a.params.k >= 2 {
+            egui::Grid::new("acc_clusters")
+                .striped(true)
+                .show(ui, |ui| {
+                    for h in ["cluster", "bursts", "dyn SD", "wingbeat", "pitch", "flight"] {
+                        ui.strong(h);
+                    }
+                    if !c.a.classes.is_empty() {
+                        ui.strong("annotated as");
+                    }
+                    ui.end_row();
+                    for (i, ci) in c.a.clusters.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let (r, _) =
+                                ui.allocate_exact_size(vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter().rect_filled(
+                                r,
+                                2.0,
+                                CLUSTER_COLORS[i % CLUSTER_COLORS.len()],
+                            );
+                            ui.label(format!("C{}", i + 1));
+                        });
+                        ui.label(ci.n.to_string());
+                        ui.label(format!("{:.2} g", ci.dyn_sd));
+                        ui.label(
+                            ci.wbf_hz
+                                .map(|w| format!("{w:.1} Hz"))
+                                .unwrap_or("-".into()),
+                        );
+                        ui.label(format!("{:.0}°", ci.pitch_deg));
+                        ui.label(format!("{:.0} %", ci.flight_frac * 100.0));
+                        if !c.a.classes.is_empty() {
+                            let mix: Vec<String> = ci
+                                .label_frac
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, x)| **x >= 0.05)
+                                .map(|(k, x)| format!("{} {:.0}%", c.a.classes[k], x * 100.0))
+                                .collect();
+                            ui.label(if mix.is_empty() {
+                                "-".into()
+                            } else {
+                                mix.join(", ")
+                            });
+                        }
+                        ui.end_row();
+                    }
+                });
+            ui.weak("Clusters are numbered from calmest (C1) to most dynamic; name them from these profiles.");
+        }
+        if let Some(rep) = &c.a.classifier {
+            ui.separator();
+            ui.label(format!(
+                "Behaviour classifier ({}-NN on {} annotated bursts), {}-fold time-blocked cross-validation: {:.0} % correct, balanced accuracy {:.0} % (mean recall per behaviour)",
+                rep.k,
+                rep.n_train,
+                rep.folds,
+                rep.accuracy * 100.0,
+                rep.balanced_accuracy * 100.0
+            ));
+            egui::Grid::new("acc_confusion")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("annotated ↓ / predicted →");
+                    for (k, name) in c.a.classes.iter().enumerate() {
+                        ui.colored_label(BEHAVIOUR_COLORS[k % BEHAVIOUR_COLORS.len()], name);
+                    }
+                    ui.strong("recall");
+                    ui.end_row();
+                    for (i, name) in c.a.classes.iter().enumerate() {
+                        ui.label(name);
+                        let row = &rep.confusion[i];
+                        for v in row {
+                            ui.label(v.to_string());
+                        }
+                        let n: usize = row.iter().sum();
+                        ui.label(if n > 0 {
+                            format!("{:.0} %", 100.0 * row[i] as f32 / n as f32)
+                        } else {
+                            "-".into()
+                        });
+                        ui.end_row();
+                    }
+                });
+            ui.weak("Every burst gets a predicted behaviour; fixes get the shares over their step (colour by 'ACC: behaviour').");
+        }
+        if ui
+            .button("export burst features CSV")
+            .on_hover_text(
+                "One row per burst: all features, flight flag, cluster and the matched track",
+            )
+            .clicked()
+        {
+            let csv = {
+                let tr_of = |si: usize| {
+                    self.acc_sets[si]
+                        .track
+                        .as_deref()
+                        .and_then(|k| self.track_by_key(k))
+                        .map(|i| self.tracks[i].id.clone())
+                        .unwrap_or_default()
+                };
+                crate::acc::bursts_csv(&self.acc_sets, &c.a, tr_of)
+            };
+            self.save_csv("wingtrack_acc_bursts.csv", csv);
+        }
+        ui.weak("Per-fix summaries (acc_* columns) are added to the annotated CSV export.");
+    }
+
+    /// Waveform and spectrum of the burst nearest the cursor for the focused track.
+    fn acc_burst_chart(&mut self, ui: &mut Ui) {
+        let Some(c) = &self.acc_cache else {
+            ui.weak("Load acceleration data to see bursts.");
+            return;
+        };
+        let focus = self
+            .selected_track
+            .or(self.selected.map(|s| s.0))
+            .or_else(|| self.tracks.iter().position(|t| t.visible));
+        let tk = focus.map(|i| self.track_key(i));
+        let t_ms = (self.t_now * 1000.0) as i64;
+        let mut best: Option<(i64, usize, usize)> = None;
+        for (si, s) in self.acc_sets.iter().enumerate() {
+            if tk.is_some() && s.track != tk {
+                continue;
+            }
+            for (bi, r) in c.a.per_set[si].iter().enumerate() {
+                let d = (r.f.t_ms - t_ms).abs();
+                if best.is_none_or(|b| d < b.0) {
+                    best = Some((d, si, bi));
+                }
+            }
+        }
+        let Some((_, si, bi)) = best else {
+            ui.weak("No ACC data for this track.");
+            return;
+        };
+        // per_set holds only bursts with absolute times, in order: map back by time
+        let row = &c.a.per_set[si][bi];
+        let (f, fl, cl) = (&row.f, &row.flight, &row.cluster);
+        let cls = |i: Option<usize>| i.and_then(|i| c.a.classes.get(i).cloned());
+        let set = &self.acc_sets[si];
+        let Some(b) = set.bursts.iter().find(|b| set.abs_ms(b) == Some(f.t_ms)) else {
+            return;
+        };
+        ui.label(format!(
+            "{} · {} · {:.2} s · dyn SD {:.2} g · wingbeat {} · {}{}{}{}",
+            set.id,
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(f.t_ms)
+                .map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+                .unwrap_or_default(),
+            f.dur_s,
+            f.dyn_sd,
+            f.wbf_hz
+                .map(|w| format!("{w:.1} Hz (peak {:.0} %)", f.peak_frac * 100.0))
+                .unwrap_or("-".into()),
+            if *fl { "flight" } else { "not flight" },
+            if c.a.params.k >= 2 {
+                format!(" · C{}", cl + 1)
+            } else {
+                String::new()
+            },
+            cls(row.label)
+                .map(|l| format!(" · annotated {l}"))
+                .unwrap_or_default(),
+            cls(row.behaviour)
+                .map(|l| format!(" · predicted {l}"))
+                .unwrap_or_default()
+        ));
+        let sr = b.sr as f64;
+        let axes: Vec<Vec<[f64; 2]>> = (0..3)
+            .map(|k| {
+                b.xyz
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| [i as f64 / sr * 1000.0, v[k] as f64])
+                    .collect()
+            })
+            .collect();
+        let dyn_: Vec<[f64; 3]> = b
+            .xyz
+            .iter()
+            .map(|v| {
+                [
+                    (v[0] - f.mean[0]) as f64,
+                    (v[1] - f.mean[1]) as f64,
+                    (v[2] - f.mean[2]) as f64,
+                ]
+            })
+            .collect();
+        let (fr, pw) = crate::acc::spectrum(&dyn_, sr);
+        let spec: Vec<[f64; 2]> = fr
+            .iter()
+            .zip(&pw)
+            .map(|(x, p)| [*x, p[0] + p[1] + p[2]])
+            .collect();
+        let band = c.a.params.band;
+        let w = ui.available_width();
+        ui.horizontal(|ui| {
+            Plot::new("acc_wave")
+                .width(w * 0.6)
+                .legend_if(!self.narrow)
+                .x_axis_label("ms")
+                .y_axis_label("g")
+                .allow_scroll(false)
+                .show(ui, |pui| {
+                    for (k, (name, col)) in [
+                        ("x", Color32::from_rgb(230, 97, 1)),
+                        ("y", Color32::from_rgb(94, 60, 153)),
+                        ("z", Color32::from_rgb(77, 175, 74)),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        pui.line(
+                            Line::new(name, PlotPoints::from(axes[k].clone()))
+                                .color(col)
+                                .width(1.3),
+                        );
+                    }
+                });
+            Plot::new("acc_spec")
+                .width(w * 0.38)
+                .x_axis_label("Hz")
+                .allow_scroll(false)
+                .show(ui, |pui| {
+                    pui.line(
+                        Line::new("power (x+y+z)", PlotPoints::from(spec))
+                            .color(Color32::from_gray(220)),
+                    );
+                    pui.vline(
+                        egui_plot::VLine::new("band", band.0 as f64).color(Color32::from_gray(90)),
+                    );
+                    pui.vline(
+                        egui_plot::VLine::new("band", band.1 as f64).color(Color32::from_gray(90)),
+                    );
+                    if let Some(w) = f.wbf_hz {
+                        pui.vline(
+                            egui_plot::VLine::new("wingbeat", w as f64)
+                                .color(Color32::from_rgb(255, 160, 40)),
+                        );
+                    }
+                });
+        });
     }
 
     // ------------------------------------------------------------------ structures
@@ -3460,6 +4363,8 @@ impl WingApp {
         {
             self.tracks.clear();
             self.files.clear();
+            self.acc_files.clear();
+            self.acc_sets.clear();
             self.selected = None;
             self.selected_track = None;
             self.packed_cache = None;
@@ -3502,7 +4407,7 @@ impl WingApp {
             // ---- files & firmware
             egui::CollapsingHeader::new(format!("Files & firmware ({})", self.files.len())).default_open(true).show(ui, |ui| {
                 if self.files.is_empty() {
-                    ui.weak("No files yet. Supported: Wildcloud TinyFox / NanoFox 30Days / FineScalePressure, Movebank Sigfox & GPS, CTT GPS, any lat/lon/time CSV.");
+                    ui.weak("No files yet. Supported: Wildcloud TinyFox / NanoFox 30Days / FineScalePressure, Movebank Sigfox & GPS, CTT GPS, any lat/lon/time CSV - plus acceleration (Movebank e-obs, Technosmart, FleaTag).");
                 }
                 let mut reparse: Option<(usize, String)> = None;
                 for (i, f) in self.files.iter().enumerate() {
@@ -3692,6 +4597,13 @@ impl WingApp {
                 }
             });
 
+            // ---- acceleration
+            egui::CollapsingHeader::new(format!("Acceleration ({})", self.acc_sets.len()))
+                .default_open(!self.acc_sets.is_empty())
+                .show(ui, |ui| {
+                    self.acc_panel(ui);
+                });
+
             // ---- wind turbines & structures
             egui::CollapsingHeader::new("Wind turbines & tall structures").default_open(false).show(ui, |ui| {
                 self.structures_panel(ui);
@@ -3844,7 +4756,12 @@ impl WingApp {
                 && let Some(f) = self.tracks.get(ti).and_then(|t| t.fixes.get(fi)) {
                     let tr = &self.tracks[ti];
                     egui::CollapsingHeader::new(format!("Selected fix · {}", tr.id)).default_open(true).show(ui, |ui| {
-                        fix_details(ui, tr, f);
+                        let classes: Vec<String> = self
+                            .acc_cache
+                            .as_ref()
+                            .map(|c| c.a.classes.clone())
+                            .unwrap_or_default();
+                        fix_details(ui, tr, f, &classes);
                     });
                 }
 
@@ -3950,6 +4867,7 @@ impl WingApp {
         match self.chart_var {
             ChartVar::Curtain => return self.curtain_chart(ui),
             ChartVar::Profile => return self.profile_chart(ui),
+            ChartVar::AccBurst => return self.acc_burst_chart(ui),
             _ => {}
         }
 
@@ -3959,7 +4877,19 @@ impl WingApp {
             if !tr.visible || self.selected_track.is_some_and(|s| s != i) {
                 continue;
             }
+            let tk = self.track_key(i);
             let pts: Vec<[f64; 2]> = match var {
+                ChartVar::Acc(m) => match &self.acc_cache {
+                    Some(c) => self
+                        .acc_sets
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.track.as_deref() == Some(tk.as_str()))
+                        .flat_map(|(si, _)| c.a.per_set[si].iter())
+                        .filter_map(|r| m.of(r).map(|v| [r.f.t_ms as f64 / 86_400_000.0, v]))
+                        .collect(),
+                    None => Vec::new(),
+                },
                 ChartVar::Sensor(k) => tr
                     .sensors
                     .iter()
@@ -4008,11 +4938,14 @@ impl WingApp {
             })
             .show(ui, |pui| {
                 for (name, c, pts) in &series {
-                    pui.line(
-                        Line::new(name.clone(), PlotPoints::from(pts.clone()))
-                            .color(*c)
-                            .width(1.5),
-                    );
+                    // per-burst ACC metrics are clouds of points, not lines
+                    if !matches!(var, ChartVar::Acc(_)) {
+                        pui.line(
+                            Line::new(name.clone(), PlotPoints::from(pts.clone()))
+                                .color(*c)
+                                .width(1.5),
+                        );
+                    }
                     pui.points(
                         Points::new(name.clone(), PlotPoints::from(pts.clone()))
                             .color(*c)
@@ -4092,6 +5025,7 @@ impl WingApp {
                 max_error_m: self.max_error_km * 1000.0,
                 hide_insignificant: self.hide_insignificant,
                 color_by: self.color_by,
+                acc_band: self.acc_params.band,
             },
             structs: self.st_cache.as_ref().filter(|_| self.st_on).map(|c| {
                 (
@@ -4114,6 +5048,11 @@ impl WingApp {
             map = map.with_layer(st as &mut dyn Tiles, self.sat_opacity);
         }
         let color_by = self.color_by;
+        let acc_classes: Vec<String> = self
+            .acc_cache
+            .as_ref()
+            .map(|c| c.a.classes.clone())
+            .unwrap_or_default();
         let wind_legend = (self.show_wind_field && !self.store.is_empty()).then_some(wind_pal);
         let sat_on = self.sat_on;
         let sat_label = self.sat_layer.label();
@@ -4179,7 +5118,7 @@ impl WingApp {
                 FontId::proportional(14.0),
                 Color32::WHITE,
             );
-            legend(p, r, color_by, wind_legend);
+            legend(p, r, color_by, wind_legend, &acc_classes);
             (centre.y(), centre.x())
         });
         self.map_center = Some(shown.inner);
@@ -4840,7 +5779,7 @@ impl WingApp {
     }
 }
 
-fn fix_details(ui: &mut Ui, tr: &Track, f: &Fix) {
+fn fix_details(ui: &mut Ui, tr: &Track, f: &Fix, classes: &[String]) {
     let w = &f.weather;
     let row = |ui: &mut Ui, k: &str, v: String| {
         ui.label(k);
@@ -4913,6 +5852,55 @@ fn fix_details(ui: &mut Ui, tr: &Track, f: &Fix) {
             row(ui, "ERA5 MSLP", o(w.msl_hpa, "hPa", 1));
             row(ui, "precipitation", o(w.precipitation_mm, "mm", 1));
             row(ui, "cloud cover", o(w.cloud_cover, "%", 0));
+            if let Some(a) = &f.acc {
+                row(ui, "ACC bursts (step)", a.n.to_string());
+                row(
+                    ui,
+                    "ACC flight share",
+                    format!("{:.0} %", a.flight_frac * 100.0),
+                );
+                row(
+                    ui,
+                    "ACC dynamic SD / VeDBA",
+                    format!("{:.2} / {:.2} g", a.dyn_sd, a.vedba),
+                );
+                row(ui, "ACC wingbeat", o(a.wbf_hz, "Hz", 1));
+                row(ui, "ACC pitch", format!("{:.0}°", a.pitch_deg));
+                if let Some(c) = a.cluster {
+                    let fr: Vec<String> = a
+                        .cluster_frac
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, x)| **x > 0.0)
+                        .map(|(i, x)| format!("C{} {:.0}%", i + 1, x * 100.0))
+                        .collect();
+                    row(ui, "ACC cluster", format!("C{} ({})", c + 1, fr.join(", ")));
+                }
+                if let Some(b) = a.behaviour {
+                    let fr: Vec<String> = a
+                        .behaviour_frac
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, x)| **x > 0.0)
+                        .map(|(i, x)| {
+                            format!(
+                                "{} {:.0}%",
+                                classes.get(i).map(String::as_str).unwrap_or("?"),
+                                x * 100.0
+                            )
+                        })
+                        .collect();
+                    row(
+                        ui,
+                        "ACC behaviour",
+                        format!(
+                            "{} ({})",
+                            classes.get(b).map(String::as_str).unwrap_or("?"),
+                            fr.join(", ")
+                        ),
+                    );
+                }
+            }
             if let Some(fw) = &w.flight {
                 row(
                     ui,
@@ -4972,6 +5960,7 @@ impl eframe::App for WingApp {
         self.plan_structures();
         self.pump_structures(ctx);
         self.ensure_st_cache();
+        self.ensure_acc_cache();
         self.record_tick(ctx);
         if self.playing {
             let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
@@ -5109,6 +6098,8 @@ struct ViewCfg {
     max_error_m: f32,
     hide_insignificant: bool,
     color_by: ColorBy,
+    /// Wingbeat band, for the wingbeat colour scale.
+    acc_band: (f32, f32),
 }
 
 struct TrackLayer<'a> {
@@ -5158,6 +6149,32 @@ impl ViewCfg {
                 let (a, b) = tr.time_range().unwrap_or((0, 1));
                 viridis(((f.t - a) as f32) / ((b - a).max(1) as f32))
             }
+            ColorBy::AccFlight => f
+                .acc
+                .as_ref()
+                .map(|a| viridis(a.flight_frac))
+                .unwrap_or(none),
+            ColorBy::AccWbf => f
+                .acc
+                .as_ref()
+                .and_then(|a| a.wbf_hz)
+                .map(|w| {
+                    let (lo, hi) = self.acc_band;
+                    viridis((w - lo) / (hi - lo).max(0.1))
+                })
+                .unwrap_or(none),
+            ColorBy::AccCluster => f
+                .acc
+                .as_ref()
+                .and_then(|a| a.cluster)
+                .map(|c| CLUSTER_COLORS[c % CLUSTER_COLORS.len()])
+                .unwrap_or(none),
+            ColorBy::AccBehaviour => f
+                .acc
+                .as_ref()
+                .and_then(|a| a.behaviour)
+                .map(|c| BEHAVIOUR_COLORS[c % BEHAVIOUR_COLORS.len()])
+                .unwrap_or(none),
         }
     }
 }
@@ -5450,9 +6467,42 @@ impl Plugin for TrackLayer<'_> {
 }
 
 /// Track colour legend, plus the wind-field speed scale stacked above it when shown.
-fn legend(p: &egui::Painter, r: Rect, by: ColorBy, wind: Option<WindPalette>) {
+fn legend(p: &egui::Painter, r: Rect, by: ColorBy, wind: Option<WindPalette>, classes: &[String]) {
     let mut origin = pos2(r.left() + 12.0, r.bottom() - 40.0);
-    if track_legend(p, origin, by) {
+    if by == ColorBy::AccBehaviour {
+        // one swatch per annotated behaviour
+        let n = classes.len().max(1);
+        let h = 16.0 * n as f32 + 18.0;
+        let top = origin + vec2(0.0, 30.0 - h);
+        p.rect_filled(
+            Rect::from_min_size(top - vec2(6.0, 4.0), vec2(170.0, h + 4.0)),
+            4.0,
+            Color32::from_black_alpha(160),
+        );
+        p.text(
+            top,
+            Align2::LEFT_TOP,
+            "ACC behaviour",
+            FontId::proportional(11.0),
+            Color32::WHITE,
+        );
+        for (i, c) in classes.iter().enumerate() {
+            let y = top.y + 16.0 + 16.0 * i as f32;
+            p.rect_filled(
+                Rect::from_min_size(pos2(top.x, y + 2.0), vec2(12.0, 10.0)),
+                2.0,
+                BEHAVIOUR_COLORS[i % BEHAVIOUR_COLORS.len()],
+            );
+            p.text(
+                pos2(top.x + 18.0, y),
+                Align2::LEFT_TOP,
+                c,
+                FontId::proportional(11.0),
+                Color32::WHITE,
+            );
+        }
+        origin.y -= h + 8.0;
+    } else if track_legend(p, origin, by) {
         origin.y -= 60.0;
     }
     if let Some(pal) = wind {
@@ -5475,6 +6525,20 @@ fn track_legend(p: &egui::Painter, origin: Pos2, by: ColorBy) -> bool {
         ColorBy::Altitude => ("altitude (m)", "0", "1500", false),
         ColorBy::GroundSpeed => ("ground speed (m/s)", "0", "15", false),
         ColorBy::Time => ("time within track", "start", "end", false),
+        ColorBy::AccFlight => ("ACC flight share of the step", "0 %", "100 %", false),
+        ColorBy::AccWbf => ("ACC wingbeat frequency", "band low", "band high", false),
+        ColorBy::AccBehaviour => return false,
+        ColorBy::AccCluster => {
+            colorbar(
+                p,
+                origin,
+                "ACC behaviour cluster",
+                "C1 calm",
+                "dynamic",
+                &|x| CLUSTER_COLORS[((x * 5.999) as usize).min(5)],
+            );
+            return true;
+        }
     };
     let f = |x: f32| {
         if div {
@@ -5591,6 +6655,11 @@ fn web_download(name: &str, bytes: &[u8], mime: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Cell `c` of a table row ("" if missing).
+fn t_get(r: &[String], c: usize) -> &str {
+    r.get(c).map(String::as_str).unwrap_or("")
+}
+
 /// Tracks to (re)filter (empty = all visible) and the range, `None` to clear.
 type DateAction = (Vec<usize>, Option<(i64, i64)>);
 
@@ -5628,6 +6697,191 @@ fn parse_date_range(from: &str, to: &str) -> Result<(i64, i64), String> {
 #[cfg(test)]
 mod share_tests {
     use super::*;
+
+    /// Synthetic Movebank e-obs ACC for a track: a burst every 10 min, flapping at 9 Hz in
+    /// the first half of the deployment, at rest afterwards.
+    fn eobs_for(tr: &Track) -> String {
+        let (t0, t1) = tr.time_range().unwrap();
+        let mut out = String::from(
+            "event-id,timestamp,eobs:accelerations-raw,eobs:acceleration-axes,eobs:acceleration-sampling-frequency-per-axis,individual-local-identifier,tag-local-identifier\n",
+        );
+        let mid = (t0 + t1) / 2;
+        let mut t = t0;
+        let mut id = 0;
+        while t <= t1 {
+            let fly = t < mid;
+            let raw: Vec<String> = (0..40)
+                .map(|i| {
+                    let ph = std::f64::consts::TAU * 9.0 * i as f64 / 33.0;
+                    let z = 2048.0 + 512.0 + if fly { 700.0 * ph.sin() } else { 0.0 };
+                    format!("2048 {} {}", 2048 + (i % 3), z.round())
+                })
+                .collect();
+            out.push_str(&format!(
+                "{id},{}.000,{},XYZ,33,{},5001\n",
+                fmt_time(t),
+                raw.join(" "),
+                tr.id
+            ));
+            t += 600;
+            id += 1;
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn acc_real_files() {
+        // WT_ACC=a.csv:b.csv cargo test acc_real_files -- --ignored --nocapture
+        let Ok(list) = std::env::var("WT_ACC") else {
+            return;
+        };
+        let mut a = WingApp::blank();
+        for p in list.split(':') {
+            let name = p.rsplit('/').next().unwrap().to_string();
+            let t0 = std::time::Instant::now();
+            a.add_file_from(
+                name,
+                std::fs::read(p).unwrap(),
+                None,
+                Some(FileOrigin::Local),
+            );
+            println!("read {p} in {:?}", t0.elapsed());
+        }
+        for l in &a.log {
+            println!("log: {l}");
+        }
+        let t0 = std::time::Instant::now();
+        a.ensure_acc_cache();
+        println!("analysis {:?}", t0.elapsed());
+        for s in &a.acc_sets {
+            let labels = s.bursts.iter().filter(|b| b.label.is_some()).count();
+            println!(
+                "set {} file {} bursts {} labelled {} track {:?} notes {:?}",
+                s.id,
+                s.file,
+                s.bursts.len(),
+                labels,
+                s.track,
+                s.notes
+            );
+        }
+        let c = a.acc_cache.as_ref().unwrap();
+        println!("classes {:?}", c.a.classes);
+        if let Some(r) = &c.a.classifier {
+            println!(
+                "kNN k={} n={} acc={:.3} bal={:.3} confusion={:?}",
+                r.k, r.n_train, r.accuracy, r.balanced_accuracy, r.confusion
+            );
+        }
+        for (i, ci) in c.a.clusters.iter().enumerate() {
+            println!(
+                "C{} n={} dyn={:.2} wbf={:?} pitch={:.0} flight={:.2} labels={:?}",
+                i + 1,
+                ci.n,
+                ci.dyn_sd,
+                ci.wbf_hz,
+                ci.pitch_deg,
+                ci.flight_frac,
+                ci.label_frac
+            );
+        }
+        for (si, v) in c.a.per_set.iter().enumerate() {
+            let mut by: std::collections::BTreeMap<String, (usize, f32, Vec<f32>)> =
+                Default::default();
+            for r in v {
+                let l = r
+                    .label
+                    .map(|l| c.a.classes[l].clone())
+                    .unwrap_or("-".into());
+                let e = by.entry(l).or_default();
+                e.0 += 1;
+                e.1 += r.f.dyn_sd;
+                if let Some(w) = r.f.wbf_hz.filter(|_| r.flight && r.f.peak_frac > 0.2) {
+                    e.2.push(w);
+                }
+            }
+            for (l, (n, d, mut w)) in by {
+                w.sort_by(|a, b| a.total_cmp(b));
+                println!(
+                    "  set{si} {l:10} n={n:5} mean dynSD={:.3} g  median wbf(flight)={:?} (n={})",
+                    d / n as f32,
+                    w.get(w.len() / 2),
+                    w.len()
+                );
+            }
+        }
+        for tr in &a.tracks {
+            let ann = tr.fixes.iter().filter(|f| f.acc.is_some()).count();
+            println!(
+                "track {} fixes {} with acc {} first {:?}",
+                tr.id,
+                tr.fixes.len(),
+                ann,
+                tr.fixes.iter().find_map(|f| f.acc.as_deref())
+            );
+        }
+    }
+
+    #[test]
+    fn acceleration_end_to_end() {
+        let mut a = WingApp::blank();
+        a.load_demo();
+        let tr0 = a.tracks[0].clone();
+        let n = a.tracks.len();
+        a.add_file_from(
+            "acc.csv".into(),
+            eobs_for(&tr0).into_bytes(),
+            None,
+            Some(FileOrigin::Local),
+        );
+        assert_eq!(a.tracks.len(), n, "an ACC file adds no tracks");
+        assert_eq!(a.acc_sets.len(), 1);
+        a.acc_params.k = 2;
+        a.ensure_acc_cache();
+        assert_eq!(
+            a.acc_sets[0].track.as_deref(),
+            Some(a.track_key(0).as_str()),
+            "matched by id"
+        );
+        let annotated: Vec<&crate::acc::FixAcc> = a.tracks[0]
+            .fixes
+            .iter()
+            .filter_map(|f| f.acc.as_deref())
+            .collect();
+        assert!(annotated.len() > 3);
+        let early = annotated.first().unwrap();
+        let late = annotated.last().unwrap();
+        assert!(
+            early.flight_frac > 0.9 && late.flight_frac < 0.1,
+            "{early:?} {late:?}"
+        );
+        assert!((early.wbf_hz.unwrap() - 9.0).abs() < 0.5);
+        assert_ne!(early.cluster, late.cluster);
+        assert!(a.tracks[1].fixes.iter().all(|f| f.acc.is_none()));
+        // export columns
+        let mut tr = a.tracks[0].clone();
+        tr.fixes.retain(|f| f.acc.is_some());
+        // share round trip of settings and set state
+        a.acc_params.flight_g = 0.7;
+        a.acc_sets[0].clock_rate = 0.015;
+        let m = a.share_map(true);
+        let mut b = WingApp::blank();
+        b.load_demo();
+        b.add_file_from(
+            "acc.csv".into(),
+            eobs_for(&tr0).into_bytes(),
+            None,
+            Some(FileOrigin::Local),
+        );
+        b.apply_share_settings(&m);
+        b.apply_share_view(&m);
+        assert_eq!(b.acc_params, a.acc_params);
+        assert!((b.acc_sets[0].clock_rate - 0.015).abs() < 1e-9);
+        assert_eq!(b.acc_sets[0].track, a.acc_sets[0].track);
+        b.ensure_acc_cache();
+        assert!(b.tracks[0].fixes.iter().any(|f| f.acc.is_some()));
+    }
 
     #[test]
     #[ignore]

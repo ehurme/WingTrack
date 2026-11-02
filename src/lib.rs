@@ -8,6 +8,7 @@
 //! * [`video`] — MP4 / GIF export of the animated map and charts
 //! * [`app`] — the egui application (native and web)
 
+pub mod acc;
 pub mod app;
 pub mod cds;
 pub mod demo;
