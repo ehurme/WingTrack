@@ -55,6 +55,11 @@ enum Msg {
         tiles: Vec<crate::structures::Tile>,
         result: Result<String, String>,
     },
+    /// IBTrACS cyclone table (ERDDAP subset or imported CSV).
+    Cyclones {
+        name: String,
+        result: Result<Vec<u8>, String>,
+    },
     /// A wind-turbine / structure register CSV picked by the user.
     StructFile {
         name: String,
@@ -548,6 +553,15 @@ pub struct WingApp {
     /// Track whose date-range editor is open, with the From / To text.
     date_edit: Option<usize>,
     falloff: crate::falloff::Params,
+    // weather layers & storms
+    wx_field: crate::wxfield::FieldVar,
+    wx_isobars: bool,
+    wx_centres: bool,
+    storms: Vec<crate::cyclones::Storm>,
+    storms_on: bool,
+    storms_busy: bool,
+    /// A shared link asked for cyclones: fetch once the tracks are in.
+    storms_fetch_pending: bool,
     // acceleration
     acc_files: Vec<AccFile>,
     acc_sets: Vec<crate::acc::AccSet>,
@@ -728,6 +742,13 @@ impl WingApp {
             selected_track: None,
             date_edit: None,
             falloff: crate::falloff::Params::default(),
+            wx_field: crate::wxfield::FieldVar::Off,
+            wx_isobars: false,
+            wx_centres: false,
+            storms: Vec::new(),
+            storms_on: true,
+            storms_busy: false,
+            storms_fetch_pending: false,
             acc_files: Vec::new(),
             acc_sets: Vec::new(),
             acc_params: crate::acc::Params::default(),
@@ -1172,6 +1193,18 @@ impl WingApp {
             })
             .collect();
         m.set_if(!ranges.is_empty(), "dr", ranges.join(";"));
+        if self.wx_field != crate::wxfield::FieldVar::Off || self.wx_isobars || self.wx_centres {
+            m.set(
+                "wxl",
+                format!(
+                    "{},{},{}",
+                    name(&self.wx_field),
+                    self.wx_isobars as u8,
+                    self.wx_centres as u8
+                ),
+            );
+        }
+        m.set_if(self.storms_on && !self.storms.is_empty(), "tc", 1);
         let ap = &self.acc_params;
         if !self.acc_sets.is_empty() || *ap != crate::acc::Params::default() {
             m.set(
@@ -1255,6 +1288,18 @@ impl WingApp {
 
     /// Settings that don't depend on the data.
     fn apply_share_settings(&mut self, m: &ShareMap) {
+        if let Some(v) = m.get("wxl") {
+            let p: Vec<&str> = v.split(',').collect();
+            if let Some(f) = p
+                .first()
+                .and_then(|f| from_name(&crate::wxfield::FieldVar::ALL, f))
+            {
+                self.wx_field = f;
+            }
+            self.wx_isobars = p.get(1) == Some(&"1");
+            self.wx_centres = p.get(2) == Some(&"1");
+        }
+        self.storms_fetch_pending = m.get("tc") == Some("1");
         if let [lo, hi, fl, pk, k, win, slope, ..] = m.nums("acc")[..] {
             self.acc_params = crate::acc::Params {
                 band: (lo as f32, hi as f32),
@@ -1942,6 +1987,24 @@ impl WingApp {
         let mut tracks: Vec<Track> = Vec::new();
         for (ti, tr) in self.tracks.iter().enumerate().filter(|(_, t)| t.visible) {
             let mut tr = tr.clone();
+            if !self.storms.is_empty() {
+                for f in tr.fixes.iter_mut() {
+                    let near = crate::cyclones::nearest(&self.storms, f.lat, f.lon, f.t, 1500.0);
+                    let (name, d, w, c) = match &near {
+                        Some((i, d, p)) => (
+                            self.storms[*i].label(),
+                            format!("{d:.0}"),
+                            p.wind_kt.map(|w| format!("{w:.0}")).unwrap_or_default(),
+                            crate::cyclones::category(p.sshs, p.wind_kt, &p.nature).0,
+                        ),
+                        None => Default::default(),
+                    };
+                    f.extra.push(("tc_name".into(), name));
+                    f.extra.push(("tc_distance_km".into(), d));
+                    f.extra.push(("tc_wind_kt".into(), w));
+                    f.extra.push(("tc_category".into(), c));
+                }
+            }
             if let Some(ac) = &self.acc_cache {
                 let k = self.acc_params.k;
                 let classes = ac.a.classes.clone();
@@ -2700,6 +2763,188 @@ impl WingApp {
                     }
                 });
         });
+    }
+
+    // ------------------------------------------------------------------ weather & storms
+
+    /// Ask NOAA's ERDDAP for IBTrACS points within the tracks' window (± 3 days) and area
+    /// (± 25° — cyclones far from the animals still matter for wind).
+    fn fetch_cyclones(&mut self, ctx: &egui::Context) {
+        let (mut s, mut n, mut w, mut e) = (90.0f64, -90.0f64, 180.0f64, -180.0f64);
+        for f in self
+            .tracks
+            .iter()
+            .filter(|t| t.visible)
+            .flat_map(|t| t.fixes.iter())
+        {
+            s = s.min(f.lat);
+            n = n.max(f.lat);
+            w = w.min(f.lon);
+            e = e.max(f.lon);
+        }
+        if s > n {
+            return;
+        }
+        let url = crate::cyclones::erddap_url(
+            self.t_min as i64 - 3 * 86_400,
+            self.t_max as i64 + 3 * 86_400,
+            (s - 25.0).max(-90.0),
+            (n + 25.0).min(90.0),
+            (w - 25.0).max(-180.0),
+            (e + 25.0).min(180.0),
+        );
+        self.storms_busy = true;
+        self.status(
+            "IBTrACS: asking NOAA ERDDAP for tropical cyclones near the tracks…".to_string(),
+        );
+        let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+        let mut req = ehttp::Request::get(url);
+        req.timeout = Some(std::time::Duration::from_secs(120));
+        ehttp::fetch(req, move |res| {
+            let result = match res {
+                Ok(r) if r.ok => Ok(r.bytes),
+                Ok(r) => Err(format!(
+                    "HTTP {} {}",
+                    r.status,
+                    r.text().unwrap_or("").chars().take(200).collect::<String>()
+                )),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(Msg::Cyclones {
+                name: "IBTrACS (ERDDAP)".into(),
+                result,
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    fn import_cyclones_dialog(&self, ctx: &egui::Context) {
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("IBTrACS CSV", &["csv", "gz"])
+                .pick_file()
+            {
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let result = std::fs::read(&p).map_err(|e| e.to_string());
+                let _ = tx.send(Msg::Cyclones { name, result });
+                ctx.request_repaint();
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(f) = rfd::AsyncFileDialog::new()
+                .add_filter("IBTrACS CSV", &["csv", "gz"])
+                .pick_file()
+                .await
+            {
+                let bytes = f.read().await;
+                let _ = tx.send(Msg::Cyclones {
+                    name: f.file_name(),
+                    result: Ok(bytes),
+                });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn weather_layers_panel(&mut self, ui: &mut egui::Ui) {
+        use crate::wxfield::FieldVar;
+        ui.label("ERA5 around the animals (hour under the cursor):");
+        let before = (self.wx_field, self.wx_isobars, self.wx_centres);
+        egui::ComboBox::from_label("colour field")
+            .selected_text(self.wx_field.label())
+            .show_ui(ui, |ui| {
+                for v in FieldVar::ALL {
+                    ui.selectable_value(&mut self.wx_field, v, v.label());
+                }
+            });
+        ui.checkbox(&mut self.wx_isobars, "isobars (4 hPa)");
+        ui.checkbox(&mut self.wx_centres, "lows / highs and storms")
+            .on_hover_text("L / H at MSL pressure extremes; a low is marked as a storm when ≤ 995 hPa or with gale-force (≥ 17.2 m/s) 10 m wind nearby");
+        if before != (self.wx_field, self.wx_isobars, self.wx_centres) {
+            // the fields come from the wind-field downloads around the animals
+            self.surface_field_days.clear();
+        }
+        ui.weak(format!(
+            "Uses the ERA5 wind-field downloads (radius {:.1}°, spacing {}° — ERA5 panel); fetched a week at a time as you move.",
+            self.opts.field_margin_deg,
+            self.opts.field_stride as f64 * weather::GRID
+        ));
+        ui.separator();
+        ui.label("Tropical cyclones (IBTrACS best tracks):");
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!self.tracks.is_empty() && !self.storms_busy, egui::Button::new("Load for the tracks"))
+                .on_hover_text("Hurricanes / typhoons within ±25° of the tracks during their time span, from NOAA AOML's ERDDAP (IBTrACS since 1980)")
+                .clicked()
+            {
+                self.fetch_cyclones(ui.ctx());
+            }
+            if ui
+                .button("Import IBTrACS CSV…")
+                .on_hover_text("e.g. ibtracs.last3years.list.v04r01.csv or a basin file from NCEI")
+                .clicked()
+            {
+                self.import_cyclones_dialog(ui.ctx());
+            }
+            if self.storms_busy {
+                ui.spinner();
+            }
+        });
+        if self.storms.is_empty() {
+            return;
+        }
+        ui.checkbox(
+            &mut self.storms_on,
+            format!("show {} storm(s)", self.storms.len()),
+        );
+        // closest approach of any visible animal to each storm
+        egui::ScrollArea::vertical()
+            .max_height(160.0)
+            .id_salt("storm_list")
+            .show(ui, |ui| {
+                egui::Grid::new("storms").striped(true).show(ui, |ui| {
+                    for h in ["storm", "peak", "closest animal"] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    for st in &self.storms {
+                        let (cat, col) =
+                            crate::cyclones::category(st.peak_category(), st.max_wind_kt(), "");
+                        ui.colored_label(col, st.label());
+                        ui.label(format!(
+                            "{cat}{}",
+                            st.max_wind_kt()
+                                .map(|w| format!(", {w:.0} kt"))
+                                .unwrap_or_default()
+                        ));
+                        let mut best: Option<(f64, &str, i64)> = None;
+                        for tr in self.tracks.iter().filter(|t| t.visible) {
+                            for f in &tr.fixes {
+                                if let Some(p) = st.at(f.t) {
+                                    let d = crate::geo::haversine_m(f.lat, f.lon, p.lat, p.lon)
+                                        / 1000.0;
+                                    if best.is_none_or(|b| d < b.0) {
+                                        best = Some((d, &tr.id, f.t));
+                                    }
+                                }
+                            }
+                        }
+                        ui.label(
+                            best.map(|(d, id, t)| format!("{d:.0} km · {id} · {}", fmt_date(t)))
+                                .unwrap_or("not during the tracks".into()),
+                        );
+                        ui.end_row();
+                    }
+                });
+            });
+        ui.weak("Annotated CSV export gains tc_name / tc_distance_km / tc_wind_kt / tc_category (nearest cyclone within 1500 km at each fix). Data: NOAA NCEI IBTrACS v04r01.");
     }
 
     // ------------------------------------------------------------------ structures
@@ -3549,8 +3794,10 @@ impl WingApp {
 
     /// Same for the 2D (surface ERA5) wind field, once the user has annotated at least once.
     fn maybe_request_surface_field(&mut self) {
-        if !self.surface_field_on
-            || !self.show_wind_field
+        let layers =
+            self.wx_field != crate::wxfield::FieldVar::Off || self.wx_isobars || self.wx_centres;
+        if !(self.surface_field_on || layers)
+            || !(self.show_wind_field || layers)
             || self.opts.field_margin_deg <= 0.0
             || self.tracks.is_empty()
             || self.queue.len() > 20
@@ -3879,6 +4126,33 @@ impl WingApp {
                 }
                 Msg::Cds { run, result } => self.on_cds_response(run, result),
                 Msg::Overpass { tiles, result } => self.on_overpass(tiles, result),
+                Msg::Cyclones { name, result } => {
+                    self.storms_busy = false;
+                    match result {
+                        Ok(bytes) => match crate::cyclones::parse(&name, &bytes, None) {
+                            Ok(v) => {
+                                let names: Vec<String> = v.iter().map(|s| s.label()).collect();
+                                self.storms = v;
+                                self.storms_on = true;
+                                self.status(format!(
+                                    "Tropical cyclones (IBTrACS): {} storm(s) - {}",
+                                    names.len(),
+                                    names.join(", ")
+                                ));
+                            }
+                            Err(e) => self.status(format!("! {name}: {e}")),
+                        },
+                        // ERDDAP answers 404 when nothing matches the query
+                        Err(e) if e.starts_with("HTTP 404") => {
+                            self.storms.clear();
+                            self.status("IBTrACS: no tropical cyclones in the tracks' time window and area".to_string());
+                        }
+                        Err(e) => self.status(format!(
+                            "! IBTrACS download failed ({e}) - download a CSV from NCEI ({}) and use 'Import IBTrACS CSV…'",
+                            crate::cyclones::NCEI_PAGE
+                        )),
+                    }
+                }
                 Msg::StructFile { name, bytes } => {
                     match crate::table::Table::from_bytes(&name, &bytes)
                         .and_then(|t| crate::structures::from_table(&t))
@@ -4387,8 +4661,8 @@ impl WingApp {
                     ui.selectable_value(&mut self.basemap, b, b.label());
                 }
             });
-        ui.checkbox(&mut self.sat_on, "Daily satellite").on_hover_text(
-            "NASA GIBS imagery for the date under the time cursor - see cloud fronts the animals flew through",
+        ui.checkbox(&mut self.sat_on, "Satellite & weather imagery").on_hover_text(
+            "NASA GIBS imagery for the time under the cursor: true colour (clouds, fronts), GPM IMERG precipitation (30 min) or AIRS surface air temperature",
         );
         if self.sat_on {
             egui::ComboBox::from_id_salt("sat")
@@ -4399,6 +4673,16 @@ impl WingApp {
                     }
                 });
             ui.add(egui::Slider::new(&mut self.sat_opacity, 0.1..=1.0).text("opacity"));
+            if let Some((title, lo, hi)) = self.sat_layer.legend() {
+                ui.weak(format!(
+                    "{title}: {lo} → {hi} (NASA Worldview colour scale). Time step: {}",
+                    if self.sat_layer == SatLayer::ImergPrecip {
+                        "30 min"
+                    } else {
+                        "1 day"
+                    }
+                ));
+            }
         }
     }
 
@@ -4603,6 +4887,11 @@ impl WingApp {
                 .show(ui, |ui| {
                     self.acc_panel(ui);
                 });
+
+            // ---- weather layers & storms
+            egui::CollapsingHeader::new("Weather layers & storms").default_open(false).show(ui, |ui| {
+                self.weather_layers_panel(ui);
+            });
 
             // ---- wind turbines & structures
             egui::CollapsingHeader::new("Wind turbines & tall structures").default_open(false).show(ui, |ui| {
@@ -4991,7 +5280,7 @@ impl WingApp {
             .base_tiles
             .entry(basemap)
             .or_insert_with(|| HttpTiles::new(basemap, ctx.clone()));
-        let date = fmt_date(self.t_now as i64);
+        let date = self.sat_layer.time_key(self.t_now as i64);
         let sat_key = (self.sat_layer, date.clone());
         if self.sat_on && !self.sat_tiles.contains_key(&sat_key) {
             if self.sat_tiles.len() > 4 {
@@ -5037,6 +5326,15 @@ impl WingApp {
                     self.st_highlight.then_some(&c.near),
                 )
             }),
+            wx: WxDraw::build(
+                &self.store,
+                self.t_now as i64,
+                self.opts.field_stride,
+                self.wx_field,
+                self.wx_isobars,
+                self.wx_centres,
+            ),
+            storms: (self.storms_on && !self.storms.is_empty()).then_some(&self.storms[..]),
             out: &mut interaction,
         };
 
@@ -5048,6 +5346,7 @@ impl WingApp {
             map = map.with_layer(st as &mut dyn Tiles, self.sat_opacity);
         }
         let color_by = self.color_by;
+        let wx_field = self.wx_field;
         let acc_classes: Vec<String> = self
             .acc_cache
             .as_ref()
@@ -5118,7 +5417,7 @@ impl WingApp {
                 FontId::proportional(14.0),
                 Color32::WHITE,
             );
-            legend(p, r, color_by, wind_legend, &acc_classes);
+            legend(p, r, color_by, wind_legend, &acc_classes, wx_field);
             (centre.y(), centre.x())
         });
         self.map_center = Some(shown.inner);
@@ -5199,7 +5498,7 @@ impl WingApp {
     fn map3d(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let _ = self.current_slice();
-        let date = fmt_date(self.t_now as i64);
+        let date = self.sat_layer.time_key(self.t_now as i64);
         let sat_key = (self.sat_layer, date.clone());
         if self.sat_on && !self.sat_tiles.contains_key(&sat_key) {
             if self.sat_tiles.len() > 4 {
@@ -5957,6 +6256,10 @@ impl eframe::App for WingApp {
         }
         self.pump_weather(ctx);
         self.pump_cds(ctx);
+        if self.storms_fetch_pending && !self.tracks.is_empty() && self.downloads_idle() {
+            self.storms_fetch_pending = false;
+            self.fetch_cyclones(ctx);
+        }
         self.plan_structures();
         self.pump_structures(ctx);
         self.ensure_st_cache();
@@ -6116,7 +6419,63 @@ struct TrackLayer<'a> {
     app: ViewCfg,
     /// Wind turbines & structures, plus steps to highlight.
     structs: Option<StructLayer<'a>>,
+    /// ERA5 colour field, isobars and pressure centres at the cursor hour.
+    wx: Option<WxDraw>,
+    storms: Option<&'a [crate::cyclones::Storm]>,
     out: &'a mut Interaction,
+}
+
+/// One isobar level and its segments (lat, lon).
+type Isobar = (f32, Vec<[(f64, f64); 2]>);
+
+/// Weather layers prepared for one frame.
+struct WxDraw {
+    var: crate::wxfield::FieldVar,
+    field: Option<crate::wxfield::Grid>,
+    isobars: Vec<Isobar>,
+    centres: Vec<crate::wxfield::Centre>,
+}
+
+impl WxDraw {
+    fn build(
+        store: &WeatherStore,
+        t: i64,
+        step: i32,
+        var: crate::wxfield::FieldVar,
+        isobars: bool,
+        centres: bool,
+    ) -> Option<WxDraw> {
+        use crate::wxfield::{self as wx, FieldVar};
+        if var == FieldVar::Off && !isobars && !centres {
+            return None;
+        }
+        let field = (var != FieldVar::Off)
+            .then(|| wx::grid(store, t, step, |v| var.value(v)))
+            .flatten();
+        let p = (isobars || centres)
+            .then(|| wx::grid(store, t, step, |v| FieldVar::Pressure.value(v)))
+            .flatten();
+        let iso = match (&p, isobars) {
+            (Some(p), true) => wx::levels(p, 4.0)
+                .into_iter()
+                .map(|l| (l, wx::contour(p, l)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let cen = match (&p, centres) {
+            (Some(p), true) => {
+                let w = wx::grid(store, t, step, |v| FieldVar::Wind.value(v));
+                wx::centres(p, w.as_ref())
+            }
+            _ => Vec::new(),
+        };
+        Some(WxDraw {
+            var,
+            field,
+            isobars: iso,
+            centres: cen,
+        })
+    }
 }
 
 impl ViewCfg {
@@ -6193,6 +6552,180 @@ impl Plugin for TrackLayer<'_> {
             |lat: f64, lon: f64| -> Pos2 { projector.project(lon_lat(lon, lat)).to_pos2() };
         let hover_pos = response.hover_pos();
         let mut best: Option<(f32, usize, usize, Pos2)> = None;
+
+        // ERA5 weather layers: colour field, isobars, lows / highs.
+        if let Some(wx) = &self.wx {
+            if let Some(g) = &wx.field {
+                let mut mesh = egui::Mesh::default();
+                let mut idx = vec![u32::MAX; g.ni * g.nj];
+                for a in 0..g.ni {
+                    for b in 0..g.nj {
+                        let v = g.at(a, b);
+                        if !v.is_finite() {
+                            continue;
+                        }
+                        let (la, lo) = g.latlon(a as f64, b as f64);
+                        idx[a * g.nj + b] = mesh.vertices.len() as u32;
+                        mesh.colored_vertex(to_screen(la, lo), wx.var.color(wx.var.norm(v), v));
+                    }
+                }
+                for a in 0..g.ni.saturating_sub(1) {
+                    for b in 0..g.nj.saturating_sub(1) {
+                        let q = [
+                            idx[a * g.nj + b],
+                            idx[a * g.nj + b + 1],
+                            idx[(a + 1) * g.nj + b],
+                            idx[(a + 1) * g.nj + b + 1],
+                        ];
+                        if q.iter().all(|&i| i != u32::MAX) {
+                            mesh.add_triangle(q[0], q[1], q[3]);
+                            mesh.add_triangle(q[0], q[3], q[2]);
+                        }
+                    }
+                }
+                painter.add(egui::Shape::mesh(mesh));
+            }
+            for (level, segs) in &wx.isobars {
+                let major = (*level as i32) % 20 == 0;
+                let stroke = Stroke::new(
+                    if major { 1.6 } else { 1.0 },
+                    Color32::from_rgba_unmultiplied(250, 250, 250, 190),
+                );
+                for s in segs {
+                    painter.line_segment(
+                        [to_screen(s[0].0, s[0].1), to_screen(s[1].0, s[1].1)],
+                        stroke,
+                    );
+                }
+                if let Some(s) = segs
+                    .iter()
+                    .map(|s| to_screen(s[0].0, s[0].1))
+                    .find(|p| clip.shrink(30.0).contains(*p))
+                {
+                    let txt = format!("{level:.0}");
+                    let r = painter.text(
+                        s,
+                        Align2::CENTER_CENTER,
+                        &txt,
+                        FontId::proportional(10.0),
+                        Color32::WHITE,
+                    );
+                    painter.rect_filled(r.expand(1.5), 2.0, Color32::from_black_alpha(140));
+                    painter.text(
+                        s,
+                        Align2::CENTER_CENTER,
+                        &txt,
+                        FontId::proportional(10.0),
+                        Color32::WHITE,
+                    );
+                }
+            }
+            for c in &wx.centres {
+                let p = to_screen(c.lat, c.lon);
+                if !clip.contains(p) {
+                    continue;
+                }
+                let col = if c.low {
+                    Color32::from_rgb(235, 60, 60)
+                } else {
+                    Color32::from_rgb(60, 130, 235)
+                };
+                if c.storm {
+                    painter.circle_stroke(
+                        p,
+                        16.0,
+                        Stroke::new(2.5, Color32::from_rgb(255, 70, 70)),
+                    );
+                }
+                let big = painter.text(
+                    p,
+                    Align2::CENTER_CENTER,
+                    if c.low { "L" } else { "H" },
+                    FontId::proportional(22.0),
+                    col,
+                );
+                let sub = format!(
+                    "{:.0} hPa{}{}",
+                    c.hpa,
+                    c.max_wind
+                        .filter(|_| c.low)
+                        .map(|w| format!(" · {w:.0} m/s"))
+                        .unwrap_or_default(),
+                    if c.storm { " · storm" } else { "" }
+                );
+                painter.text(
+                    big.center_bottom() + vec2(0.0, 2.0),
+                    Align2::CENTER_TOP,
+                    sub,
+                    FontId::proportional(11.0),
+                    Color32::WHITE,
+                );
+            }
+        }
+
+        // Tropical cyclones: best tracks coloured by category, position at the cursor.
+        if let Some(storms) = self.storms {
+            let t = self.t_now as i64;
+            for st in storms {
+                for w in st.pts.windows(2) {
+                    let (_, col) = crate::cyclones::category(w[0].sshs, w[0].wind_kt, &w[0].nature);
+                    painter.line_segment(
+                        [to_screen(w[0].lat, w[0].lon), to_screen(w[1].lat, w[1].lon)],
+                        Stroke::new(2.0, col.gamma_multiply(0.7)),
+                    );
+                }
+                for p in st.pts.iter().filter(|p| p.t % (6 * 3600) == 0) {
+                    let (_, col) = crate::cyclones::category(p.sshs, p.wind_kt, &p.nature);
+                    painter.circle_filled(to_screen(p.lat, p.lon), 2.2, col);
+                }
+                if let Some(p) = st.at(t) {
+                    let (cat, col) = crate::cyclones::category(p.sshs, p.wind_kt, &p.nature);
+                    let sp = to_screen(p.lat, p.lon);
+                    painter.circle(sp, 9.0, col, Stroke::new(2.0, Color32::BLACK));
+                    for k in 0..2 {
+                        let a = std::f32::consts::PI * k as f32;
+                        let arm: Vec<Pos2> = (0..8)
+                            .map(|i| {
+                                let r = 9.0 + i as f32 * 1.6;
+                                let th = a + i as f32 * 0.35;
+                                sp + vec2(th.cos(), th.sin()) * r
+                            })
+                            .collect();
+                        painter.add(egui::Shape::line(arm, Stroke::new(2.0, col)));
+                    }
+                    let txt = format!(
+                        "{} · {cat}{}",
+                        st.label(),
+                        p.wind_kt
+                            .map(|w| format!(" · {w:.0} kt"))
+                            .unwrap_or_default()
+                    );
+                    let r = painter.text(
+                        sp + vec2(16.0, -12.0),
+                        Align2::LEFT_BOTTOM,
+                        &txt,
+                        FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                    painter.rect_filled(r.expand(2.0), 3.0, Color32::from_black_alpha(150));
+                    painter.text(
+                        sp + vec2(16.0, -12.0),
+                        Align2::LEFT_BOTTOM,
+                        &txt,
+                        FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                } else if let Some(p0) = st.pts.first() {
+                    painter.text(
+                        to_screen(p0.lat, p0.lon) + vec2(4.0, -4.0),
+                        Align2::LEFT_BOTTOM,
+                        st.label(),
+                        FontId::proportional(10.0),
+                        Color32::from_gray(200),
+                    );
+                }
+            }
+        }
 
         // ERA5 wind field at the cursor time.
         if self.show_wind_field && !self.store.is_empty() {
@@ -6467,8 +7000,23 @@ impl Plugin for TrackLayer<'_> {
 }
 
 /// Track colour legend, plus the wind-field speed scale stacked above it when shown.
-fn legend(p: &egui::Painter, r: Rect, by: ColorBy, wind: Option<WindPalette>, classes: &[String]) {
+fn legend(
+    p: &egui::Painter,
+    r: Rect,
+    by: ColorBy,
+    wind: Option<WindPalette>,
+    classes: &[String],
+    field: crate::wxfield::FieldVar,
+) {
     let mut origin = pos2(r.left() + 12.0, r.bottom() - 40.0);
+    if field != crate::wxfield::FieldVar::Off {
+        let (title, lo, hi) = field.legend();
+        colorbar(p, origin, title, lo, hi, &|x| {
+            let [r, g, b, _] = field.color(x, 1.0).to_srgba_unmultiplied();
+            Color32::from_rgb(r, g, b)
+        });
+        origin.y -= 60.0;
+    }
     if by == ColorBy::AccBehaviour {
         // one swatch per annotated behaviour
         let n = classes.len().max(1);
@@ -6977,6 +7525,8 @@ mod share_tests {
         a.st_params.radius_m = 2500.0;
         a.st_params.include_other = false;
         a.st_highlight = false;
+        a.wx_field = crate::wxfield::FieldVar::Precip;
+        a.wx_isobars = true;
         a.selected_track = Some(2);
         a.selected = Some((0, 5));
         a.map_center = Some((45.5, 7.25));
@@ -7007,6 +7557,8 @@ mod share_tests {
         assert_eq!(b.tracks[2].date_filter, Some(dr));
         assert_eq!(b.tracks[2].fixes.len(), a.tracks[2].fixes.len());
         assert!(b.view3d.terrain);
+        assert_eq!(b.wx_field, crate::wxfield::FieldVar::Precip);
+        assert!(b.wx_isobars && !b.wx_centres);
         assert!(
             b.st_on
                 && b.st_params.radius_m == 2500.0

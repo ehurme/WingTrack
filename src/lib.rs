@@ -11,6 +11,7 @@
 pub mod acc;
 pub mod app;
 pub mod cds;
+pub mod cyclones;
 pub mod demo;
 pub mod export;
 pub mod falloff;
@@ -27,5 +28,6 @@ pub mod video;
 pub mod view3d;
 pub mod weather;
 pub mod wind3d;
+pub mod wxfield;
 
 pub use app::WingApp;

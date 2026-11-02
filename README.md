@@ -87,8 +87,21 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
     nearest turbine, rotor-zone encounters) and the **structures** themselves; the annotated CSV gains
     `turbines_within_radius`, `other_structures_within_radius` and `nearest_turbine_m` per fix. Coordinates are
     included throughout, so encounters can be joined to regions (e.g. country / département mortality estimates) in R.
+- **Weather layers & storms** (*Weather layers & storms* panel), all for the hour under the time cursor:
+  - **ERA5 colour fields** around the animals — 2 m temperature, precipitation, cloud cover, 10 m wind speed or MSL
+    pressure — from the same week-by-week ERA5 wind-field downloads (radius / spacing in the ERA5 panel), with
+    **isobars** every 4 hPa and **L / H pressure centres**; a low is flagged as a **storm** (red ring) when it is
+    ≤ 995 hPa or has gale-force (≥ 17.2 m/s) 10 m wind nearby.
+  - **Tropical cyclones** from [IBTrACS](https://www.ncei.noaa.gov/products/international-best-track-archive)
+    (NOAA NCEI best tracks: hurricanes, typhoons, cyclones): *Load for the tracks* asks NOAA AOML's ERDDAP for
+    storms within ±25° of the tracks during their time span; *Import IBTrACS CSV…* takes any NCEI IBTrACS file.
+    Tracks are coloured by Saffir–Simpson category, the storm at the cursor is labelled with category and wind,
+    the panel lists each storm's closest approach to an animal, and the annotated CSV gains `tc_name`,
+    `tc_distance_km`, `tc_wind_kt` and `tc_category` (nearest cyclone within 1500 km of each fix).
 - **Satellite layers** — Esri World Imagery / OSM / topo / dark basemaps, plus **NASA GIBS daily imagery
-  (MODIS Terra, MODIS Aqua, VIIRS)** that switches date with the time cursor, so you can see the fronts the animals crossed.
+  (MODIS Terra, MODIS Aqua, VIIRS)** that switches date with the time cursor, so you can see the fronts the animals crossed,
+  and GIBS weather imagery: **GPM IMERG precipitation rate** (every 30 min, since 2000) and **AIRS surface air
+  temperature** (daily day / night passes).
 - **ERA5 wind & weather** (via the [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api)):
 
   - 10 m / 100 m wind, 2 m temperature, MSL & surface pressure, precipitation, cloud cover per fix
