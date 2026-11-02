@@ -252,3 +252,7 @@ Enable GitHub Pages via *Settings → Pages → Source: GitHub Actions*.
   (`cyclones.rs`) come from ERDDAP `IBTrACS_since1980_1` (CSV with a units row) or an imported NCEI file; share keys
   `wxl=` (field,isobars,centres) and `tc=1` (re-fetch). GIBS weather imagery (`SatLayer::ImergPrecip`, AIRS) uses WMS
   GetMap per tile (`tiles.rs`); true colour stays on WMTS.
+- Open-Meteo queue errors are classified by `om_failure()`: daily / hourly 429 stop or pause, transient errors (5xx,
+  overloaded, network, timeouts, minute limit) back off globally and re-queue (≤ `OM_RETRIES`, `om_parallel` → 1),
+  then go to `failed_jobs` (never `mark_done`); only permanent 4xx are marked done. IBTrACS per-year CSVs are built in
+  CI (`tools/ibtracs_years.py` → `dist/data/ibtracs/`, weekly schedule) and read before ERDDAP.

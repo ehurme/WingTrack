@@ -55,10 +55,12 @@ enum Msg {
         tiles: Vec<crate::structures::Tile>,
         result: Result<String, String>,
     },
-    /// IBTrACS cyclone table (ERDDAP subset or imported CSV).
+    /// IBTrACS cyclone table (ERDDAP subset or imported CSV), or one year file served
+    /// with the app (`year` set).
     Cyclones {
         name: String,
         result: Result<Vec<u8>, String>,
+        year: Option<i32>,
     },
     /// A wind-turbine / structure register CSV picked by the user.
     StructFile {
@@ -155,6 +157,72 @@ struct StCache {
 const CDS_PARALLEL: usize = 4;
 /// Give up on a hanging Open-Meteo request after this many seconds.
 const OM_TIMEOUT_S: f64 = 150.0;
+
+/// Parallel Open-Meteo requests when the service is healthy (1 after an overload error).
+const OM_PARALLEL: usize = 3;
+/// Attempts per request for transient errors (overloaded, timeouts, network).
+const OM_RETRIES: u8 = 6;
+
+enum OmFailure {
+    Daily,
+    Hourly,
+    /// Worth retrying later (`minute`: the per-minute rate limit).
+    Transient {
+        minute: bool,
+    },
+    /// The request itself is wrong (HTTP 4xx, API error): retrying won't help.
+    Permanent,
+}
+
+/// What an Open-Meteo error means for the queue.
+fn om_failure(e: &str) -> OmFailure {
+    let el = e.to_lowercase();
+    if e.starts_with("HTTP 429") || el.contains("too many") || el.contains("limit exceeded") {
+        if el.contains("daily") {
+            return OmFailure::Daily;
+        }
+        if el.contains("hourly") {
+            return OmFailure::Hourly;
+        }
+        return OmFailure::Transient { minute: true };
+    }
+    if e.starts_with("HTTP 4") {
+        return OmFailure::Permanent;
+    }
+    // HTTP 5xx ("The service is overloaded"), timeouts, network errors, truncated JSON
+    if e.starts_with("HTTP 5")
+        || el.contains("overload")
+        || el.contains("timed out")
+        || el.contains("timeout")
+        || el.contains("fetch")
+        || el.contains("network")
+        || el.contains("connect")
+        || el.contains("bad json")
+        || el.contains("expected")
+        || !e.starts_with("HTTP")
+            && !el.contains("parameter")
+            && !el.contains("invalid")
+            && !el.contains("out of")
+    {
+        return OmFailure::Transient { minute: false };
+    }
+    OmFailure::Permanent
+}
+
+/// First line of an error, without a JSON wrapper.
+fn short_err(e: &str) -> String {
+    let reason = e
+        .split("\"reason\":\"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .map(|r| {
+            format!(
+                "{} {r}",
+                e.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+            )
+        });
+    reason.unwrap_or_else(|| e.lines().next().unwrap_or("").chars().take(120).collect())
+}
 
 /// Point an Open-Meteo URL at the customer servers when the user has an API key.
 fn om_url(url: &str, key: &str) -> String {
@@ -562,6 +630,12 @@ pub struct WingApp {
     storms_busy: bool,
     /// A shared link asked for cyclones: fetch once the tracks are in.
     storms_fetch_pending: bool,
+    /// Year files still loading, how many arrived, storms collected, and the query
+    /// (t0, t1, south, north, west, east).
+    storms_years_left: usize,
+    storms_years_ok: usize,
+    storms_acc: Vec<crate::cyclones::Storm>,
+    storms_query: Option<(i64, i64, f64, f64, f64, f64)>,
     // acceleration
     acc_files: Vec<AccFile>,
     acc_sets: Vec<crate::acc::AccSet>,
@@ -612,6 +686,11 @@ pub struct WingApp {
     wait_note: Option<String>,
     /// Open-Meteo refused with its daily limit: no more requests before this time.
     om_blocked_until: f64,
+    /// Requests in parallel (drops to 1 while the service is overloaded).
+    om_parallel: usize,
+    om_ok_streak: u32,
+    /// Requests that kept failing transiently (not marked done; 'Retry failed').
+    failed_jobs: Vec<Job>,
     req_done: usize,
     req_failed: usize,
     since_annotate: usize,
@@ -749,6 +828,10 @@ impl WingApp {
             storms_on: true,
             storms_busy: false,
             storms_fetch_pending: false,
+            storms_years_left: 0,
+            storms_years_ok: 0,
+            storms_acc: Vec::new(),
+            storms_query: None,
             acc_files: Vec::new(),
             acc_sets: Vec::new(),
             acc_params: crate::acc::Params::default(),
@@ -794,6 +877,9 @@ impl WingApp {
             in_flight_t: HashMap::new(),
             wait_note: None,
             om_blocked_until: 0.0,
+            om_parallel: OM_PARALLEL,
+            om_ok_streak: 0,
+            failed_jobs: Vec::new(),
             share_dialog: false,
             share_embed: true,
             url_dialog: false,
@@ -2767,8 +2853,9 @@ impl WingApp {
 
     // ------------------------------------------------------------------ weather & storms
 
-    /// Ask NOAA's ERDDAP for IBTrACS points within the tracks' window (± 3 days) and area
-    /// (± 25° — cyclones far from the animals still matter for wind).
+    /// Cyclones for the tracks: the per-year IBTrACS files published with the web app
+    /// (built weekly from NOAA NCEI by CI — NOAA's own servers don't allow browser
+    /// requests), falling back to NOAA AOML's ERDDAP (works from the desktop app).
     fn fetch_cyclones(&mut self, ctx: &egui::Context) {
         let (mut s, mut n, mut w, mut e) = (90.0f64, -90.0f64, 180.0f64, -180.0f64);
         for f in self
@@ -2785,7 +2872,7 @@ impl WingApp {
         if s > n {
             return;
         }
-        let url = crate::cyclones::erddap_url(
+        let q = (
             self.t_min as i64 - 3 * 86_400,
             self.t_max as i64 + 3 * 86_400,
             (s - 25.0).max(-90.0),
@@ -2793,6 +2880,111 @@ impl WingApp {
             (w - 25.0).max(-180.0),
             (e + 25.0).min(180.0),
         );
+        self.storms_query = Some(q);
+        let year = |t: i64| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0)
+                .map(|d| chrono::Datelike::year(&d))
+                .unwrap_or(1980)
+        };
+        let years: Vec<i32> = (year(q.0)..=year(q.1)).collect();
+        self.storms_years_left = years.len();
+        self.storms_years_ok = 0;
+        self.storms_acc.clear();
+        self.storms_busy = true;
+        self.status(format!(
+            "IBTrACS: loading tropical-cyclone tracks for {}",
+            years
+                .iter()
+                .map(|y| y.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        let base = if cfg!(target_arch = "wasm32") {
+            "data/ibtracs/".to_string()
+        } else {
+            format!("{}data/ibtracs/", share::WEB_APP_URL)
+        };
+        for y in years {
+            let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+            let mut req = ehttp::Request::get(format!("{base}{y}.csv"));
+            req.timeout = Some(std::time::Duration::from_secs(60));
+            ehttp::fetch(req, move |res| {
+                let result = match res {
+                    Ok(r) if r.ok => Ok(r.bytes),
+                    Ok(r) => Err(format!("HTTP {}", r.status)),
+                    Err(e) => Err(e),
+                };
+                let _ = tx.send(Msg::Cyclones {
+                    name: format!("IBTrACS {y}"),
+                    result,
+                    year: Some(y),
+                });
+                ctx2.request_repaint();
+            });
+        }
+    }
+
+    /// One year file arrived: keep storms that touch the query window and area.
+    fn on_cyclone_year(
+        &mut self,
+        name: &str,
+        result: Result<Vec<u8>, String>,
+        ctx: &egui::Context,
+    ) {
+        self.storms_years_left = self.storms_years_left.saturating_sub(1);
+        let Some((t0, t1, s, n, w, e)) = self.storms_query else {
+            return;
+        };
+        if let Ok(bytes) = result {
+            self.storms_years_ok += 1;
+            if let Ok(v) = crate::cyclones::parse(name, &bytes, Some((t0, t1))) {
+                for st in v {
+                    if !st
+                        .pts
+                        .iter()
+                        .any(|p| p.lat >= s && p.lat <= n && p.lon >= w && p.lon <= e)
+                    {
+                        continue;
+                    }
+                    match self.storms_acc.iter_mut().find(|x| x.sid == st.sid) {
+                        Some(x) => {
+                            x.pts.extend(st.pts);
+                            x.pts.sort_by_key(|p| p.t);
+                            x.pts.dedup_by_key(|p| p.t);
+                        }
+                        None => self.storms_acc.push(st),
+                    }
+                }
+            }
+        }
+        if self.storms_years_left > 0 {
+            return;
+        }
+        if self.storms_years_ok == 0 {
+            // not published (yet) or unreachable: try NOAA's ERDDAP directly
+            self.fetch_cyclones_erddap(ctx);
+            return;
+        }
+        self.storms_busy = false;
+        self.storms = std::mem::take(&mut self.storms_acc);
+        self.storms_on = true;
+        let names: Vec<String> = self.storms.iter().map(|s| s.label()).collect();
+        self.status(if names.is_empty() {
+            "IBTrACS: no tropical cyclones near the tracks during their time span".to_string()
+        } else {
+            format!(
+                "Tropical cyclones (IBTrACS): {} storm(s) - {}",
+                names.len(),
+                names.join(", ")
+            )
+        });
+    }
+
+    fn fetch_cyclones_erddap(&mut self, ctx: &egui::Context) {
+        let Some((t0, t1, s, n, w, e)) = self.storms_query else {
+            return;
+        };
+        let url = crate::cyclones::erddap_url(t0, t1, s, n, w, e);
         self.storms_busy = true;
         self.status(
             "IBTrACS: asking NOAA ERDDAP for tropical cyclones near the tracks…".to_string(),
@@ -2813,6 +3005,7 @@ impl WingApp {
             let _ = tx.send(Msg::Cyclones {
                 name: "IBTrACS (ERDDAP)".into(),
                 result,
+                year: None,
             });
             ctx2.request_repaint();
         });
@@ -2832,7 +3025,11 @@ impl WingApp {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
                 let result = std::fs::read(&p).map_err(|e| e.to_string());
-                let _ = tx.send(Msg::Cyclones { name, result });
+                let _ = tx.send(Msg::Cyclones {
+                    name,
+                    result,
+                    year: None,
+                });
                 ctx.request_repaint();
             }
         });
@@ -2847,6 +3044,7 @@ impl WingApp {
                 let _ = tx.send(Msg::Cyclones {
                     name: f.file_name(),
                     result: Ok(bytes),
+                    year: None,
                 });
                 ctx.request_repaint();
             }
@@ -3726,7 +3924,8 @@ impl WingApp {
             self.profiles.levels.len(),
             self.profiles.source.label()
         ));
-        self.enqueue(reqs.into_iter().map(Job::Profile).collect());
+        // along-track annotation before the fields around the animals
+        self.enqueue_front(reqs.into_iter().map(Job::Profile).collect());
     }
 
     /// Key that changes when the set of visible tracks changes (field windows depend on it).
@@ -3953,8 +4152,9 @@ impl WingApp {
         }
         if now < self.pause_until {
             self.wait_note = Some(format!(
-                "Open-Meteo rate limit: resuming in {:.0} s",
-                self.pause_until - now
+                "Open-Meteo busy (overloaded / rate limit): resuming in {:.0} s, {} at a time",
+                self.pause_until - now,
+                self.om_parallel
             ));
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
             return;
@@ -3966,7 +4166,7 @@ impl WingApp {
         } else {
             10.0
         };
-        while self.in_flight.len() < 3 {
+        while self.in_flight.len() < self.om_parallel {
             let Some(w) = self.queue.front().map(|j| j.weight()) else {
                 break;
             };
@@ -4024,7 +4224,7 @@ impl WingApp {
         }
     }
 
-    fn process_messages(&mut self) {
+    fn process_messages(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::File { name, bytes } => self.add_file(name, bytes, None),
@@ -4066,67 +4266,101 @@ impl WingApp {
                         continue;
                     };
                     self.in_flight_t.remove(&id);
-                    // Rate limited: wait and retry instead of giving up on these cells.
-                    if let Err(e) = &result
-                        && (e.starts_with("HTTP 429") || e.to_lowercase().contains("too many"))
-                    {
-                        let el = e.to_lowercase();
-                        if el.contains("daily") {
-                            // Nothing will succeed before midnight UTC: stop instead of retrying.
-                            let day = 86_400.0;
-                            let wall = chrono::Utc::now().timestamp() as f64;
-                            self.om_blocked_until = self.now + (day - wall.rem_euclid(day)) + 60.0;
-                            self.queue.push_front(job);
-                            self.status(
-                                "! Open-Meteo daily limit (10 000 calls) reached for your IP address - it is shared by everyone on your network. \
-                                 Remaining requests skipped. Try again after midnight UTC, enter an Open-Meteo API key, or switch the ERA5 source to Copernicus CDS."
-                                    .to_string(),
-                            );
-                            continue;
+                    let res: Result<(), String> = result.and_then(|body| match &job {
+                        Job::Surface(req) => self.store.ingest(req, &body).map(|_| ()),
+                        Job::Profile(req) => self.profiles.ingest(req, &body).map(|_| ()),
+                    });
+                    match res {
+                        Ok(()) => {
+                            self.om_ok_streak += 1;
+                            if self.om_ok_streak >= 5 {
+                                self.om_parallel = OM_PARALLEL;
+                            }
+                            self.retries.remove(job.url());
+                            self.req_done += 1;
                         }
-                        if el.contains("hourly") {
-                            let wall = chrono::Utc::now().timestamp() as f64;
-                            let wait = 3600.0 - wall.rem_euclid(3600.0) + 30.0;
-                            self.pause_until = self.now + wait;
-                            self.queue.push_front(job);
-                            self.status(format!(
-                                "Open-Meteo hourly limit reached for your IP - waiting {:.0} min for the next hour",
-                                wait / 60.0
-                            ));
-                            continue;
-                        }
-                        let n = self.retries.entry(job.url().to_string()).or_insert(0);
-                        *n += 1;
-                        if *n <= 4 {
-                            let wait = 65.0 * *n as f64;
-                            self.pause_until = self.now + wait;
-                            self.status(format!(
-                                "Open-Meteo rate limit reached - pausing {wait:.0} s, then retrying"
-                            ));
-                            self.queue.push_front(job);
-                            continue;
-                        }
-                    }
-                    self.req_done += 1;
-                    let res = match &job {
-                        Job::Surface(req) => result.and_then(|body| self.store.ingest(req, &body)),
-                        Job::Profile(req) => {
-                            result.and_then(|body| self.profiles.ingest(req, &body))
-                        }
-                    };
-                    if let Err(e) = res {
-                        self.req_failed += 1;
-                        match &job {
-                            Job::Surface(req) => self.store.mark_done(req),
-                            Job::Profile(req) => self.profiles.mark_done(req),
-                        }
-                        self.status(format!("! weather request failed: {e}"));
+                        Err(e) => match om_failure(&e) {
+                            OmFailure::Daily => {
+                                // Nothing will succeed before midnight UTC: stop instead of retrying.
+                                let day = 86_400.0;
+                                let wall = chrono::Utc::now().timestamp() as f64;
+                                self.om_blocked_until =
+                                    self.now + (day - wall.rem_euclid(day)) + 60.0;
+                                self.queue.push_front(job);
+                                self.status(
+                                    "! Open-Meteo daily limit (10 000 calls) reached for your IP address - it is shared by everyone on your network. \
+                                     Remaining requests skipped. Try again after midnight UTC, enter an Open-Meteo API key, or switch the ERA5 source to Copernicus CDS."
+                                        .to_string(),
+                                );
+                                continue;
+                            }
+                            OmFailure::Hourly => {
+                                let wall = chrono::Utc::now().timestamp() as f64;
+                                let wait = 3600.0 - wall.rem_euclid(3600.0) + 30.0;
+                                self.pause_until = self.now + wait;
+                                self.queue.push_front(job);
+                                self.status(format!(
+                                    "Open-Meteo hourly limit reached for your IP - waiting {:.0} min for the next hour",
+                                    wait / 60.0
+                                ));
+                                continue;
+                            }
+                            OmFailure::Transient { minute } => {
+                                // Overloaded / unreachable / rate-limited this minute: back off
+                                // (for everything: the server is busy), slow down, retry later.
+                                self.om_ok_streak = 0;
+                                self.om_parallel = 1;
+                                let n = {
+                                    let n = self.retries.entry(job.url().to_string()).or_insert(0);
+                                    *n += 1;
+                                    *n
+                                };
+                                if n <= OM_RETRIES {
+                                    let wait = if minute {
+                                        65.0
+                                    } else {
+                                        (20.0 * 2f64.powi(n as i32 - 1)).min(600.0)
+                                    };
+                                    self.pause_until = self.pause_until.max(self.now + wait);
+                                    self.queue.push_front(job);
+                                    self.status(format!(
+                                        "Open-Meteo: {} - retry {n}/{OM_RETRIES} in {wait:.0} s",
+                                        short_err(&e)
+                                    ));
+                                    continue;
+                                }
+                                self.req_done += 1;
+                                self.req_failed += 1;
+                                self.failed_jobs.push(job);
+                                self.status(format!(
+                                    "! weather request failed {OM_RETRIES} times ({}) - kept for 'Retry failed'",
+                                    short_err(&e)
+                                ));
+                            }
+                            OmFailure::Permanent => {
+                                self.req_done += 1;
+                                self.req_failed += 1;
+                                match &job {
+                                    Job::Surface(req) => self.store.mark_done(req),
+                                    Job::Profile(req) => self.profiles.mark_done(req),
+                                }
+                                self.status(format!(
+                                    "! weather request rejected: {}",
+                                    short_err(&e)
+                                ));
+                            }
+                        },
                     }
                     self.on_download_complete();
                 }
                 Msg::Cds { run, result } => self.on_cds_response(run, result),
                 Msg::Overpass { tiles, result } => self.on_overpass(tiles, result),
-                Msg::Cyclones { name, result } => {
+                Msg::Cyclones {
+                    name,
+                    result,
+                    year: Some(_),
+                } => self.on_cyclone_year(&name, result, ctx),
+                Msg::Cyclones { name, result, .. } => {
                     self.storms_busy = false;
                     match result {
                         Ok(bytes) => match crate::cyclones::parse(&name, &bytes, None) {
@@ -5030,6 +5264,33 @@ impl WingApp {
                         ui.weak(format!("{} failed - see the log", self.req_failed));
                     }
                 }
+                ui.horizontal_wrapped(|ui| {
+                    if !self.queue.is_empty()
+                        && ui
+                            .button("Cancel downloads")
+                            .on_hover_text("Stop the queued requests (they can be resumed with 'Retry failed')")
+                            .clicked()
+                    {
+                        let n = self.queue.len();
+                        self.failed_jobs.extend(self.queue.drain(..));
+                        self.req_total = self.req_total.saturating_sub(n);
+                        self.pause_until = 0.0;
+                        self.status(format!("Cancelled {n} queued request(s)"));
+                    }
+                    if !self.failed_jobs.is_empty()
+                        && ui
+                            .button(format!("Retry failed ({})", self.failed_jobs.len()))
+                            .on_hover_text("Queue the requests that failed (server overloaded, timeouts) or were cancelled")
+                            .clicked()
+                    {
+                        let jobs: Vec<Job> = std::mem::take(&mut self.failed_jobs);
+                        for j in &jobs {
+                            self.retries.remove(j.url());
+                        }
+                        self.pause_until = 0.0;
+                        self.enqueue(jobs);
+                    }
+                });
                 if !self.store.is_empty() {
                     ui.weak(format!("cache: {} cells · {} hours", self.store.cells.len(), self.store.hours()));
                 }
@@ -6249,7 +6510,7 @@ impl eframe::App for WingApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.now = ctx.input(|i| i.time);
         self.sync_url_hash();
-        self.process_messages();
+        self.process_messages(ctx);
         match self.view_tab {
             ViewTab::ThreeD => self.maybe_request_field(),
             ViewTab::Map => self.maybe_request_surface_field(),
@@ -7452,6 +7713,77 @@ mod share_tests {
         a.remove_fallen_tags();
         println!("again: {}", a.log.last().unwrap());
         assert!(after < before);
+    }
+
+    #[test]
+    fn open_meteo_error_classification() {
+        let over = r#"HTTP 503 {"reason":"The service is overloaded","error":true}"#;
+        assert!(matches!(
+            om_failure(over),
+            OmFailure::Transient { minute: false }
+        ));
+        assert_eq!(short_err(over), "HTTP 503 The service is overloaded");
+        assert!(matches!(
+            om_failure("Failed to fetch, check the developer console for details"),
+            OmFailure::Transient { .. }
+        ));
+        assert!(matches!(
+            om_failure("bad JSON: EOF while parsing"),
+            OmFailure::Transient { .. }
+        ));
+        assert!(matches!(
+            om_failure(
+                r#"HTTP 429 {"reason":"Minutely API request limit exceeded. Please try again in one minute.","error":true}"#
+            ),
+            OmFailure::Transient { minute: true }
+        ));
+        assert!(matches!(
+            om_failure(
+                r#"HTTP 429 {"reason":"Daily API request limit exceeded. Please try again tomorrow.","error":true}"#
+            ),
+            OmFailure::Daily
+        ));
+        assert!(matches!(
+            om_failure(
+                r#"HTTP 400 {"reason":"Parameter 'start_date' is out of allowed range","error":true}"#
+            ),
+            OmFailure::Permanent
+        ));
+    }
+
+    #[test]
+    fn overloaded_requests_back_off_and_are_kept() {
+        let mut a = WingApp::blank();
+        a.load_demo();
+        let ctx = egui::Context::default();
+        let pts = weather::sample_points(&a.tracks, &a.opts);
+        let req = a
+            .store
+            .plan(&pts, a.opts.model, weather::latest_available_day())
+            .remove(0);
+        let url = req.url.clone();
+        let over = r#"HTTP 503 {"reason":"The service is overloaded","error":true}"#;
+        for attempt in 1..=OM_RETRIES + 1 {
+            let job = a.queue.pop_front().unwrap_or(Job::Surface(req.clone()));
+            a.in_flight.insert(attempt as usize, job);
+            let _ = a.tx.send(Msg::Weather {
+                id: attempt as usize,
+                result: Err(over.to_string()),
+            });
+            a.process_messages(&ctx);
+            if attempt <= OM_RETRIES {
+                assert_eq!(a.queue.len(), 1, "re-queued for retry {attempt}");
+                assert!(a.pause_until > a.now, "backing off");
+                assert_eq!(a.om_parallel, 1, "one request at a time while overloaded");
+            }
+        }
+        assert!(a.queue.is_empty());
+        assert_eq!(a.failed_jobs.len(), 1, "kept for 'Retry failed'");
+        assert!(
+            a.store.days.is_empty(),
+            "failed cells are not marked as downloaded"
+        );
+        assert!(a.failed_jobs[0].url() == url);
     }
 
     #[test]
