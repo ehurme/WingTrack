@@ -32,6 +32,7 @@ This file is written for AI coding agents. Assume the reader knows nothing about
 ├── src/
 │   ├── main.rs             # Native / WASM entry points
 │   ├── lib.rs              # Public module exports
+│   ├── acc.rs              # Acceleration: e-obs / per-sample / FleaTag readers, burst features (flea port), k-means, per-fix summaries
 │   ├── app.rs              # egui application: map, timeline, charts, export, video
 │   ├── model.rs            # Core data model: Track, Fix, SensorSample, WeatherAnno
 │   ├── structures.rs       # Wind turbines / tall structures: Overpass + CSV import, encounter analysis, CSV exports
@@ -238,3 +239,9 @@ Enable GitHub Pages via *Settings → Pages → Source: GitHub Actions*.
   `WingApp::pump_structures`), a 0.05° grid index, `analyse()` → `Analysis` (encounters + per-fix counts), cached in
   `WingApp::st_cache` keyed on tracks / store version / params. Drawn by `TrackLayer` (2D) and `view3d` (`Scene::structures`).
   Shared as `st=radius,other,min_height,highlight`.
+- `acc.rs`: `AccSet` per animal and file (bursts in g; FleaTag times relative to a user-set start × clock rate),
+  `features()` mirrors flea's `burst_features()`, `analyse()` → features + flight + clusters (one k-means over all
+  animals, fitted on ≤ 20 000 bursts), `summarise_track()` → `Fix::acc`. In the app, ACC files never go through the
+  firmware registry (`acc::sniff` first in `add_file_from`), live in `acc_files` / `acc_sets`, and `ensure_acc_cache`
+  separates the expensive analysis (sets + params) from per-fix annotation (tracks). Share: `acc=` params, `accs=`
+  per-set start / clock rate (ppm) / track; local ACC files are not embedded.

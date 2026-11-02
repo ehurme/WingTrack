@@ -211,6 +211,46 @@ pub fn parse_num(s: &str) -> Option<f64> {
     s.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
+/// [`parse_time`] with millisecond precision (ACC bursts): unix ms (UTC).
+pub fn parse_time_ms(s: &str) -> Option<i64> {
+    let s = s.trim().trim_matches('"');
+    if let Ok(v) = s.parse::<f64>() {
+        if v > 1e11 {
+            return Some(v as i64);
+        }
+        if v > 1e8 {
+            return Some((v * 1000.0).round() as i64);
+        }
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc).timestamp_millis());
+    }
+    let cleaned = s
+        .trim_end_matches(" UTC")
+        .trim_end_matches(" GMT")
+        .trim_end_matches('Z')
+        .replace('T', " ");
+    for f in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y/%m/%d %H:%M:%S%.f",
+        "%d.%m.%Y %H:%M:%S%.f",
+        "%d.%m.%Y, %H:%M:%S%.f",
+    ] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(&cleaned, f) {
+            return Some(dt.and_utc().timestamp_millis());
+        }
+    }
+    parse_time(s).map(|t| t * 1000)
+}
+
+/// Technosmart-style `dd/mm/yyyy` + `HH:MM:SS.fff` (day first), unix ms.
+pub fn parse_dmy_time_ms(s: &str) -> Option<i64> {
+    NaiveDateTime::parse_from_str(s.trim(), "%d/%m/%Y %H:%M:%S%.f")
+        .ok()
+        .map(|dt| dt.and_utc().timestamp_millis())
+        .or_else(|| parse_time_ms(s))
+}
+
 /// Parse the timestamp formats seen in Movebank, Wildcloud, CTT and R exports. Returns unix seconds (UTC).
 pub fn parse_time(s: &str) -> Option<i64> {
     let s = s.trim().trim_matches('"');

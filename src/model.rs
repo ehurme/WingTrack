@@ -143,6 +143,8 @@ pub struct Fix {
     pub weather: WeatherAnno,
     /// Extra columns kept for export / display (name, value).
     pub extra: Vec<(String, String)>,
+    /// Acceleration summary of the step arriving at this fix ([`crate::acc`]).
+    pub acc: Option<Box<crate::acc::FixAcc>>,
 }
 
 impl Fix {
@@ -167,6 +169,7 @@ impl Fix {
             step_significant: true,
             weather: WeatherAnno::default(),
             extra: Vec::new(),
+            acc: None,
         }
     }
 
