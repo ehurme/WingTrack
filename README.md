@@ -95,9 +95,9 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
 - **Charts & subplots** — any chart variable over time; *+ subplot* stacks up to four more on the same (linked)
   time axis, e.g. altitude, crosswind (at the fix, along each step, or at flight altitude), cloud base and wind
   support. Subplots are kept in share links.
-- **Weather layers & storms** (*Weather layers & storms* panel), all for the hour under the time cursor:
+- **Weather layers & storms** (*Wind & weather → Map layers* and *→ Tropical cyclones*), all for the hour under the time cursor:
   - **ERA5 colour fields** around the animals — 2 m temperature, precipitation, cloud cover, 10 m wind speed or MSL
-    pressure — from the same week-by-week ERA5 wind-field downloads (radius / spacing in the ERA5 panel), with
+    pressure — from the same week-by-week ERA5 wind-field downloads (radius / spacing under *Map layers*), with
     **isobars** every 4 hPa and **L / H pressure centres**; a low is flagged as a **storm** (red ring) when it is
     ≤ 995 hPa or has gale-force (≥ 17.2 m/s) 10 m wind nearby.
   - **Tropical cyclones** from [IBTrACS](https://www.ncei.noaa.gov/products/international-best-track-archive)
@@ -107,6 +107,10 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
     Tracks are coloured by Saffir–Simpson category, the storm at the cursor is labelled with category and wind,
     the panel lists each storm's closest approach to an animal, and the annotated CSV gains `tc_name`,
     `tc_distance_km`, `tc_wind_kt` and `tc_category` (nearest cyclone within 1500 km of each fix).
+- **Side panel** — *Files & firmware*, *Tracks* (date filters, fallen tags), *Display* (colouring, location error,
+  trail), **Wind & weather** (*Download & annotate* · *Map layers* · *3D wind* · *Tropical cyclones*),
+  *Acceleration*, *Wind turbines & tall structures*, *Selected fix*, *Log*. Basemap and satellite / weather imagery
+  are in the top bar.
 - **Satellite layers** — Esri World Imagery / OSM / topo / dark basemaps, plus **NASA GIBS daily imagery
   (MODIS Terra, MODIS Aqua, VIIRS)** that switches date with the time cursor, so you can see the fronts the animals crossed,
   and GIBS weather imagery: **GPM IMERG precipitation rate** (every 30 min, since 2000) and **AIRS surface air
@@ -130,7 +134,7 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
     Along-track annotation goes ahead of the wind fields around the animals, which are most of the requests.
   - **Data source and quotas.** Requests go from your browser straight to the data provider. Open-Meteo's free tier
     is limited **per IP address** (600 calls/min, 5 000/h, 10 000/day) — not shared by all WingTrack users, but shared
-    by everyone behind the same network address (an institute, a VPN). The ERA5 panel shows why downloads are
+    by everyone behind the same network address (an institute, a VPN). *Wind & weather → Download & annotate* shows why downloads are
     waiting (pacing, hourly budget, rate limit), times out hung requests, and stops with a clear message at the daily
     limit. Two ways around it, both stored only on your device and never put in share links:
     - **Copernicus CDS** (*ERA5 source → Copernicus CDS*): your own [CDS](https://cds.climate.copernicus.eu)

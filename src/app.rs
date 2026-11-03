@@ -3100,9 +3100,215 @@ impl WingApp {
         });
     }
 
-    fn weather_layers_panel(&mut self, ui: &mut egui::Ui) {
+    /// ERA5 download options, data source, Annotate, progress / retry / cancel.
+    fn era5_download_ui(&mut self, ui: &mut Ui) {
+        egui::ComboBox::from_label("model")
+            .selected_text(self.opts.model.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.opts.model, Model::Era5, Model::Era5.label());
+                ui.selectable_value(
+                    &mut self.opts.model,
+                    Model::BestMatch,
+                    Model::BestMatch.label(),
+                );
+            });
+        egui::ComboBox::from_label("wind level")
+            .selected_text(self.opts.level.label())
+            .show_ui(ui, |ui| {
+                for l in [WindLevel::Auto, WindLevel::M10, WindLevel::M100] {
+                    ui.selectable_value(&mut self.opts.level, l, l.label());
+                }
+            });
+        ui.checkbox(
+            &mut self.opts.segments,
+            "sample wind along each step (hourly)",
+        )
+        .on_hover_text("Essential for Sigfox: fixes are hours apart and usually at the roost");
+        ui.add_enabled(
+            self.opts.segments,
+            egui::Checkbox::new(&mut self.opts.night_only, "night hours only (sun < −6°)"),
+        );
+        ui.add_enabled(
+            self.opts.segments,
+            egui::Slider::new(&mut self.opts.max_segment_h, 6.0..=168.0)
+                .text("max step length (h)"),
+        );
+        self.era5_source_ui(ui);
+        let busy = !self.downloads_idle();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.tracks.is_empty() && !busy,
+                    egui::Button::new("Annotate with ERA5"),
+                )
+                .clicked()
+            {
+                self.start_weather();
+            }
+            if ui
+                .add_enabled(!self.store.is_empty(), egui::Button::new("Re-apply"))
+                .on_hover_text("Recompute with the current options from cached data")
+                .clicked()
+            {
+                let n = weather::annotate(&mut self.tracks, &self.store, &self.opts);
+                self.status(format!("Re-annotated {n} fixes"));
+            }
+        });
+        if busy || self.req_total > 0 && self.req_done < self.req_total {
+            let frac = if self.req_total > 0 {
+                self.req_done as f32 / self.req_total as f32
+            } else {
+                0.0
+            };
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .text(format!("{}/{} requests", self.req_done, self.req_total)),
+            );
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
+            if !self.cds_running.is_empty() || !self.cds_pending.is_empty() {
+                let waiting = self
+                    .cds_running
+                    .iter()
+                    .filter(|r| matches!(r.stage, CdsStage::Poll(_)))
+                    .count();
+                ui.weak(format!(
+                    "Copernicus CDS: {} running ({waiting} queued at CDS), {} waiting here",
+                    self.cds_running.len(),
+                    self.cds_pending.len()
+                ));
+            }
+            if let Some(n) = &self.wait_note {
+                ui.colored_label(Color32::from_rgb(255, 190, 90), n);
+            }
+            if self.req_failed > 0 {
+                ui.weak(format!("{} failed - see the log", self.req_failed));
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+                    if !self.queue.is_empty()
+                        && ui
+                            .button("Cancel downloads")
+                            .on_hover_text("Stop the queued requests (they can be resumed with 'Retry failed')")
+                            .clicked()
+                    {
+                        let n = self.queue.len();
+                        self.failed_jobs.extend(self.queue.drain(..));
+                        self.req_total = self.req_total.saturating_sub(n);
+                        self.pause_until = 0.0;
+                        self.status(format!("Cancelled {n} queued request(s)"));
+                    }
+                    if !self.failed_jobs.is_empty()
+                        && ui
+                            .button(format!("Retry failed ({})", self.failed_jobs.len()))
+                            .on_hover_text("Queue the requests that failed (server overloaded, timeouts) or were cancelled")
+                            .clicked()
+                    {
+                        let jobs: Vec<Job> = std::mem::take(&mut self.failed_jobs);
+                        for j in &jobs {
+                            self.retries.remove(j.url());
+                        }
+                        self.pause_until = 0.0;
+                        self.enqueue(jobs);
+                    }
+                });
+        if !self.store.is_empty() {
+            ui.weak(format!(
+                "cache: {} cells · {} hours",
+                self.store.cells.len(),
+                self.store.hours()
+            ));
+        }
+    }
+
+    /// Wind arrows at fixes and the wind field around the animals (download extent, palette).
+    fn wind_map_ui(&mut self, ui: &mut Ui) {
+        ui.checkbox(&mut self.show_wind_arrows, "wind arrows at fixes");
+        ui.checkbox(&mut self.show_wind_field, "ERA5 wind field at cursor time");
+        ui.indent("wind_field_opts", |ui| {
+                    ui.add_enabled(
+                        self.show_wind_field,
+                        egui::Checkbox::new(&mut self.wind_field_night_only, "night cells only (sun < −6°)"),
+                    )
+                    .on_hover_text("Draw wind arrows only where the sun is more than 6° below the horizon at the cursor time");
+                    ui.checkbox(&mut self.skip_daytime, "skip daytime during playback")
+                        .on_hover_text("Playback jumps ahead whenever it is day across the whole wind-field / track area");
+                    let mut pal = self.wind_palette();
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("wind_palette").selected_text(pal.label()).show_ui(ui, |ui| {
+                            for p in WindPalette::ALL {
+                                ui.selectable_value(&mut pal, p, p.label());
+                            }
+                        });
+                        ui.label("palette");
+                        if self.wind_palettes.contains_key(&self.basemap)
+                            && ui.small_button("default").on_hover_text("Use this basemap's default palette").clicked()
+                        {
+                            self.wind_palettes.remove(&self.basemap);
+                            pal = WindPalette::default_for(self.basemap);
+                        }
+                    })
+                    .response
+                    .on_hover_text("Remembered separately for each basemap");
+                    if pal != self.wind_palette() {
+                        self.wind_palettes.insert(self.basemap, pal);
+                    }
+                });
+        ui.label("Wind field around the animals (fetched a week at a time):");
+        let old_field = (self.opts.field_margin_deg, self.opts.field_stride);
+        ui.add(
+                    egui::Slider::new(&mut self.opts.field_margin_deg, 0.0..=8.0)
+                        .step_by(0.25)
+                        .suffix("°")
+                        .text("wind-field radius"),
+                )
+                .on_hover_text("Download wind arrows this far around each animal, for the week in view (fetched as you move through time). 0 = only at the fixes");
+        let spacing = |s: i32| format!("{}°", s as f64 * weather::GRID);
+        ui.add_enabled_ui(self.opts.field_margin_deg > 0.0, |ui| {
+            egui::ComboBox::from_label("wind-field spacing")
+                .selected_text(spacing(self.opts.field_stride))
+                .show_ui(ui, |ui| {
+                    for s in [1, 2, 4] {
+                        ui.selectable_value(&mut self.opts.field_stride, s, spacing(s));
+                    }
+                });
+        });
+        if old_field != (self.opts.field_margin_deg, self.opts.field_stride) {
+            self.surface_field_days.clear();
+        }
+        if self.opts.field_margin_deg > 0.0 && !self.tracks.is_empty() {
+            let day = weather::day_of(self.t_now as i64);
+            let pts = weather::window_points(
+                &self.tracks,
+                day,
+                7,
+                self.opts.field_margin_deg as f64,
+                self.opts.field_stride,
+            );
+            let mut cells: Vec<weather::CellKey> =
+                pts.iter().map(|p| weather::cell_of(p.0, p.1)).collect();
+            cells.sort_unstable();
+            cells.dedup();
+            let n = cells.len();
+            let txt = if self.surface_field_on {
+                format!("≈{n} wind-field cells for this week (≈{n} API calls)")
+            } else {
+                format!("≈{n} wind-field cells per week, fetched after the first Annotate")
+            };
+            if n > 1500 {
+                ui.colored_label(
+                    Color32::from_rgb(255, 180, 80),
+                    txt + " - consider a smaller radius or wider spacing",
+                );
+            } else {
+                ui.weak(txt);
+            }
+        }
+    }
+
+    /// ERA5 colour field, isobars and pressure centres (2D map).
+    fn wx_fields_ui(&mut self, ui: &mut egui::Ui) {
         use crate::wxfield::FieldVar;
-        ui.label("ERA5 around the animals (hour under the cursor):");
         let before = (self.wx_field, self.wx_isobars, self.wx_centres);
         egui::ComboBox::from_label("colour field")
             .selected_text(self.wx_field.label())
@@ -3118,13 +3324,11 @@ impl WingApp {
             // the fields come from the wind-field downloads around the animals
             self.surface_field_days.clear();
         }
-        ui.weak(format!(
-            "Uses the ERA5 wind-field downloads (radius {:.1}°, spacing {}° — ERA5 panel); fetched a week at a time as you move.",
-            self.opts.field_margin_deg,
-            self.opts.field_stride as f64 * weather::GRID
-        ));
-        ui.separator();
-        ui.label("Tropical cyclones (IBTrACS best tracks):");
+        ui.weak("Colour fields, isobars and storms use the wind-field downloads around the animals (radius / spacing above).");
+    }
+
+    /// Tropical cyclones (IBTrACS): load, list, closest approach.
+    fn cyclones_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!self.tracks.is_empty() && !self.storms_busy, egui::Button::new("Load for the tracks"))
@@ -3780,7 +3984,7 @@ impl WingApp {
         if self.era5_source == Era5Source::Cds {
             if self.cds_key.trim().is_empty() {
                 self.status(
-                    "! Copernicus CDS selected but no API key entered (ERA5 panel → data source)"
+                    "! Copernicus CDS selected but no API key entered (Wind & weather → Download & annotate → ERA5 source)"
                         .to_string(),
                 );
                 return;
@@ -5178,23 +5382,6 @@ impl WingApp {
                 }
             });
 
-            // ---- acceleration
-            egui::CollapsingHeader::new(format!("Acceleration ({})", self.acc_sets.len()))
-                .default_open(!self.acc_sets.is_empty())
-                .show(ui, |ui| {
-                    self.acc_panel(ui);
-                });
-
-            // ---- weather layers & storms
-            egui::CollapsingHeader::new("Weather layers & storms").default_open(false).show(ui, |ui| {
-                self.weather_layers_panel(ui);
-            });
-
-            // ---- wind turbines & structures
-            egui::CollapsingHeader::new("Wind turbines & tall structures").default_open(false).show(ui, |ui| {
-                self.structures_panel(ui);
-            });
-
             // ---- display
             egui::CollapsingHeader::new("Display").default_open(true).show(ui, |ui| {
                 egui::ComboBox::from_label("colour by").selected_text(self.color_by.label()).show_ui(ui, |ui| {
@@ -5206,162 +5393,39 @@ impl WingApp {
                     .on_hover_text("Hide Sigfox fixes whose Atlas radius exceeds this");
                 ui.checkbox(&mut self.hide_insignificant, "hide steps smaller than location error");
                 ui.checkbox(&mut self.show_error, "location-error circles");
-                ui.checkbox(&mut self.show_wind_arrows, "wind arrows at fixes");
-                ui.checkbox(&mut self.show_wind_field, "ERA5 wind field at cursor time");
-                ui.indent("wind_field_opts", |ui| {
-                    ui.add_enabled(
-                        self.show_wind_field,
-                        egui::Checkbox::new(&mut self.wind_field_night_only, "night cells only (sun < −6°)"),
-                    )
-                    .on_hover_text("Draw wind arrows only where the sun is more than 6° below the horizon at the cursor time");
-                    ui.checkbox(&mut self.skip_daytime, "skip daytime during playback")
-                        .on_hover_text("Playback jumps ahead whenever it is day across the whole wind-field / track area");
-                    let mut pal = self.wind_palette();
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("wind_palette").selected_text(pal.label()).show_ui(ui, |ui| {
-                            for p in WindPalette::ALL {
-                                ui.selectable_value(&mut pal, p, p.label());
-                            }
-                        });
-                        ui.label("palette");
-                        if self.wind_palettes.contains_key(&self.basemap)
-                            && ui.small_button("default").on_hover_text("Use this basemap's default palette").clicked()
-                        {
-                            self.wind_palettes.remove(&self.basemap);
-                            pal = WindPalette::default_for(self.basemap);
-                        }
-                    })
-                    .response
-                    .on_hover_text("Remembered separately for each basemap");
-                    if pal != self.wind_palette() {
-                        self.wind_palettes.insert(self.basemap, pal);
-                    }
-                });
                 ui.checkbox(&mut self.trail_to_cursor, "draw tracks only up to cursor");
                 ui.checkbox(&mut self.follow, "follow selected animal");
             });
 
-            // ---- weather
-            egui::CollapsingHeader::new("Wind & weather (ERA5)").default_open(true).show(ui, |ui| {
-                egui::ComboBox::from_label("model").selected_text(self.opts.model.label()).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.opts.model, Model::Era5, Model::Era5.label());
-                    ui.selectable_value(&mut self.opts.model, Model::BestMatch, Model::BestMatch.label());
+            // ---- wind & weather: everything wind / weather in one place
+            egui::CollapsingHeader::new("Wind & weather").default_open(true).show(ui, |ui| {
+                egui::CollapsingHeader::new("Download & annotate (ERA5)").default_open(true).show(ui, |ui| {
+                    self.era5_download_ui(ui);
                 });
-                egui::ComboBox::from_label("wind level").selected_text(self.opts.level.label()).show_ui(ui, |ui| {
-                    for l in [WindLevel::Auto, WindLevel::M10, WindLevel::M100] {
-                        ui.selectable_value(&mut self.opts.level, l, l.label());
-                    }
+                egui::CollapsingHeader::new("Map layers").default_open(true).show(ui, |ui| {
+                    self.wind_map_ui(ui);
+                    ui.separator();
+                    self.wx_fields_ui(ui);
+                    ui.weak("Satellite precipitation / temperature imagery: the 'Satellite & weather imagery' switch in the top bar.");
                 });
-                ui.checkbox(&mut self.opts.segments, "sample wind along each step (hourly)")
-                    .on_hover_text("Essential for Sigfox: fixes are hours apart and usually at the roost");
-                ui.add_enabled(self.opts.segments, egui::Checkbox::new(&mut self.opts.night_only, "night hours only (sun < −6°)"));
-                ui.add_enabled(
-                    self.opts.segments,
-                    egui::Slider::new(&mut self.opts.max_segment_h, 6.0..=168.0).text("max step length (h)"),
-                );
-                let old_field = (self.opts.field_margin_deg, self.opts.field_stride);
-                ui.add(
-                    egui::Slider::new(&mut self.opts.field_margin_deg, 0.0..=8.0)
-                        .step_by(0.25)
-                        .suffix("°")
-                        .text("wind-field radius"),
-                )
-                .on_hover_text("Download wind arrows this far around each animal, for the week in view (fetched as you move through time). 0 = only at the fixes");
-                let spacing = |s: i32| format!("{}°", s as f64 * weather::GRID);
-                ui.add_enabled_ui(self.opts.field_margin_deg > 0.0, |ui| {
-                    egui::ComboBox::from_label("wind-field spacing").selected_text(spacing(self.opts.field_stride)).show_ui(ui, |ui| {
-                        for s in [1, 2, 4] {
-                            ui.selectable_value(&mut self.opts.field_stride, s, spacing(s));
-                        }
-                    });
+                egui::CollapsingHeader::new("3D wind (pressure levels)").default_open(false).show(ui, |ui| {
+                    self.wind3d_panel(ui);
                 });
-                if old_field != (self.opts.field_margin_deg, self.opts.field_stride) {
-                    self.surface_field_days.clear();
-                }
-                if self.opts.field_margin_deg > 0.0 && !self.tracks.is_empty() {
-                    let day = weather::day_of(self.t_now as i64);
-                    let pts = weather::window_points(&self.tracks, day, 7, self.opts.field_margin_deg as f64, self.opts.field_stride);
-                    let mut cells: Vec<weather::CellKey> = pts.iter().map(|p| weather::cell_of(p.0, p.1)).collect();
-                    cells.sort_unstable();
-                    cells.dedup();
-                    let n = cells.len();
-                    let txt = if self.surface_field_on {
-                        format!("≈{n} wind-field cells for this week (≈{n} API calls)")
-                    } else {
-                        format!("≈{n} wind-field cells per week, fetched after the first Annotate")
-                    };
-                    if n > 1500 {
-                        ui.colored_label(Color32::from_rgb(255, 180, 80), txt + " - consider a smaller radius or wider spacing");
-                    } else {
-                        ui.weak(txt);
-                    }
-                }
-                ui.separator();
-                self.era5_source_ui(ui);
-                let busy = !self.downloads_idle();
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(!self.tracks.is_empty() && !busy, egui::Button::new("Annotate with ERA5")).clicked() {
-                        self.start_weather();
-                    }
-                    if ui.add_enabled(!self.store.is_empty(), egui::Button::new("Re-apply")).on_hover_text("Recompute with the current options from cached data").clicked() {
-                        let n = weather::annotate(&mut self.tracks, &self.store, &self.opts);
-                        self.status(format!("Re-annotated {n} fixes"));
-                    }
+                egui::CollapsingHeader::new("Tropical cyclones").default_open(false).show(ui, |ui| {
+                    self.cyclones_ui(ui);
                 });
-                if busy || self.req_total > 0 && self.req_done < self.req_total {
-                    let frac = if self.req_total > 0 { self.req_done as f32 / self.req_total as f32 } else { 0.0 };
-                    ui.add(egui::ProgressBar::new(frac).text(format!("{}/{} requests", self.req_done, self.req_total)));
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
-                    if !self.cds_running.is_empty() || !self.cds_pending.is_empty() {
-                        let waiting = self.cds_running.iter().filter(|r| matches!(r.stage, CdsStage::Poll(_))).count();
-                        ui.weak(format!(
-                            "Copernicus CDS: {} running ({waiting} queued at CDS), {} waiting here",
-                            self.cds_running.len(),
-                            self.cds_pending.len()
-                        ));
-                    }
-                    if let Some(n) = &self.wait_note {
-                        ui.colored_label(Color32::from_rgb(255, 190, 90), n);
-                    }
-                    if self.req_failed > 0 {
-                        ui.weak(format!("{} failed - see the log", self.req_failed));
-                    }
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if !self.queue.is_empty()
-                        && ui
-                            .button("Cancel downloads")
-                            .on_hover_text("Stop the queued requests (they can be resumed with 'Retry failed')")
-                            .clicked()
-                    {
-                        let n = self.queue.len();
-                        self.failed_jobs.extend(self.queue.drain(..));
-                        self.req_total = self.req_total.saturating_sub(n);
-                        self.pause_until = 0.0;
-                        self.status(format!("Cancelled {n} queued request(s)"));
-                    }
-                    if !self.failed_jobs.is_empty()
-                        && ui
-                            .button(format!("Retry failed ({})", self.failed_jobs.len()))
-                            .on_hover_text("Queue the requests that failed (server overloaded, timeouts) or were cancelled")
-                            .clicked()
-                    {
-                        let jobs: Vec<Job> = std::mem::take(&mut self.failed_jobs);
-                        for j in &jobs {
-                            self.retries.remove(j.url());
-                        }
-                        self.pause_until = 0.0;
-                        self.enqueue(jobs);
-                    }
-                });
-                if !self.store.is_empty() {
-                    ui.weak(format!("cache: {} cells · {} hours", self.store.cells.len(), self.store.hours()));
-                }
             });
 
-            // ---- 3D wind
-            egui::CollapsingHeader::new("3D wind (pressure levels)").default_open(true).show(ui, |ui| {
-                self.wind3d_panel(ui);
+            // ---- acceleration
+            egui::CollapsingHeader::new(format!("Acceleration ({})", self.acc_sets.len()))
+                .default_open(!self.acc_sets.is_empty())
+                .show(ui, |ui| {
+                    self.acc_panel(ui);
+                });
+
+            // ---- wind turbines & structures
+            egui::CollapsingHeader::new("Wind turbines & tall structures").default_open(false).show(ui, |ui| {
+                self.structures_panel(ui);
             });
 
             // ---- selected fix
