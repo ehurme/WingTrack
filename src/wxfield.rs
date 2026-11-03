@@ -22,16 +22,18 @@ pub enum FieldVar {
     Cloud,
     Wind,
     Pressure,
+    CloudBase,
 }
 
 impl FieldVar {
-    pub const ALL: [FieldVar; 6] = [
+    pub const ALL: [FieldVar; 7] = [
         FieldVar::Off,
         FieldVar::Temp,
         FieldVar::Precip,
         FieldVar::Cloud,
         FieldVar::Wind,
         FieldVar::Pressure,
+        FieldVar::CloudBase,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -41,6 +43,7 @@ impl FieldVar {
             FieldVar::Cloud => "cloud cover",
             FieldVar::Wind => "10 m wind speed",
             FieldVar::Pressure => "MSL pressure",
+            FieldVar::CloudBase => "cloud base (LCL, where low cloud)",
         }
     }
     /// (legend title, low label, high label)
@@ -52,6 +55,7 @@ impl FieldVar {
             FieldVar::Cloud => ("ERA5 cloud cover (%)", "0", "100"),
             FieldVar::Wind => ("ERA5 10 m wind speed (m/s)", "0", "20+"),
             FieldVar::Pressure => ("ERA5 MSL pressure (hPa)", "980", "1040"),
+            FieldVar::CloudBase => ("cloud base, LCL (m ASL)", "0", "3000+"),
         }
     }
     pub fn value(self, v: &Values) -> Option<f32> {
@@ -62,6 +66,14 @@ impl FieldVar {
             FieldVar::Cloud => v[8],
             FieldVar::Wind => v[0],
             FieldVar::Pressure => v[5],
+            // only where ERA5 reports some low cloud (otherwise it's just where cloud *would* form)
+            FieldVar::CloudBase => {
+                let low = v[crate::weather::CLOUD_LOW];
+                if low.is_finite() && low < 10.0 {
+                    return None;
+                }
+                crate::weather::cloud_base_m(v)?
+            }
         };
         x.is_finite().then_some(x)
     }
@@ -73,6 +85,7 @@ impl FieldVar {
             FieldVar::Cloud => x / 100.0,
             FieldVar::Wind => x / 20.0,
             FieldVar::Pressure => (x - 980.0) / 60.0,
+            FieldVar::CloudBase => x / 3000.0,
             FieldVar::Off => 0.0,
         }
         .clamp(0.0, 1.0)
@@ -150,6 +163,18 @@ impl FieldVar {
                     t,
                 );
                 Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 90)
+            }
+            FieldVar::CloudBase => {
+                // low base: dark grey; high base: pale
+                let c = lerp(
+                    &[
+                        (0.0, [70, 80, 100]),
+                        (0.5, [150, 160, 180]),
+                        (1.0, [235, 240, 250]),
+                    ],
+                    t,
+                );
+                Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 150)
             }
             FieldVar::Off => Color32::TRANSPARENT,
         }

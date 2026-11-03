@@ -367,9 +367,17 @@ impl ProfileStore {
         let Source::OpenMeteo(model) = self.source else {
             return Vec::new();
         };
-        plan_cell_days(points, &self.days, latest_day, CELLS_PER_REQUEST)
+        // the archive starts in 2016: don't ask for (and fail on) earlier days
+        let pts: Vec<(f64, f64, i64)> = points
+            .iter()
+            .copied()
+            .filter(|p| day_of(p.2) >= OM_FIRST_DAY)
+            .collect();
+        plan_cell_days(&pts, &self.days, latest_day, CELLS_PER_REQUEST)
             .into_iter()
-            .map(|(cells, a, b)| ProfileRequest::new(cells, a, b, model, &self.levels))
+            .map(|(cells, a, b)| {
+                ProfileRequest::new(cells, a.max(OM_FIRST_DAY), b, model, &self.levels)
+            })
             .collect()
     }
 
@@ -738,6 +746,15 @@ impl ProfileRequest {
 }
 
 /// Historical-forecast data lag only a day or two.
+/// First day Open-Meteo's historical-forecast archive has pressure levels for
+/// (`start_date` must be ≥ 2016-01-01). Older tracks need an ERA5 cube file.
+pub const OM_FIRST_DAY: i64 = 16_801; // 2016-01-01
+
+/// Points the Open-Meteo pressure-level archive can't serve (before 2016).
+pub fn too_early(points: &[(f64, f64, i64)]) -> usize {
+    points.iter().filter(|p| day_of(p.2) < OM_FIRST_DAY).count()
+}
+
 pub fn latest_available_day() -> i64 {
     day_of(chrono::Utc::now().timestamp()) - 1
 }
@@ -1178,6 +1195,24 @@ pub fn synthetic_profiles(store: &mut ProfileStore, tracks: &[Track]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_requests_before_2016() {
+        let mut st = ProfileStore::default();
+        st.use_open_meteo(OmModel::BestMatch);
+        let t2012 = 1_335_312_000; // 2012-04-25
+        let t2020 = 1_587_772_800; // 2020-04-25
+        let pts = vec![(13.5, 101.2, t2012), (13.5, 101.2, t2012 + 3600)];
+        assert_eq!(too_early(&pts), 2);
+        assert!(
+            st.plan(&pts, latest_available_day()).is_empty(),
+            "the archive starts 2016-01-01"
+        );
+        let pts = vec![(13.5, 101.2, t2012), (47.7, 9.0, t2020)];
+        let r = st.plan(&pts, latest_available_day());
+        assert_eq!(r.len(), 1);
+        assert!(r[0].start_day >= OM_FIRST_DAY);
+    }
     use crate::model::{Fix, LocationSource};
 
     fn om_body(

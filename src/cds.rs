@@ -15,13 +15,14 @@ pub const API: &str = "https://cds.climate.copernicus.eu/api/retrieve/v1";
 pub const DATASET: &str = "reanalysis-era5-single-levels-timeseries";
 pub const DATASET_PAGE: &str = "https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels-timeseries?tab=download";
 pub const PROFILE_PAGE: &str = "https://cds.climate.copernicus.eu/profile";
-pub const VARS: [&str; 6] = [
+pub const VARS: [&str; 7] = [
     "10m_u_component_of_wind",
     "10m_v_component_of_wind",
     "2m_temperature",
     "mean_sea_level_pressure",
     "surface_pressure",
     "total_precipitation",
+    "2m_dewpoint_temperature",
 ];
 /// Split a cell's days into separate jobs across gaps longer than this (e.g. two seasons).
 const MAX_GAP_DAYS: i64 = 45;
@@ -241,8 +242,8 @@ fn unzip(b: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
 /// (wind speed/direction m/s & degrees-from, °C, hPa, mm). Accepts short (`u10`) or long
 /// (`10m_u_component_of_wind`) column names; several header blocks are merged by time.
 pub fn parse_csv(csv: &str) -> Result<BTreeMap<i64, Values>, String> {
-    let mut rows: BTreeMap<i64, [f32; 6]> = BTreeMap::new();
-    let mut cols: Option<(usize, [Option<usize>; 6])> = None;
+    let mut rows: BTreeMap<i64, [f32; 7]> = BTreeMap::new();
+    let mut cols: Option<(usize, [Option<usize>; 7])> = None;
     for line in csv.lines() {
         let f: Vec<&str> = line
             .split(',')
@@ -265,6 +266,7 @@ pub fn parse_csv(csv: &str) -> Result<BTreeMap<i64, Values>, String> {
                     find(&["msl", "mean_sea_level_pressure"]),
                     find(&["sp", "surface_pressure"]),
                     find(&["tp", "total_precipitation"]),
+                    find(&["d2m", "2m_dewpoint_temperature"]),
                 ],
             ));
             continue;
@@ -275,7 +277,7 @@ pub fn parse_csv(csv: &str) -> Result<BTreeMap<i64, Values>, String> {
         };
         let e = rows
             .entry(t.div_euclid(3600) * 3600)
-            .or_insert([f32::NAN; 6]);
+            .or_insert([f32::NAN; 7]);
         for (j, c) in idx.iter().enumerate() {
             if let Some(v) = c.and_then(|c| f.get(c)).and_then(|s| s.parse::<f32>().ok()) {
                 e[j] = v;
@@ -286,7 +288,7 @@ pub fn parse_csv(csv: &str) -> Result<BTreeMap<i64, Values>, String> {
         return Err("CDS CSV without a header".into());
     }
     let mut out = BTreeMap::new();
-    for (t, [u, v, t2, msl, sp, tp]) in rows {
+    for (t, [u, v, t2, msl, sp, tp, d2]) in rows {
         if !(u.is_finite() && v.is_finite()) {
             continue;
         }
@@ -302,6 +304,7 @@ pub fn parse_csv(csv: &str) -> Result<BTreeMap<i64, Values>, String> {
         } else {
             f32::NAN
         };
+        x[crate::weather::DEW] = if d2 > 150.0 { d2 - 273.15 } else { d2 };
         out.insert(t, x);
     }
     if out.is_empty() {

@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub const API: &str = "https://archive-api.open-meteo.com/v1/archive";
 
 /// Hourly variables requested (order = index into a cell's value array).
-pub const VARS: [&str; 9] = [
+pub const VARS: [&str; 11] = [
     "wind_speed_10m",
     "wind_direction_10m",
     "wind_speed_100m",
@@ -28,6 +28,8 @@ pub const VARS: [&str; 9] = [
     "surface_pressure",
     "precipitation",
     "cloud_cover",
+    "dew_point_2m",
+    "cloud_cover_low",
 ];
 pub const NV: usize = VARS.len();
 const WS10: usize = 0;
@@ -39,6 +41,26 @@ const MSL: usize = 5;
 const SP: usize = 6;
 const PRECIP: usize = 7;
 const CLOUD: usize = 8;
+pub const DEW: usize = 9;
+pub const CLOUD_LOW: usize = 10;
+
+/// Cloud base estimated as the lifting condensation level, m above sea level:
+/// ERA5 ground height (from surface vs. sea-level pressure) + 125 m per °C of
+/// temperature – dew point spread at 2 m (Espy). The base of low / convective cloud
+/// where there is some (see `cloud_cover_low`); ERA5 via Open-Meteo has no cloud-base
+/// variable.
+pub fn cloud_base_m(v: &Values) -> Option<f32> {
+    let (t, td) = (v[T2M], v[DEW]);
+    if !(t.is_finite() && td.is_finite()) {
+        return None;
+    }
+    let ground = if v[SP].is_finite() && v[MSL].is_finite() {
+        geo::pressure_to_altitude_m(v[SP] as f64, v[MSL] as f64) as f32
+    } else {
+        0.0
+    };
+    Some(ground.max(0.0) + 125.0 * (t - td).max(0.0))
+}
 
 /// Locations per request (keeps URLs short and responses small).
 /// Locations per Open-Meteo request: fewer, larger requests ride out overloads better.
@@ -544,6 +566,9 @@ pub fn annotate(tracks: &mut [Track], store: &WeatherStore, opts: &AnnotateOptio
             w.surface_pressure_hpa = opt(v[SP]);
             w.precipitation_mm = opt(v[PRECIP]);
             w.cloud_cover = opt(v[CLOUD]);
+            w.dew_point_2m = opt(v[DEW]);
+            w.cloud_cover_low = opt(v[CLOUD_LOW]);
+            w.cloud_base_m = cloud_base_m(&v);
 
             // ERA5-corrected barometric altitude.
             w.alt_msl_corrected = match (f.pressure_hpa, w.msl_hpa) {
@@ -656,7 +681,22 @@ pub fn synthetic_field(store: &mut WeatherStore, tracks: &[Track]) {
                 let dir = (30.0 + 90.0 * (ph * 0.7 + i as f32 * 0.05).sin() + j as f32 * 1.5)
                     .rem_euclid(360.0);
                 let ws = 6.0 + 4.0 * (ph * 1.3 + j as f32 * 0.08).sin();
-                series.insert(h, [ws * 0.6, dir, ws, dir, 15.0, 1015.0, 965.0, 0.0, 40.0]);
+                series.insert(
+                    h,
+                    [
+                        ws * 0.6,
+                        dir,
+                        ws,
+                        dir,
+                        15.0,
+                        1015.0,
+                        965.0,
+                        0.0,
+                        40.0,
+                        10.0,
+                        30.0,
+                    ],
+                );
                 h += 3600;
             }
         }
@@ -820,6 +860,22 @@ mod tests {
         assert!(window_points(&tracks, day + 10, 2, 1.0, 4).is_empty());
         assert!((call_weight(10, 33, 7) - 33.0).abs() < 1e-4);
         assert!((call_weight(25, 9, 31) - 25.0 * 31.0 / 14.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cloud_base_from_dew_point() {
+        let mut v = [f32::NAN; NV];
+        v[T2M] = 15.0;
+        v[DEW] = 11.0;
+        // sea level: 125 m/°C × 4 °C
+        assert_eq!(cloud_base_m(&v), Some(500.0));
+        // on a plateau (ground ≈ 1 km from 900 vs 1013 hPa) the base is higher ASL
+        v[SP] = 900.0;
+        v[MSL] = 1013.0;
+        let b = cloud_base_m(&v).unwrap();
+        assert!((b - 1500.0).abs() < 60.0, "{b}");
+        v[DEW] = f32::NAN;
+        assert_eq!(cloud_base_m(&v), None);
     }
 
     #[test]

@@ -87,6 +87,14 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
     nearest turbine, rotor-zone encounters) and the **structures** themselves; the annotated CSV gains
     `turbines_within_radius`, `other_structures_within_radius` and `nearest_turbine_m` per fix. Coordinates are
     included throughout, so encounters can be joined to regions (e.g. country / département mortality estimates) in R.
+- **Cloud base** — ERA5 has no cloud-base variable on Open-Meteo, so it is estimated as the lifting condensation
+  level: ERA5 ground height + 125 m per °C of 2 m temperature – dew point spread (`cloud_base_lcl_m_asl`, with
+  `era5_dewpoint_c` and `era5_cloud_cover_low_pct`, in the export). Shown as a chart (with the flight altitude
+  dashed; the altitude chart shows the cloud base dashed), as a 2D colour field where there is low cloud, and in
+  the 3D view as a translucent cloud deck at true scale, shaded by low cloud cover (*cloud base* in the 3D panel).
+- **Charts & subplots** — any chart variable over time; *+ subplot* stacks up to four more on the same (linked)
+  time axis, e.g. altitude, crosswind (at the fix, along each step, or at flight altitude), cloud base and wind
+  support. Subplots are kept in share links.
 - **Weather layers & storms** (*Weather layers & storms* panel), all for the hour under the time cursor:
   - **ERA5 colour fields** around the animals — 2 m temperature, precipitation, cloud cover, 10 m wind speed or MSL
     pressure — from the same week-by-week ERA5 wind-field downloads (radius / spacing in the ERA5 panel), with
@@ -140,6 +148,8 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
     (SRTM / GMTED2010 / ETOPO1), hill-shaded. It uses the same vertical exaggeration as the flight altitudes, so an
     animal's height above the ground is to scale; drop lines and shadows land on the terrain, and fixes without
     altitude sit at ground level + *altitude if unknown*. Sea and below is flat at 0 m.
+  - Open-Meteo's pressure levels (historical forecast archive) start on **2016-01-01**; for older tracks the app
+    says so instead of requesting, and an **ERA5 cube** (any year since 1940) is the way in.
   - **Two data sources** in one store:
     [Open-Meteo Historical Forecast API](https://open-meteo.com/en/docs/historical-forecast-api) — 1000–700 hPa
     (≈ 110 m – 3 km) wind, geopotential height and temperature from archived GFS / ICON / IFS analyses,

@@ -83,6 +83,8 @@ pub struct View3D {
     pub flow_hours_per_s: f32,
     pub show_drop_lines: bool,
     pub show_shadows: bool,
+    /// Cloud deck at the cloud base (LCL) where ERA5 has low cloud.
+    pub show_clouds: bool,
     /// Altitude (m) used for fixes without any altitude.
     pub default_alt_m: f32,
     /// A step is "not detected" (dotted) when longer than this × the track's median interval.
@@ -115,6 +117,7 @@ impl Default for View3D {
             flow_hours_per_s: 3.0,
             show_drop_lines: true,
             show_shadows: true,
+            show_clouds: false,
             default_alt_m: 0.0,
             gap_factor: 2.5,
             follow: false,
@@ -145,6 +148,8 @@ pub struct Scene<'a> {
     pub source_label: String,
     pub basemap_attribution: String,
     pub max_error_m: f32,
+    /// Cloud base (m ASL) and low cloud cover (%) on the ERA5 lattice at the cursor hour.
+    pub clouds: Option<(crate::wxfield::Grid, crate::wxfield::Grid)>,
     /// Wind turbines & tall structures to draw at their heights.
     pub structures: Option<crate::structures::Draw<'a>>,
 }
@@ -664,6 +669,51 @@ impl View3D {
                 );
                 painter.circle_filled(lr.left_center() - vec2(7.0, 0.0), 4.0, level_color(k, 255));
             }
+        }
+
+        // ---------------------------------------------------------------- cloud deck
+        // A translucent sheet at the cloud base, opacity from the low cloud cover, at the
+        // same vertical exaggeration as the flight altitudes.
+        if self.show_clouds
+            && let Some((base, low)) = &scene.clouds
+        {
+            let mut mesh = Mesh::default();
+            let mut idx = vec![u32::MAX; base.ni * base.nj];
+            for a in 0..base.ni {
+                for b in 0..base.nj {
+                    let (z, c) = (base.at(a, b), low.at(a, b));
+                    if !z.is_finite() {
+                        continue;
+                    }
+                    let (la, lo) = base.latlon(a as f64, b as f64);
+                    let Some(p) = pr.geo(la, lo, z) else {
+                        continue;
+                    };
+                    let cover = if c.is_finite() { c / 100.0 } else { 0.0 };
+                    let alpha = if cover < 0.1 {
+                        0
+                    } else {
+                        (40.0 + 150.0 * cover) as u8
+                    };
+                    idx[a * base.nj + b] = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(p, Color32::from_rgba_unmultiplied(225, 230, 240, alpha));
+                }
+            }
+            for a in 0..base.ni.saturating_sub(1) {
+                for b in 0..base.nj.saturating_sub(1) {
+                    let q = [
+                        idx[a * base.nj + b],
+                        idx[a * base.nj + b + 1],
+                        idx[(a + 1) * base.nj + b],
+                        idx[(a + 1) * base.nj + b + 1],
+                    ];
+                    if q.iter().all(|&i| i != u32::MAX) {
+                        mesh.add_triangle(q[0], q[1], q[3]);
+                        mesh.add_triangle(q[0], q[3], q[2]);
+                    }
+                }
+            }
+            painter.add(Shape::mesh(mesh));
         }
 
         // ---------------------------------------------------------------- structures
