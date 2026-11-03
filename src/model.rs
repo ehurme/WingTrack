@@ -76,6 +76,12 @@ pub struct WeatherAnno {
     pub surface_pressure_hpa: Option<f32>,
     pub precipitation_mm: Option<f32>,
     pub cloud_cover: Option<f32>,
+    pub dew_point_2m: Option<f32>,
+    /// Low cloud and fog (up to ~2 km), %.
+    pub cloud_cover_low: Option<f32>,
+    /// Cloud base (lifting condensation level), m above sea level — see
+    /// [`crate::weather::cloud_base_m`].
+    pub cloud_base_m: Option<f32>,
     /// Mean wind support / crosswind along the segment that *ended* at this fix,
     /// sampled hourly along the interpolated path (night hours only if requested).
     pub seg_wind_support: Option<f32>,

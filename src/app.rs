@@ -402,6 +402,12 @@ enum ChartVar {
     Curtain,
     /// Wind profile at the selected fix / cursor.
     Profile,
+    /// Cloud base (lifting condensation level, m ASL) and low cloud cover.
+    CloudBase,
+    CloudLow,
+    /// Crosswind averaged along each step, and at flight altitude (3D wind).
+    SegCrosswind,
+    FlightCrosswind,
     /// A per-burst acceleration metric over time.
     Acc(AccMetric),
     /// Waveform and spectrum of the burst nearest the cursor.
@@ -483,7 +489,7 @@ struct AccCache {
 }
 
 impl ChartVar {
-    const ALL: [ChartVar; 26] = [
+    const ALL: [ChartVar; 30] = [
         ChartVar::Curtain,
         ChartVar::Profile,
         ChartVar::FlightSupport,
@@ -494,10 +500,14 @@ impl ChartVar {
         ChartVar::WindSupport,
         ChartVar::SegmentWind,
         ChartVar::Crosswind,
+        ChartVar::SegCrosswind,
+        ChartVar::FlightCrosswind,
         ChartVar::Airspeed,
         ChartVar::WindSpeed,
         ChartVar::Era5Temp,
         ChartVar::Precip,
+        ChartVar::CloudBase,
+        ChartVar::CloudLow,
         ChartVar::LocError,
         ChartVar::Sensor(SensorKind::Vedba),
         ChartVar::Sensor(SensorKind::Temperature),
@@ -529,9 +539,20 @@ impl ChartVar {
             ChartVar::FlightHeight => "3D: flight height from profile (m ASL)",
             ChartVar::Curtain => "3D: time × height wind curtain along track",
             ChartVar::Profile => "3D: wind profile at selected fix / cursor",
+            ChartVar::CloudBase => "Cloud base, LCL (m ASL) — with flight altitude",
+            ChartVar::CloudLow => "ERA5 low cloud cover (%)",
+            ChartVar::SegCrosswind => "Along-step crosswind (m/s)",
+            ChartVar::FlightCrosswind => "3D: crosswind at flight altitude (m/s)",
             ChartVar::Acc(m) => m.label(),
             ChartVar::AccBurst => "ACC: burst at the cursor (waveform + spectrum)",
         }
+    }
+    /// Plotted as values over time (can be a subplot).
+    fn is_series(self) -> bool {
+        !matches!(
+            self,
+            ChartVar::Curtain | ChartVar::Profile | ChartVar::AccBurst
+        )
     }
     fn of_fix(self, f: &Fix) -> Option<f32> {
         match self {
@@ -548,6 +569,10 @@ impl ChartVar {
             ChartVar::FlightSupport => f.weather.flight.as_ref().and_then(|w| w.wind_support),
             ChartVar::BestSupport => f.weather.flight.as_ref().and_then(|w| w.best_wind_support),
             ChartVar::FlightHeight => f.weather.flight.as_ref().and_then(|w| w.flight_height_m),
+            ChartVar::CloudBase => f.weather.cloud_base_m,
+            ChartVar::CloudLow => f.weather.cloud_cover_low,
+            ChartVar::SegCrosswind => f.weather.seg_crosswind,
+            ChartVar::FlightCrosswind => f.weather.flight.as_ref().and_then(|w| w.crosswind),
             ChartVar::Sensor(_)
             | ChartVar::Curtain
             | ChartVar::Profile
@@ -663,6 +688,8 @@ pub struct WingApp {
     date_from: String,
     date_to: String,
     chart_var: ChartVar,
+    /// Extra charts stacked under the main one (shared time axis).
+    chart_subplots: Vec<ChartVar>,
 
     // weather
     store: WeatherStore,
@@ -855,6 +882,7 @@ impl WingApp {
             date_from: String::new(),
             date_to: String::new(),
             chart_var: ChartVar::Altitude,
+            chart_subplots: Vec::new(),
             store: WeatherStore::default(),
             opts: AnnotateOptions::default(),
             queue: VecDeque::new(),
@@ -1184,6 +1212,15 @@ impl WingApp {
         );
         m.set("err", r(self.max_error_km as f64, 2));
         m.set("chart", name(&self.chart_var));
+        m.set_if(
+            !self.chart_subplots.is_empty(),
+            "sub",
+            self.chart_subplots
+                .iter()
+                .map(name)
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
         m.set("cm", name(&self.curtain_metric));
         m.set("co", self.chart_open as u8);
         // ---- weather
@@ -1252,7 +1289,7 @@ impl WingApp {
         m.set(
             "v3",
             format!(
-                "{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{}",
                 v.particles_on as u8,
                 v.particles_per_level,
                 r(v.flow_hours_per_s as f64, 2),
@@ -1263,7 +1300,8 @@ impl WingApp {
                 r(v.ground_dim as f64, 2),
                 r(v.default_alt_m as f64, 0),
                 r(v.gap_factor as f64, 2),
-                v.terrain as u8
+                v.terrain as u8,
+                v.show_clouds as u8
             ),
         );
         // ---- tracks
@@ -1462,6 +1500,16 @@ impl WingApp {
         if let Some(c) = m.get("chart").and_then(|c| from_name(&ChartVar::ALL, c)) {
             self.chart_var = c;
         }
+        self.chart_subplots = m
+            .get("sub")
+            .map(|v| {
+                v.split(';')
+                    .filter_map(|c| from_name(&ChartVar::ALL, c))
+                    .filter(|c| c.is_series())
+                    .take(4)
+                    .collect()
+            })
+            .unwrap_or_default();
         if let Some(c) = m.get("cm").and_then(|c| from_name(&CurtainMetric::ALL, c)) {
             self.curtain_metric = c;
         }
@@ -1547,6 +1595,7 @@ impl WingApp {
             v.gap_factor = x as f32;
         }
         v.terrain = g(10).is_some_and(|x| x != 0.0);
+        v.show_clouds = g(11).is_some_and(|x| x != 0.0);
         if let Some(x) = m.f64("rl") {
             v.raster_level = x as usize;
         }
@@ -3912,7 +3961,19 @@ impl WingApp {
             return;
         }
         let pts = wind3d::annotation_points(&self.tracks, true, self.opts.max_segment_h);
+        let early = wind3d::too_early(&pts);
+        if early > 0 {
+            self.status(format!(
+                "! 3D wind: Open-Meteo has pressure levels only from 2016-01-01 - {} of {} points are earlier. \
+                 For older tracks export an ERA5 pressure-level cube (tools/era5_wind_cube.py, CDS) and use 'Import ERA5 cube…'.",
+                early,
+                pts.len()
+            ));
+        }
         let reqs = self.profiles.plan(&pts, wind3d::latest_available_day());
+        if reqs.is_empty() && early == pts.len() {
+            return;
+        }
         if reqs.is_empty() {
             let n = wind3d::annotate(&mut self.tracks, &self.profiles);
             self.status(format!("3D wind: everything cached - annotated {n} fixes"));
@@ -3993,8 +4054,10 @@ impl WingApp {
 
     /// Same for the 2D (surface ERA5) wind field, once the user has annotated at least once.
     fn maybe_request_surface_field(&mut self) {
-        let layers =
-            self.wx_field != crate::wxfield::FieldVar::Off || self.wx_isobars || self.wx_centres;
+        let layers = self.wx_field != crate::wxfield::FieldVar::Off
+            || self.wx_isobars
+            || self.wx_centres
+            || self.view3d.show_clouds;
         if !(self.surface_field_on || layers)
             || !(self.show_wind_field || layers)
             || self.opts.field_margin_deg <= 0.0
@@ -5395,6 +5458,24 @@ impl WingApp {
                         ui.selectable_value(&mut self.chart_var, v, v.label());
                     }
                 });
+            if self.chart_subplots.len() < 4
+                && ui
+                    .small_button("+ subplot")
+                    .on_hover_text("Stack another chart below, on the same time axis")
+                    .clicked()
+            {
+                // a useful next variable: crosswind, then cloud base, wind support, altitude
+                let next = [
+                    ChartVar::Crosswind,
+                    ChartVar::CloudBase,
+                    ChartVar::WindSupport,
+                    ChartVar::Altitude,
+                ]
+                .into_iter()
+                .find(|v| *v != self.chart_var && !self.chart_subplots.contains(v))
+                .unwrap_or(ChartVar::GroundSpeed);
+                self.chart_subplots.push(next);
+            }
             if self.chart_var == ChartVar::Curtain {
                 egui::ComboBox::from_id_salt("curtain_metric")
                     .selected_text(self.curtain_metric.label())
@@ -5414,14 +5495,59 @@ impl WingApp {
                 });
             }
         });
+        // main chart + stacked subplots share the height; time-series plots share the x axis
+        let n = 1 + self.chart_subplots.len();
+        let row_h = if self.chart_subplots.is_empty() {
+            0.0
+        } else {
+            24.0
+        };
+        let avail = ui.available_height();
+        let h = ((avail - row_h * (n - 1) as f32) / n as f32).max(60.0);
+        let w = ui.available_width();
         match self.chart_var {
-            ChartVar::Curtain => return self.curtain_chart(ui),
-            ChartVar::Profile => return self.profile_chart(ui),
-            ChartVar::AccBurst => return self.acc_burst_chart(ui),
-            _ => {}
+            ChartVar::Curtain | ChartVar::Profile | ChartVar::AccBurst => {
+                ui.allocate_ui(vec2(w, h), |ui| match self.chart_var {
+                    ChartVar::Curtain => self.curtain_chart(ui),
+                    ChartVar::Profile => self.profile_chart(ui),
+                    _ => self.acc_burst_chart(ui),
+                });
+            }
+            v => self.series_plot(ui, v, 0, h),
         }
+        let mut remove = None;
+        for k in 0..self.chart_subplots.len() {
+            ui.horizontal(|ui| {
+                let cur = self.chart_subplots[k];
+                let mut v = cur;
+                egui::ComboBox::from_id_salt(("subplot", k))
+                    .selected_text(v.label())
+                    .show_ui(ui, |ui| {
+                        for o in ChartVar::ALL.into_iter().filter(|o| o.is_series()) {
+                            ui.selectable_value(&mut v, o, o.label());
+                        }
+                    });
+                if v != cur {
+                    self.chart_subplots[k] = v;
+                }
+                if ui
+                    .small_button("✕")
+                    .on_hover_text("Remove this subplot")
+                    .clicked()
+                {
+                    remove = Some(k);
+                }
+            });
+            let v = self.chart_subplots[k];
+            self.series_plot(ui, v, k + 1, h);
+        }
+        if let Some(k) = remove {
+            self.chart_subplots.remove(k);
+        }
+    }
 
-        let var = self.chart_var;
+    /// One time-series chart (`slot` 0 = main), with the cursor line; click to move time.
+    fn series_plot(&mut self, ui: &mut Ui, var: ChartVar, slot: usize, height: f32) {
         let mut series: Vec<(String, Color32, Vec<[f64; 2]>)> = Vec::new();
         for (i, tr) in self.tracks.iter().enumerate() {
             if !tr.visible || self.selected_track.is_some_and(|s| s != i) {
@@ -5461,13 +5587,55 @@ impl WingApp {
                 ));
             }
         }
+        // altitude with the cloud base (dashed), or cloud base with the altitude (dashed)
+        let mut dashed: Vec<(String, Color32, Vec<[f64; 2]>)> = Vec::new();
+        let other = match var {
+            ChartVar::Altitude | ChartVar::FlightHeight => Some(ChartVar::CloudBase),
+            ChartVar::CloudBase => Some(ChartVar::Altitude),
+            _ => None,
+        };
+        if let Some(o) = other {
+            for (i, tr) in self.tracks.iter().enumerate() {
+                if !tr.visible || self.selected_track.is_some_and(|s| s != i) {
+                    continue;
+                }
+                let pts: Vec<[f64; 2]> = tr
+                    .fixes
+                    .iter()
+                    .filter(|f| self.fix_visible(f))
+                    .filter_map(|f| o.of_fix(f).map(|v| [f.t as f64 / 86400.0, v as f64]))
+                    .collect();
+                if !pts.is_empty() {
+                    let name = if o == ChartVar::CloudBase {
+                        "cloud base"
+                    } else {
+                        "altitude"
+                    };
+                    dashed.push((
+                        format!("{} {name}", tr.id),
+                        Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2])
+                            .gamma_multiply(0.6),
+                        pts,
+                    ));
+                }
+            }
+        }
         let t_now_d = self.t_now / 86400.0;
         let zero_line = matches!(
             var,
-            ChartVar::WindSupport | ChartVar::SegmentWind | ChartVar::Crosswind
+            ChartVar::WindSupport
+                | ChartVar::SegmentWind
+                | ChartVar::Crosswind
+                | ChartVar::SegCrosswind
+                | ChartVar::FlightCrosswind
+                | ChartVar::FlightSupport
+                | ChartVar::BestSupport
         );
-        let resp = Plot::new("chart")
-            .legend_if(!self.narrow)
+        let resp = Plot::new(("chart", slot))
+            .height(height)
+            .link_axis(egui::Id::unique("timeline_x"), [true, false])
+            .link_cursor(egui::Id::unique("timeline_x"), [true, false])
+            .legend_if(!self.narrow && slot == 0)
             .allow_scroll(false)
             .x_axis_formatter(|m: GridMark, _r| fmt_date((m.value * 86400.0) as i64))
             .label_formatter(|h: &HoverPosition<'_>| {
@@ -5500,6 +5668,14 @@ impl WingApp {
                         Points::new(name.clone(), PlotPoints::from(pts.clone()))
                             .color(*c)
                             .radius(2.0),
+                    );
+                }
+                for (name, c, pts) in &dashed {
+                    pui.line(
+                        Line::new(name.clone(), PlotPoints::from(pts.clone()))
+                            .color(*c)
+                            .width(1.2)
+                            .style(egui_plot::LineStyle::dashed_loose()),
                     );
                 }
                 if zero_line {
@@ -5813,6 +5989,19 @@ impl WingApp {
                     params: self.st_params,
                 }
             }),
+            clouds: self
+                .view3d
+                .show_clouds
+                .then(|| {
+                    let t = self.t_now as i64;
+                    let st = self.opts.field_stride;
+                    let base = crate::wxfield::grid(&self.store, t, st, weather::cloud_base_m)?;
+                    let low = crate::wxfield::grid(&self.store, t, st, |v| {
+                        Some(v[weather::CLOUD_LOW]).filter(|x| x.is_finite())
+                    })?;
+                    Some((base, low))
+                })
+                .flatten(),
         };
         let out = self.view3d.show(ui, scene);
         if let Some(sel) = out.clicked {
@@ -6018,6 +6207,10 @@ impl WingApp {
         ui.horizontal(|ui| {
             ui.checkbox(&mut v.show_drop_lines, "drop lines");
             ui.checkbox(&mut v.show_shadows, "ground shadows");
+            ui.checkbox(&mut v.show_clouds, "cloud base").on_hover_text(
+                "Translucent cloud deck at the cloud base (lifting condensation level from ERA5 2 m temperature and dew point), \
+                 shaded by low cloud cover - compare with the flight altitude",
+            );
         });
         ui.toggle_value(&mut v.terrain, "⛰ 3D terrain").on_hover_text(
             "Drape the basemap over real topography (AWS Terrain Tiles), hill-shaded. Uses the same \
@@ -6512,7 +6705,12 @@ impl eframe::App for WingApp {
         self.sync_url_hash();
         self.process_messages(ctx);
         match self.view_tab {
-            ViewTab::ThreeD => self.maybe_request_field(),
+            ViewTab::ThreeD => {
+                self.maybe_request_field();
+                if self.view3d.show_clouds {
+                    self.maybe_request_surface_field();
+                }
+            }
             ViewTab::Map => self.maybe_request_surface_field(),
         }
         self.pump_weather(ctx);
@@ -7833,6 +8031,7 @@ mod share_tests {
         a.view3d.follow = true;
         a.max_error_km = 10.0;
         a.chart_var = ChartVar::Sensor(SensorKind::Pressure);
+        a.chart_subplots = vec![ChartVar::Crosswind, ChartVar::CloudBase];
         a.curtain_metric = CurtainMetric::Crosswind;
         a.chart_open = false;
         a.opts.field_margin_deg = 2.0;
@@ -7889,6 +8088,10 @@ mod share_tests {
         assert_eq!(b.tracks[2].date_filter, Some(dr));
         assert_eq!(b.tracks[2].fixes.len(), a.tracks[2].fixes.len());
         assert!(b.view3d.terrain);
+        assert_eq!(
+            b.chart_subplots,
+            vec![ChartVar::Crosswind, ChartVar::CloudBase]
+        );
         assert_eq!(b.wx_field, crate::wxfield::FieldVar::Precip);
         assert!(b.wx_isobars && !b.wx_centres);
         assert!(
