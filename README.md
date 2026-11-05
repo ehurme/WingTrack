@@ -94,7 +94,35 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
   the 3D view as a translucent cloud deck at true scale, shaded by low cloud cover (*cloud base* in the 3D panel).
 - **Charts & subplots** — any chart variable over time; *+ subplot* stacks up to four more on the same (linked)
   time axis, e.g. altitude, crosswind (at the fix, along each step, or at flight altitude), cloud base and wind
-  support. Subplots are kept in share links.
+  support. Every chart fits the data being plotted: the time axis spans all plotted data (scroll / drag any chart
+  to zoom or pan all of them, double-click to fit again) and the y axis always fits the values inside the visible
+  time window. Subplots are kept in share links.
+- **Movement analysis** (*Movement analysis* panel) — nothing runs until you press its button; pick a track (or
+  *all visible*). Analyses use the fixes inside the date filter and the max-error filter.
+  - **Autocorrelated movement models** in the spirit of [ctmm](https://ctmm-initiative.github.io/ctmm/): the
+    empirical variogram plus maximum-likelihood fits (exact Kalman filter: irregular sampling, location error from
+    the fixes' error radius or estimated) of **IID**, **OU** (home-range crossing time τp) and **OUF** (velocity
+    autocorrelation τv), compared by AICc. Reports the Gaussian home-range area with a 95 % CI and its effective
+    sample size (DOF), τp and τv with CIs, and — when OUF is selected — the **autocorrelation-corrected mean speed**
+    (`√(π/2)·√(σ/(τp τv))`, m/s and km/day) next to the biased straight-line speed. Like ctmm, these models assume
+    range residency; the panel warns when τp is long compared with the tracking period (use the per-tag date filter
+    to keep a resident period of a migrant).
+  - **Home ranges** at any coverage (50 % core + e.g. 95 %): an **AKDE-like KDE** (Gaussian reference bandwidth for
+    the model's effective sample size instead of N, so autocorrelated data are not under-smoothed), classic KDE,
+    MCP and the model's Gaussian range, drawn on the map.
+  - **Segmentation:** **first-passage time** (Fauchald & Tveraa) with a radius scan (peak of Var ln FPT),
+    a 2–3 state **hidden Markov model** on step speed (zero-inflated gamma) and turning angle (von Mises) fitted by EM
+    and decoded with Viterbi, and **change points** (penalised least squares, PELT) in net displacement (migration
+    departures / arrivals) or log speed (behavioural modes).
+  - **Land cover & habitat selection:** ESA WorldCover 2020 / 2021 (10 m) through the Terrascope WMS, one small
+    window per fix (or any WMS with the WorldCover palette): the class at each fix, *used* = classes in the fix's
+    location-error circle, *available* = classes within a radius you choose, for all, night or day fixes →
+    **Manly selection ratios** with bootstrap 95 % CIs (selected / avoided classes). If a browser blocks the WMS
+    (CORS), the desktop app works.
+  - Results colour the track (*Colour by → Movement: HMM state / change-point segment / first-passage time / Land
+    cover*), appear in the chart list (plus *Net displacement*), go into the annotated CSV (`hmm_state`,
+    `cp_segment`, `fpt_h`, `landcover_code`, `landcover_class`), and export as a per-track **movement summary CSV**
+    and a **selection-ratio CSV**. Settings travel in share links; the analyses are re-run on demand.
 - **Weather layers & storms** (*Wind & weather → Map layers* and *→ Tropical cyclones*), all for the hour under the time cursor:
   - **ERA5 colour fields** around the animals — 2 m temperature, precipitation, cloud cover, 10 m wind speed or MSL
     pressure — from the same week-by-week ERA5 wind-field downloads (radius / spacing under *Map layers*), with
@@ -109,7 +137,7 @@ basemap, daily satellite imagery and real ERA5 data load from the services below
     `tc_distance_km`, `tc_wind_kt` and `tc_category` (nearest cyclone within 1500 km of each fix).
 - **Side panel** — *Files & firmware*, *Tracks* (date filters, fallen tags), *Display* (colouring, location error,
   trail), **Wind & weather** (*Download & annotate* · *Map layers* · *3D wind* · *Tropical cyclones*),
-  *Acceleration*, *Wind turbines & tall structures*, *Selected fix*, *Log*. Basemap and satellite / weather imagery
+  *Acceleration*, *Movement analysis*, *Wind turbines & tall structures*, *Selected fix*, *Log*. Basemap and satellite / weather imagery
   are in the top bar.
 - **Satellite layers** — Esri World Imagery / OSM / topo / dark basemaps, plus **NASA GIBS daily imagery
   (MODIS Terra, MODIS Aqua, VIIRS)** that switches date with the time cursor, so you can see the fronts the animals crossed,

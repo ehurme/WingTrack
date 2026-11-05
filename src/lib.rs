@@ -4,6 +4,7 @@
 //! The crate is split so the data side can be used without the GUI:
 //! * [`table`] + [`firmware`] — read CSV exports and turn them into [`model::Track`]s
 //! * [`weather`] — download ERA5 via Open-Meteo and annotate fixes with wind support etc.
+//! * [`movement`] + [`landcover`] — on-demand home range, speed, segmentation, habitat selection
 //! * [`export`] — write annotated tracks back to CSV (readable by R / SigfoxTagPrep)
 //! * [`video`] — MP4 / GIF export of the animated map and charts
 //! * [`app`] — the egui application (native and web)
@@ -17,7 +18,9 @@ pub mod export;
 pub mod falloff;
 pub mod firmware;
 pub mod geo;
+pub mod landcover;
 pub mod model;
+pub mod movement;
 pub mod prefs;
 pub mod share;
 pub mod structures;

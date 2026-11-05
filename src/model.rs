@@ -151,6 +151,21 @@ pub struct Fix {
     pub extra: Vec<(String, String)>,
     /// Acceleration summary of the step arriving at this fix ([`crate::acc`]).
     pub acc: Option<Box<crate::acc::FixAcc>>,
+    /// Results of movement analyses the user ran ([`crate::movement`], [`crate::landcover`]).
+    pub mv: Option<Box<MoveAnno>>,
+}
+
+/// Per-fix output of the on-demand movement analyses (all optional).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MoveAnno {
+    /// HMM state of the step arriving at this fix (0 = slowest).
+    pub hmm_state: Option<u8>,
+    /// Change-point segment (0-based, in time order).
+    pub segment: Option<u16>,
+    /// First-passage time (hours) at the chosen radius.
+    pub fpt_h: Option<f32>,
+    /// Land-cover class code at the fix (ESA WorldCover: 10 = tree cover … 100 = moss).
+    pub landcover: Option<u8>,
 }
 
 impl Fix {
@@ -176,7 +191,13 @@ impl Fix {
             weather: WeatherAnno::default(),
             extra: Vec::new(),
             acc: None,
+            mv: None,
         }
+    }
+
+    /// Movement annotations, created on first write.
+    pub fn mv_mut(&mut self) -> &mut MoveAnno {
+        self.mv.get_or_insert_with(Default::default)
     }
 
     /// The best altitude estimate available (ERA5-corrected barometric first).

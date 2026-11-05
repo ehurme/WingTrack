@@ -34,11 +34,14 @@ This file is written for AI coding agents. Assume the reader knows nothing about
 │   ├── lib.rs              # Public module exports
 │   ├── acc.rs              # Acceleration: e-obs / per-sample / FleaTag readers, burst features (flea port), k-means, per-fix summaries
 │   ├── app.rs              # egui application: map, timeline, charts, export, video
+│   ├── app/movement_ui.rs  # Movement-analysis side panel, land-cover WMS queue, summary exports
 │   ├── model.rs            # Core data model: Track, Fix, SensorSample, WeatherAnno
 │   ├── structures.rs       # Wind turbines / tall structures: Overpass + CSV import, encounter analysis, CSV exports
 │   ├── table.rs            # Tolerant CSV reader (delimiter sniffing, header normalisation, timestamp parsing)
 │   ├── terrain.rs          # AWS Terrarium elevation tiles for the 3D view: fetch, decode, bilinear sampling
 │   ├── cds.rs              # Copernicus CDS ERA5 time-series client (user's API key)
+│   ├── movement.rs         # On-demand movement analyses: variogram, IID/OU/OUF ML fits (Kalman), home ranges, FPT, HMM, change points
+│   ├── landcover.rs        # ESA WorldCover via WMS (palette → classes), used/available sampling, Manly selection ratios
 │   ├── falloff.rs          # Fallen-tag detection (port of SigfoxTagPrep detect_tag_fell_off)
 │   ├── prefs.rs            # Per-device settings kept out of share links (API keys)
 │   ├── firmware/           # One module per data source
@@ -224,6 +227,7 @@ Enable GitHub Pages via *Settings → Pages → Source: GitHub Actions*.
 | `WINGTRACK_SYNTHETIC_WIND=1` | Fill the weather store with a rotating synthetic wind field, and the pressure-level store with a sheared synthetic profile field, for offline UI testing (not real data) |
 | `WINGTRACK_3D=1` / `=profile` | With the synthetic wind: open the *3D winds* tab with the curtain (or profile) chart |
 | `WINGTRACK_CUBE=path` | Path for the ignored real-cube import test |
+| `WINGTRACK_MOVE=1` | Run all movement analyses on the longest track at start and open the panel (UI testing) |
 
 ## External resources
 
@@ -256,3 +260,13 @@ Enable GitHub Pages via *Settings → Pages → Source: GitHub Actions*.
   overloaded, network, timeouts, minute limit) back off globally and re-queue (≤ `OM_RETRIES`, `om_parallel` → 1),
   then go to `failed_jobs` (never `mark_done`); only permanent 4xx are marked done. IBTrACS per-year CSVs are built in
   CI (`tools/ibtracs_years.py` → `dist/data/ibtracs/`, weekly schedule) and read before ERDDAP.
+- Charts (`series_plot`): the x axis is managed by the app, not by egui_plot's linked axes — `chart_x_view` is the
+  user's zoom / pan window (`None` = fit all data, double-click resets), `chart_full_x` the union of everything plotted
+  last frame (a change resets the zoom); y is set every frame to the data inside the visible window. Zoom / drag are x only.
+- Movement analyses (`movement.rs`, `landcover.rs`, UI in `app/movement_ui.rs`) never run automatically. Per-track
+  results live in `WingApp::mv_ui.results` keyed by `track_key`, invalidated by a fingerprint of the fixes
+  (count, first / last time); per-fix output is `Fix::mv` (`MoveAnno`), cleared by `set_date_filter`. ctmm conventions:
+  σ is the per-axis variance, area = −2 ln(1−q) π σ, OUF speed = √(π/2)√(σ/(τp τv)), error radius = RMS (per-axis
+  variance r²/2), DOF(area) = 1/Var(ln σ̂). Land cover requests (≤ 4 in flight, `pump_landcover`) go to the WMS URL in
+  `mv_ui.lc_url` (Terrascope by default). Share keys `mv=` (settings) and `mvw=` (custom WMS url|layer).
+  `WINGTRACK_DEMO=1 WINGTRACK_MOVE=1` runs every analysis on the longest demo track for UI checks.
