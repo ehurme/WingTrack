@@ -79,6 +79,12 @@ pub fn to_csv<'a>(tracks: impl IntoIterator<Item = &'a Track> + Clone) -> String
         "best_wind_support",
         "at_best_wind",
         "wind3d_source",
+        // on-demand movement analyses
+        "hmm_state",
+        "cp_segment",
+        "fpt_h",
+        "landcover_code",
+        "landcover_class",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -149,6 +155,14 @@ pub fn to_csv<'a>(tracks: impl IntoIterator<Item = &'a Track> + Clone) -> String
                 wa.flight
                     .as_ref()
                     .map(|w| w.source.clone())
+                    .unwrap_or_default(),
+                o(f.mv.as_ref().and_then(|m| m.hmm_state).map(|s| s + 1)),
+                o(f.mv.as_ref().and_then(|m| m.segment).map(|s| s + 1)),
+                f2(f.mv.as_ref().and_then(|m| m.fpt_h)),
+                o(f.mv.as_ref().and_then(|m| m.landcover)),
+                f.mv.as_ref()
+                    .and_then(|m| m.landcover)
+                    .map(|c| crate::landcover::class_name(c).to_string())
                     .unwrap_or_default(),
             ];
             for k in &extra_keys {

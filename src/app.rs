@@ -1,5 +1,7 @@
 //! The egui application: map + satellite layers, timeline, charts, weather annotation, export.
 
+mod movement_ui;
+
 use crate::firmware;
 use crate::geo;
 use crate::model::{Fix, LocationSource, SensorKind, Track};
@@ -66,6 +68,14 @@ enum Msg {
     StructFile {
         name: String,
         bytes: Vec<u8>,
+    },
+    /// A land-cover WMS window around one fix ([`crate::landcover`]).
+    LandCover {
+        key: String,
+        fix: usize,
+        err: Option<f64>,
+        run: u64,
+        result: Result<Vec<u8>, String>,
     },
     /// An ERA5 wind-cube file picked by the user.
     Cube {
@@ -272,10 +282,14 @@ enum ColorBy {
     AccWbf,
     AccCluster,
     AccBehaviour,
+    HmmState,
+    Segment,
+    Fpt,
+    LandCover,
 }
 
 impl ColorBy {
-    const ALL: [ColorBy; 10] = [
+    const ALL: [ColorBy; 14] = [
         ColorBy::Individual,
         ColorBy::WindSupport,
         ColorBy::SegmentWind,
@@ -286,6 +300,10 @@ impl ColorBy {
         ColorBy::AccWbf,
         ColorBy::AccCluster,
         ColorBy::AccBehaviour,
+        ColorBy::HmmState,
+        ColorBy::Segment,
+        ColorBy::Fpt,
+        ColorBy::LandCover,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -299,6 +317,10 @@ impl ColorBy {
             ColorBy::AccWbf => "ACC: wingbeat frequency",
             ColorBy::AccCluster => "ACC: behaviour cluster",
             ColorBy::AccBehaviour => "ACC: behaviour (from annotations)",
+            ColorBy::HmmState => "Movement: HMM state",
+            ColorBy::Segment => "Movement: change-point segment",
+            ColorBy::Fpt => "Movement: first-passage time",
+            ColorBy::LandCover => "Land cover at fix (WorldCover)",
         }
     }
 }
@@ -412,6 +434,39 @@ enum ChartVar {
     Acc(AccMetric),
     /// Waveform and spectrum of the burst nearest the cursor.
     AccBurst,
+    /// Results of the movement analyses, and the net displacement.
+    Move(MoveMetric),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MoveMetric {
+    Displacement,
+    Fpt,
+    Hmm,
+    Segment,
+    LandCover,
+}
+
+impl MoveMetric {
+    fn label(self) -> &'static str {
+        match self {
+            MoveMetric::Displacement => "Net displacement from the first fix (km)",
+            MoveMetric::Fpt => "Movement: first-passage time (h)",
+            MoveMetric::Hmm => "Movement: HMM state (1 = slowest)",
+            MoveMetric::Segment => "Movement: change-point segment",
+            MoveMetric::LandCover => "Land cover class code (WorldCover)",
+        }
+    }
+    fn of(self, f: &Fix) -> Option<f32> {
+        let m = f.mv.as_ref()?;
+        match self {
+            MoveMetric::Displacement => None,
+            MoveMetric::Fpt => m.fpt_h,
+            MoveMetric::Hmm => m.hmm_state.map(|s| s as f32 + 1.0),
+            MoveMetric::Segment => m.segment.map(|s| s as f32 + 1.0),
+            MoveMetric::LandCover => m.landcover.map(|c| c as f32),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -489,7 +544,7 @@ struct AccCache {
 }
 
 impl ChartVar {
-    const ALL: [ChartVar; 30] = [
+    const ALL: [ChartVar; 35] = [
         ChartVar::Curtain,
         ChartVar::Profile,
         ChartVar::FlightSupport,
@@ -520,6 +575,11 @@ impl ChartVar {
         ChartVar::Acc(AccMetric::Cluster),
         ChartVar::Acc(AccMetric::Behaviour),
         ChartVar::AccBurst,
+        ChartVar::Move(MoveMetric::Displacement),
+        ChartVar::Move(MoveMetric::Fpt),
+        ChartVar::Move(MoveMetric::Hmm),
+        ChartVar::Move(MoveMetric::Segment),
+        ChartVar::Move(MoveMetric::LandCover),
     ];
     fn label(self) -> &'static str {
         match self {
@@ -545,6 +605,7 @@ impl ChartVar {
             ChartVar::FlightCrosswind => "3D: crosswind at flight altitude (m/s)",
             ChartVar::Acc(m) => m.label(),
             ChartVar::AccBurst => "ACC: burst at the cursor (waveform + spectrum)",
+            ChartVar::Move(m) => m.label(),
         }
     }
     /// Plotted as values over time (can be a subplot).
@@ -573,6 +634,7 @@ impl ChartVar {
             ChartVar::CloudLow => f.weather.cloud_cover_low,
             ChartVar::SegCrosswind => f.weather.seg_crosswind,
             ChartVar::FlightCrosswind => f.weather.flight.as_ref().and_then(|w| w.crosswind),
+            ChartVar::Move(m) => m.of(f),
             ChartVar::Sensor(_)
             | ChartVar::Curtain
             | ChartVar::Profile
@@ -690,6 +752,13 @@ pub struct WingApp {
     chart_var: ChartVar,
     /// Extra charts stacked under the main one (shared time axis).
     chart_subplots: Vec<ChartVar>,
+    /// Time window (days) the user zoomed / panned the charts to; `None` = fit all plotted data.
+    chart_x_view: Option<[f64; 2]>,
+    /// Time span of everything plotted in the last frame (union over the stacked charts).
+    chart_full_x: Option<[f64; 2]>,
+    chart_full_x_acc: Option<[f64; 2]>,
+    /// On-demand movement analyses (side panel → Movement analysis).
+    mv_ui: movement_ui::MoveUi,
 
     // weather
     store: WeatherStore,
@@ -883,6 +952,10 @@ impl WingApp {
             date_to: String::new(),
             chart_var: ChartVar::Altitude,
             chart_subplots: Vec::new(),
+            chart_x_view: None,
+            chart_full_x: None,
+            chart_full_x_acc: None,
+            mv_ui: Default::default(),
             store: WeatherStore::default(),
             opts: AnnotateOptions::default(),
             queue: VecDeque::new(),
@@ -979,6 +1052,10 @@ impl WingApp {
                     app.t_now = app.t_min + 0.3 * (app.t_max - app.t_min);
                 }
             }
+        }
+        // UI test of the movement panel: analyses on the longest track
+        if std::env::var("WINGTRACK_MOVE").is_ok() && !app.tracks.is_empty() {
+            app.run_movement_test_env();
         }
     }
 
@@ -1373,6 +1450,14 @@ impl WingApp {
                 self.st_highlight as u8
             ),
         );
+        let mvs = self.mv_share();
+        let mv_default = WingApp::mv_default_share();
+        m.set_if(mvs != mv_default, "mv", mvs);
+        m.set_if(
+            self.mv_ui.lc_url != crate::landcover::TERRASCOPE_WMS,
+            "mvw",
+            format!("{}|{}", self.mv_ui.lc_url, self.mv_ui.lc_layer),
+        );
         let cols: Vec<String> = (0..self.tracks.len())
             .map(|i| {
                 let c = self.tracks[i].color;
@@ -1435,6 +1520,12 @@ impl WingApp {
             };
             self.acc_edit = self.acc_params;
             self.acc_slope = (slope > 0.0).then_some(slope);
+        }
+        self.mv_ui = Default::default();
+        self.mv_apply(&m.nums("mv"));
+        if let Some((u, l)) = m.get("mvw").and_then(|w| w.split_once('|')) {
+            self.mv_ui.lc_url = u.to_string();
+            self.mv_ui.lc_layer = l.to_string();
         }
         let stv = m.nums("st");
         self.st_on = m.get("st").is_some();
@@ -2018,6 +2109,10 @@ impl WingApp {
     fn set_date_filter(&mut self, idxs: &[usize], range: Option<(i64, i64)>) {
         for &i in idxs {
             self.tracks[i].set_date_filter(range);
+            let tr = &mut self.tracks[i];
+            for f in tr.fixes.iter_mut().chain(tr.excluded_fixes.iter_mut()) {
+                f.mv = None;
+            }
         }
         let t = self.t_now;
         self.recompute_time_range();
@@ -4654,6 +4749,13 @@ impl WingApp {
                         )),
                     }
                 }
+                Msg::LandCover {
+                    key,
+                    fix,
+                    err,
+                    run,
+                    result,
+                } => self.on_landcover(key, fix, err, run, result),
                 Msg::StructFile { name, bytes } => {
                     match crate::table::Table::from_bytes(&name, &bytes)
                         .and_then(|t| crate::structures::from_table(&t))
@@ -5423,6 +5525,11 @@ impl WingApp {
                     self.acc_panel(ui);
                 });
 
+            // ---- movement analysis
+            egui::CollapsingHeader::new("Movement analysis").default_open(self.mv_ui.open).show(ui, |ui| {
+                self.movement_panel(ui);
+            });
+
             // ---- wind turbines & structures
             egui::CollapsingHeader::new("Wind turbines & tall structures").default_open(false).show(ui, |ui| {
                 self.structures_panel(ui);
@@ -5461,6 +5568,73 @@ impl WingApp {
         );
         if !self.narrow {
             ui.monospace(fmt_time(self.t_now as i64) + " UTC");
+        }
+    }
+
+    /// Categorical legend entries for the current 'Colour by', if it is categorical.
+    fn legend_swatches(&self) -> Option<(&'static str, Vec<(String, Color32)>)> {
+        match self.color_by {
+            ColorBy::AccBehaviour => Some((
+                "ACC behaviour",
+                self.acc_cache
+                    .as_ref()
+                    .map(|c| {
+                        c.a.classes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, n)| (n.clone(), BEHAVIOUR_COLORS[i % BEHAVIOUR_COLORS.len()]))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )),
+            ColorBy::HmmState => {
+                let k = self
+                    .tracks
+                    .iter()
+                    .flat_map(|t| t.fixes.iter())
+                    .filter_map(|f| f.mv.as_ref().and_then(|m| m.hmm_state))
+                    .max()
+                    .map(|m| m as usize + 1)?;
+                Some((
+                    "HMM state",
+                    (0..k)
+                        .map(|s| {
+                            let n = match s {
+                                0 => format!("{} slowest", s + 1),
+                                _ if s + 1 == k => format!("{} fastest", s + 1),
+                                _ => format!("{}", s + 1),
+                            };
+                            (n, movement_ui::hmm_color(s as u8))
+                        })
+                        .collect(),
+                ))
+            }
+            ColorBy::LandCover => {
+                let mut seen: Vec<u8> = self
+                    .tracks
+                    .iter()
+                    .filter(|t| t.visible)
+                    .flat_map(|t| t.fixes.iter())
+                    .filter_map(|f| f.mv.as_ref().and_then(|m| m.landcover))
+                    .collect();
+                seen.sort_unstable();
+                seen.dedup();
+                (!seen.is_empty()).then(|| {
+                    (
+                        "Land cover (WorldCover)",
+                        seen.into_iter()
+                            .map(|c| {
+                                let [r, g, b] = crate::landcover::class_color(c);
+                                (
+                                    crate::landcover::class_name(c).to_string(),
+                                    Color32::from_rgb(r, g, b),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+            }
+            _ => None,
         }
     }
 
@@ -5559,6 +5733,15 @@ impl WingApp {
                 });
             }
         });
+        // the data span plotted last frame: when it changes (other track, variable, filter),
+        // the charts go back to fitting all data
+        let span = self.chart_full_x_acc.take();
+        if span != self.chart_full_x {
+            if self.chart_full_x.is_some() {
+                self.chart_x_view = None;
+            }
+            self.chart_full_x = span;
+        }
         // main chart + stacked subplots share the height; time-series plots share the x axis
         let n = 1 + self.chart_subplots.len();
         let row_h = if self.chart_subplots.is_empty() {
@@ -5630,6 +5813,20 @@ impl WingApp {
                         .collect(),
                     None => Vec::new(),
                 },
+                ChartVar::Move(MoveMetric::Displacement) => {
+                    let mut first: Option<(f64, f64)> = None;
+                    tr.fixes
+                        .iter()
+                        .filter(|f| self.fix_visible(f))
+                        .map(|f| {
+                            let (la, lo) = *first.get_or_insert((f.lat, f.lon));
+                            [
+                                f.t as f64 / 86400.0,
+                                geo::haversine_m(la, lo, f.lat, f.lon) / 1000.0,
+                            ]
+                        })
+                        .collect()
+                }
                 ChartVar::Sensor(k) => tr
                     .sensors
                     .iter()
@@ -5695,9 +5892,46 @@ impl WingApp {
                 | ChartVar::FlightSupport
                 | ChartVar::BestSupport
         );
+        // Axes: x is shared by all stacked charts (zoom / pan any of them, double-click to fit
+        // all data again); y always fits the data inside the visible time window.
+        let own_x = series
+            .iter()
+            .chain(dashed.iter())
+            .flat_map(|(_, _, p)| p.iter())
+            .fold(None, |r: Option<[f64; 2]>, q| {
+                Some(r.map_or([q[0], q[0]], |r| [r[0].min(q[0]), r[1].max(q[0])]))
+            });
+        if let Some(o) = own_x {
+            self.chart_full_x_acc = Some(union_range(self.chart_full_x_acc, o));
+        }
+        let x_range = self
+            .chart_x_view
+            .or(self.chart_full_x.or(own_x).map(pad_range));
+        let y_range = x_range.and_then(|xr| {
+            let ys = series
+                .iter()
+                .chain(dashed.iter())
+                .flat_map(|(_, _, p)| p.iter())
+                .filter(|q| q[0] >= xr[0] && q[0] <= xr[1] && q[1].is_finite())
+                .map(|q| q[1]);
+            let mut r: Option<[f64; 2]> = None;
+            for y in ys.chain(zero_line.then_some(0.0)) {
+                r = Some(r.map_or([y, y], |r| [r[0].min(y), r[1].max(y)]));
+            }
+            r.map(|r| {
+                let span = (r[1] - r[0]).max(1e-6 * r[1].abs().max(1.0));
+                if r[1] - r[0] < 1e-9 {
+                    [r[0] - 0.5 * span.max(0.5), r[1] + 0.5 * span.max(0.5)]
+                } else {
+                    [r[0] - 0.06 * span, r[1] + 0.06 * span]
+                }
+            })
+        });
         let resp = Plot::new(("chart", slot))
             .height(height)
-            .link_axis(egui::Id::unique("timeline_x"), [true, false])
+            .allow_zoom([true, false])
+            .allow_drag([true, false])
+            .allow_boxed_zoom(false)
             .link_cursor(egui::Id::unique("timeline_x"), [true, false])
             .legend_if(!self.narrow && slot == 0)
             .allow_scroll(false)
@@ -5719,6 +5953,12 @@ impl WingApp {
                 })
             })
             .show(ui, |pui| {
+                if let Some(xr) = x_range {
+                    pui.set_plot_bounds_x(xr[0]..=xr[1]);
+                }
+                if let Some(yr) = y_range {
+                    pui.set_plot_bounds_y(yr[0]..=yr[1]);
+                }
                 for (name, c, pts) in &series {
                     // per-burst ACC metrics are clouds of points, not lines
                     if !matches!(var, ChartVar::Acc(_)) {
@@ -5752,6 +5992,18 @@ impl WingApp {
                     None
                 }
             });
+        // a zoom / pan by the user (applied after our bounds) becomes the shared time window
+        let b = resp.transform.bounds();
+        if resp.response.double_clicked() {
+            self.chart_x_view = None;
+        } else if let Some(xr) = x_range {
+            let (lo, hi) = (b.min()[0], b.max()[0]);
+            let tol = 1e-7 * (xr[1] - xr[0]).abs().max(1e-9);
+            if hi > lo && ((lo - xr[0]).abs() > tol || (hi - xr[1]).abs() > tol) {
+                self.chart_x_view = Some([lo, hi]);
+                ui.ctx().request_repaint();
+            }
+        }
         if let Some(p) = resp.inner {
             self.t_now = (p.x * 86400.0).clamp(self.t_min, self.t_max);
             self.playing = false;
@@ -5775,6 +6027,8 @@ impl WingApp {
             self.memory.follow_my_position();
         }
 
+        let home_ranges = self.home_range_draw();
+        let swatches = self.legend_swatches();
         let basemap = self.basemap;
         let wind_pal = self.wind_palette();
         let base = self
@@ -5836,6 +6090,7 @@ impl WingApp {
                 self.wx_centres,
             ),
             storms: (self.storms_on && !self.storms.is_empty()).then_some(&self.storms[..]),
+            home_ranges,
             out: &mut interaction,
         };
 
@@ -5848,11 +6103,6 @@ impl WingApp {
         }
         let color_by = self.color_by;
         let wx_field = self.wx_field;
-        let acc_classes: Vec<String> = self
-            .acc_cache
-            .as_ref()
-            .map(|c| c.a.classes.clone())
-            .unwrap_or_default();
         let wind_legend = (self.show_wind_field && !self.store.is_empty()).then_some(wind_pal);
         let sat_on = self.sat_on;
         let sat_label = self.sat_layer.label();
@@ -5918,7 +6168,7 @@ impl WingApp {
                 FontId::proportional(14.0),
                 Color32::WHITE,
             );
-            legend(p, r, color_by, wind_legend, &acc_classes, wx_field);
+            legend(p, r, color_by, wind_legend, &swatches, wx_field);
             (centre.y(), centre.x())
         });
         self.map_center = Some(shown.inner);
@@ -6785,6 +7035,7 @@ impl eframe::App for WingApp {
         }
         self.plan_structures();
         self.pump_structures(ctx);
+        self.pump_landcover(ctx);
         self.ensure_st_cache();
         self.ensure_acc_cache();
         self.record_tick(ctx);
@@ -6945,6 +7196,8 @@ struct TrackLayer<'a> {
     /// ERA5 colour field, isobars and pressure centres at the cursor hour.
     wx: Option<WxDraw>,
     storms: Option<&'a [crate::cyclones::Storm]>,
+    /// Home-range contours: (colour, width, dashed, (lat, lon) segments).
+    home_ranges: Vec<movement_ui::HrLine>,
     out: &'a mut Interaction,
 }
 
@@ -7057,6 +7310,33 @@ impl ViewCfg {
                 .and_then(|a| a.behaviour)
                 .map(|c| BEHAVIOUR_COLORS[c % BEHAVIOUR_COLORS.len()])
                 .unwrap_or(none),
+            ColorBy::HmmState => {
+                f.mv.as_ref()
+                    .and_then(|m| m.hmm_state)
+                    .map(movement_ui::hmm_color)
+                    .unwrap_or(none)
+            }
+            ColorBy::Segment => {
+                f.mv.as_ref()
+                    .and_then(|m| m.segment)
+                    .map(movement_ui::segment_color)
+                    .unwrap_or(none)
+            }
+            ColorBy::Fpt => {
+                f.mv.as_ref()
+                    .and_then(|m| m.fpt_h)
+                    .map(|h| viridis(fpt_norm(h)))
+                    .unwrap_or(none)
+            }
+            ColorBy::LandCover => {
+                f.mv.as_ref()
+                    .and_then(|m| m.landcover)
+                    .map(|c| {
+                        let [r, g, b] = crate::landcover::class_color(c);
+                        Color32::from_rgb(r, g, b)
+                    })
+                    .unwrap_or(none)
+            }
         }
     }
 }
@@ -7187,6 +7467,23 @@ impl Plugin for TrackLayer<'_> {
         }
 
         // Tropical cyclones: best tracks coloured by category, position at the cursor.
+        for (c, w, dashed, segs) in &self.home_ranges {
+            let stroke = Stroke::new(*w, *c);
+            let halo = Stroke::new(*w + 2.0, Color32::from_black_alpha(120));
+            for sg in segs {
+                let a = to_screen(sg[0].0, sg[0].1);
+                let b = to_screen(sg[1].0, sg[1].1);
+                if !clip.intersects(Rect::from_two_pos(a, b)) {
+                    continue;
+                }
+                if *dashed {
+                    painter.add(egui::Shape::dashed_line(&[a, b], stroke, 8.0, 5.0));
+                } else {
+                    painter.line_segment([a, b], halo);
+                    painter.line_segment([a, b], stroke);
+                }
+            }
+        }
         if let Some(storms) = self.storms {
             let t = self.t_now as i64;
             for st in storms {
@@ -7528,7 +7825,7 @@ fn legend(
     r: Rect,
     by: ColorBy,
     wind: Option<WindPalette>,
-    classes: &[String],
+    swatches: &Option<(&str, Vec<(String, Color32)>)>,
     field: crate::wxfield::FieldVar,
 ) {
     let mut origin = pos2(r.left() + 12.0, r.bottom() - 40.0);
@@ -7540,8 +7837,8 @@ fn legend(
         });
         origin.y -= 60.0;
     }
-    if by == ColorBy::AccBehaviour {
-        // one swatch per annotated behaviour
+    if let Some((title, classes)) = swatches {
+        // one swatch per class
         let n = classes.len().max(1);
         let h = 16.0 * n as f32 + 18.0;
         let top = origin + vec2(0.0, 30.0 - h);
@@ -7553,16 +7850,16 @@ fn legend(
         p.text(
             top,
             Align2::LEFT_TOP,
-            "ACC behaviour",
+            *title,
             FontId::proportional(11.0),
             Color32::WHITE,
         );
-        for (i, c) in classes.iter().enumerate() {
+        for (i, (c, col)) in classes.iter().enumerate() {
             let y = top.y + 16.0 + 16.0 * i as f32;
             p.rect_filled(
                 Rect::from_min_size(pos2(top.x, y + 2.0), vec2(12.0, 10.0)),
                 2.0,
-                BEHAVIOUR_COLORS[i % BEHAVIOUR_COLORS.len()],
+                *col,
             );
             p.text(
                 pos2(top.x + 18.0, y),
@@ -7599,6 +7896,8 @@ fn track_legend(p: &egui::Painter, origin: Pos2, by: ColorBy) -> bool {
         ColorBy::AccFlight => ("ACC flight share of the step", "0 %", "100 %", false),
         ColorBy::AccWbf => ("ACC wingbeat frequency", "band low", "band high", false),
         ColorBy::AccBehaviour => return false,
+        ColorBy::HmmState | ColorBy::LandCover | ColorBy::Segment => return false,
+        ColorBy::Fpt => ("first-passage time (h, log)", "0.1", "1000", false),
         ColorBy::AccCluster => {
             colorbar(
                 p,
@@ -7763,6 +8062,22 @@ fn parse_date_range(from: &str, to: &str) -> Result<(i64, i64), String> {
         return Err("'to' is before 'from'".into());
     }
     Ok((a, b))
+}
+
+/// Union of an optional range with another.
+fn union_range(a: Option<[f64; 2]>, b: [f64; 2]) -> [f64; 2] {
+    a.map_or(b, |a| [a[0].min(b[0]), a[1].max(b[1])])
+}
+
+/// 2 % margin either side (at least an hour, in days) so the end points aren't on the frame.
+fn pad_range(r: [f64; 2]) -> [f64; 2] {
+    let m = ((r[1] - r[0]) * 0.02).max(1.0 / 24.0);
+    [r[0] - m, r[1] + m]
+}
+
+/// First-passage time (h) → 0..1 on a log scale from 0.1 h to 1000 h.
+fn fpt_norm(h: f32) -> f32 {
+    ((h.max(0.1).log10() + 1.0) / 4.0).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
